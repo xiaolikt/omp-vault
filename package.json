@@ -1,0 +1,47 @@
+{
+	"name": "omp-vault",
+	"version": "0.1.0",
+	"description": "omp/pi extension: a scoped, user-authorized secret vault for AI agents. Secrets are ChaCha20-Poly1305 encrypted at rest; every read requires an interactive grant that auto-expires, and all access is audit-logged.",
+	"author": "hljhljhlj",
+	"license": "MIT",
+	"type": "module",
+	"engines": {
+		"node": ">=20"
+	},
+	"keywords": [
+		"omp-package",
+		"pi",
+		"pi-coding-agent",
+		"extension",
+		"vault",
+		"secrets",
+		"security",
+		"omp"
+	],
+	"files": [
+		"src",
+		"tests",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "node --import tsx --test tests/*.test.mjs"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.5.0",
+		"typebox": "1.3.27"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.5.0",
+		"@types/node": "^24.0.0",
+		"tsx": "^4.23.15",
+		"typebox": "1.3.27",
+		"typescript": "^5.9.0"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	}
+}
