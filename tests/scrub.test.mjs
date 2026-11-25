@@ -19,6 +19,13 @@ test("redacts base64 and base64url", () => {
 	assert.equal(result.text, "[BW_SCRUBBED-B64:T1] [BW_SCRUBBED-B64URL:T1]");
 });
 
+test("redacts base64 of a short password", () => {
+	// `echo -n "$VAULT_SECRET" | base64` must not leak an everyday password.
+	const raw = "hunter2abcd";
+	const result = scrubText(`| ${Buffer.from(raw).toString("base64")} |`, [{ env: "T1", value: raw }]);
+	assert.equal(result.text, "| [BW_SCRUBBED-B64:T1] |");
+});
+
 test("redacts URL-encoded and hex forms", () => {
 	const raw = "a b&c=d/e";
 	const result = scrubText(`${encodeURIComponent(raw)} ${Buffer.from(raw).toString("hex")}`, [{ env: "U", value: raw }]);
@@ -39,4 +46,21 @@ test("scrubs nested details and preserves unchanged objects", () => {
 	const same = scrubDeep(plain, values);
 	assert.equal(same.changed, false);
 	assert.equal(same.value, plain);
+});
+
+test("leaves a Date, a Buffer, or a class instance as the object it was", () => {
+	class Handle {
+		constructor() {
+			this.fd = 3;
+		}
+	}
+	const date = new Date(0);
+	const blob = Buffer.from("abc");
+	const handle = new Handle();
+	const result = scrubDeep({ at: date, blob, handle, note: SECRET }, values);
+	assert.equal(result.changed, true);
+	assert.equal(result.value.at, date);
+	assert.equal(result.value.blob, blob);
+	assert.equal(result.value.handle, handle);
+	assert.equal(result.value.note, "[BW_SCRUBBED:T1]");
 });

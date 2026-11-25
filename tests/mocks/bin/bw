@@ -1,0 +1,38 @@
+#!/bin/bash
+# Mock Bitwarden CLI for the omp-vault tests: two items, one session key.
+# Controlled via env: BW_MOCK_UNAUTH=1 (unauthenticated), BW_MOCK_DIR (state dir).
+MOCK_DIR="${BW_MOCK_DIR:-/tmp/bw-mock-state}"
+mkdir -p "$MOCK_DIR"
+args="$*"
+if [[ "$1" == "--version" ]]; then echo "mock-1.0.0"; exit 0; fi
+if [[ -f "$MOCK_DIR/locked" ]]; then
+	# Simulate an external lock (e.g. /bw lock in another pi session)
+	rm -f "$MOCK_DIR/locked"
+fi
+case "$args" in
+	"status --nointeraction")
+		if [[ "${BW_MOCK_UNAUTH:-0}" == "1" ]]; then
+			echo '{"serverUrl":null,"lastSync":null,"status":"unauthenticated"}'
+		elif [[ "$BW_SESSION" == "GOOD_SESSION" ]]; then
+			echo '{"serverUrl":"https://vault.example.com","status":"unlocked","userEmail":"t@example.com"}'
+		else
+			echo '{"serverUrl":"https://vault.example.com","status":"locked","userEmail":"t@example.com"}'
+		fi ;;
+	"unlock --passwordenv BW_MASTER_PASSWORD --raw")
+		echo "$(( $(cat "$MOCK_DIR/unlocks" 2>/dev/null || echo 0) + 1 ))" > "$MOCK_DIR/unlocks"
+		if [[ "$BW_MASTER_PASSWORD" == "testmaster" ]]; then
+			touch "$MOCK_DIR/session"
+			echo "GOOD_SESSION"
+		else
+			echo "wrong pw" >&2; exit 1
+		fi ;;
+	"sync --nointeraction") exit 0 ;;
+	"list items --nointeraction")
+		echo '[{"id":"aaaa1111-1111-4111-8111-111111111111","name":"TestService","login":{"username":"alice","password":"supersecret-value-123","totp":null,"uris":[{"uri":"https://test.example.com"}]},"notes":"note-secret-abc","fields":[{"name":"API_KEY","value":"hf_sk-abc987xyz456","type":1}]},{"id":"bbbb2222-2222-4222-8222-222222222222","name":"OtherService","login":{"username":"bob","password":"other-pw-999","uris":[]},"fields":[]}]' ;;
+	"get item aaaa1111-1111-4111-8111-111111111111 --nointeraction")
+		echo '{"id":"aaaa1111-1111-4111-8111-111111111111","name":"TestService","login":{"username":"alice","password":"supersecret-value-123","uris":[]},"fields":[{"name":"API_KEY","value":"hf_sk-abc987xyz456","type":1}]}' ;;
+	"get item bbbb2222-2222-4222-8222-222222222222 --nointeraction")
+		echo '{"id":"bbbb2222-2222-4222-8222-222222222222","name":"OtherService","login":{"username":"bob","password":"other-pw-999","uris":[]},"fields":[]}' ;;
+	"lock --nointeraction") touch "$MOCK_DIR/locked"; exit 0 ;;
+	*) echo "mock bw: unhandled: $args" >&2; exit 1 ;;
+esac

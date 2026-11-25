@@ -10,6 +10,7 @@ export interface AuditEntry {
 		| "init"
 		| "unlock"
 		| "unlock_failed"
+		| "unlock_error"
 		| "lock"
 		| "auto_lock"
 		| "add"
@@ -27,19 +28,25 @@ export interface AuditEntry {
 export const defaultAuditPath = (): string =>
 	join(process.env.OMP_VAULT_DIR ?? join(homedir(), ".omp", "vault"), "audit.log");
 
-export function appendAudit(entry: Omit<AuditEntry, "ts">, file = defaultAuditPath()): void {
-	const dir = join(file, "..");
-	mkdirSync(dir, { recursive: true, mode: 0o700 });
+/** Append one entry. Best-effort: a full or read-only disk returns false. */
+export function appendAudit(entry: Omit<AuditEntry, "ts">, file = defaultAuditPath()): boolean {
 	try {
-		chmodSync(dir, 0o700);
+		const dir = join(file, "..");
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		try {
+			chmodSync(dir, 0o700);
+		} catch {
+			/* best-effort */
+		}
+		appendFileSync(
+			file,
+			JSON.stringify({ ...entry, ts: new Date().toISOString() }) + "\n",
+			{ mode: 0o600 },
+		);
+		return true;
 	} catch {
-		/* best-effort */
+		return false;
 	}
-	appendFileSync(
-		file,
-		JSON.stringify({ ...entry, ts: new Date().toISOString() }) + "\n",
-		{ mode: 0o600 },
-	);
 }
 
 export function readAudit(file = defaultAuditPath(), limit = 50): AuditEntry[] {

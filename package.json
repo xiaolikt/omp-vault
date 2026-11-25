@@ -1,7 +1,7 @@
 {
 	"name": "omp-vault",
-	"version": "0.2.0",
-	"description": "omp/pi extension: local encrypted vault plus live Bitwarden. Query Bitwarden, import logins, or store secrets yourself — local passwords are entered in a desktop dialog.",
+	"version": "0.3.0",
+	"description": "omp/pi extension: local encrypted vault plus live Bitwarden. Query Bitwarden, import logins, or store secrets yourself — per-session unlock and grants, local passwords typed in a desktop dialog.",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/xiaolikt/omp-vault.git"
@@ -30,7 +30,8 @@
 	],
 	"scripts": {
 		"typecheck": "tsc --noEmit",
-		"test": "node --import tsx --test tests/*.test.mjs"
+		"test": "node --import tsx --test tests/*.test.mjs",
+		"test:smoke": "bash test/smoke.sh"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "^1.5.0",

@@ -3,8 +3,8 @@ export type ScrubValue = { env: string; value: string };
 
 /**
  * Replace a secret and its common encodings (base64, base64url, URL, hex) in
- * text. Short values (< 6 chars) are deliberately skipped: replacing them
- * would corrupt ordinary output more often than it protects anything.
+ * text. A form shorter than 6 characters is deliberately skipped: replacing
+ * it would corrupt ordinary output more often than it protects anything.
  */
 export function scrubText(input: string, values: Iterable<ScrubValue>): { text: string; changed: boolean } {
 	let text = input;
@@ -16,11 +16,9 @@ export function scrubText(input: string, values: Iterable<ScrubValue>): { text: 
 	};
 	for (const { env, value } of values) {
 		replace(value, `[BW_SCRUBBED:${env}]`);
-		if (value.length >= 16) {
-			const b64 = Buffer.from(value, "utf-8").toString("base64");
-			replace(b64, `[BW_SCRUBBED-B64:${env}]`);
-			replace(b64.replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_"), `[BW_SCRUBBED-B64URL:${env}]`);
-		}
+		const b64 = Buffer.from(value, "utf-8").toString("base64");
+		replace(b64, `[BW_SCRUBBED-B64:${env}]`);
+		replace(b64.replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_"), `[BW_SCRUBBED-B64URL:${env}]`);
 		const url = encodeURIComponent(value);
 		if (url !== value) replace(url, `[BW_SCRUBBED-URL:${env}]`);
 		replace(Buffer.from(value, "utf-8").toString("hex"), `[BW_SCRUBBED-HEX:${env}]`);
@@ -49,6 +47,10 @@ export function scrubDeep(
 		return { value: changed ? next : value, changed };
 	}
 	if (value && typeof value === "object") {
+		// Only plain data is rebuilt. A Date, Buffer, or class instance keeps its
+		// prototype: it is returned as is instead of being turned into `{}`.
+		const proto = Object.getPrototypeOf(value);
+		if (proto !== Object.prototype && proto !== null) return { value, changed: false };
 		let changed = false;
 		const next: Record<string, unknown> = {};
 		for (const [key, entry] of Object.entries(value)) {

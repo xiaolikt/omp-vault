@@ -3,50 +3,58 @@
  *
  * Security model
  * ==============
- * - Master password: prompted via Zenity (desktop) or pi TUI input. Lives in
- *   memory only for the duration of one `bw unlock` call, passed via env var
- *   (never argv). The session key (BW_SESSION) stays in this process's memory:
- *   never on disk, never in the bash environment, never in logs or results.
- * - bw_inject: fetches a secret and injects it as an env var into bash tool
- *   child processes (pi only: createBashTool's spawnHook). The model never
+ * - Master password: asked in a desktop window, or the host's input dialog
+ *   when no window can open (prompt.ts). Lives in memory only for the duration
+ *   of one `bw unlock` call, passed via env var (never argv). The session key
+ *   (BW_SESSION) stays in this process's memory: never on disk, never in the
+ *   bash environment, never in logs or results.
+ * - One unlock per session or subagent: omp rebinds the extension for each, and
+ *   every binding owns its session key. A subagent or a second session cannot
+ *   use an unlock that is not its own.
+ * - bw_inject (pi only): fetches a secret and injects it as an env var into
+ *   this binding's bash tool (createBashTool's spawnHook). The model never
  *   sees the value. A tool_result scrubber replaces every active secret
  *   (raw/base64/base64url/URL/hex, plus details/structuredContent) in ALL tool
  *   results before they reach the model (catches `echo $VAR`).
  * - bw_run: runs one command with the secret in its environment. This is the
  *   OMP path (OMP discards spawnHook env), and also works on pi. Output is
  *   scrubbed; nothing is persisted after the command exits.
+ * - Every confirmation names the entry that was really matched, not the
+ *   model's reference, and is answered before any secret is read.
  * - bw_clipboard: copies a secret to the system clipboard, auto-cleared after
  *   the configured delay and on lock/exit (only if it still holds our value).
- * - bw_reveal (optional, per-call confirmation): returns a secret in plain
- *   text. The value then transits the LLM provider and the session file —
+ * - bw_reveal (off by default, per-call confirmation): returns a secret in
+ *   plain text. The value then transits the LLM provider and the session file —
  *   that is inherent, hence every reveal needs explicit approval.
  * - Auto-lock: configurable idle timeout (config.json, default: session-lifetime,
- *   i.e. unlock once per pi session); always on /bw lock, on /new //fork session
- *   switch, and on pi exit. Locking drops the session key and all injected vars.
+ *   i.e. unlock once per session); always on /bw lock and when the session is
+ *   left (/new, /fork, exit; a /resume keeps it when keepOnResume is set).
  * - Audit log: ~/.bw/pi-extension/audit.log (timestamps, item names, env var
  *   names, allow/deny — never secret values).
  * - Config: ~/.bw/pi-extension/config.json (autoLockMinutes, keepOnResume,
  *   clipboardClearSeconds, allowReveal, maxInjectedEnv).
  *
  * Requires: bitwarden CLI (`bw`), logged in (`bw login`).
- * Replaces mcp__bitwarden (removed); browser filling works via agent-browser:
- *   agent-browser fill @ref "$VAR"   (value never enters the conversation)
+ * Browser filling works via agent-browser: agent-browser fill @ref "$VAR"
+ *   (the value never enters the conversation).
  */
 
 import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionContext, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { bitwardenLogins, filterLogins, type LoginDraft } from "./import-map.js";
+import { onSessionLeave, withTier } from "./host.js";
+import { confirmWindow, hasDisplay, promptSecret } from "./prompt.js";
 import { scrubDeep, scrubText } from "./scrub.js";
 
 // ---------------------------------------------------------------------------
 // Configuration (defaults overridable via ~/.bw/pi-extension/config.json)
 // ---------------------------------------------------------------------------
-const STATE_DIR = path.join(homedir(), ".bw", "pi-extension");
+const STATE_DIR = process.env.OMP_VAULT_BW_DIR ?? path.join(homedir(), ".bw", "pi-extension");
 const CONFIG_PATH = path.join(STATE_DIR, "config.json");
 
 const DEFAULTS = {
@@ -58,7 +66,7 @@ const DEFAULTS = {
 	/** Clipboard auto-clear delay. */
 	clipboardClearSeconds: 30,
 	/** Allow bw_reveal (plain-text secret to the model, per-call confirmation). */
-	allowReveal: true,
+	allowReveal: false,
 	/** Upper bound on concurrently injected env vars. */
 	maxInjectedEnv: 12,
 };
@@ -133,13 +141,6 @@ const BW_LOGIN_HINT =
 // ---------------------------------------------------------------------------
 // State (memory only)
 // ---------------------------------------------------------------------------
-let sessionKey: string | undefined;
-let sessionVerifiedAt = 0;
-let lastActivity = 0;
-/** OMP exposes its package exports as `pi.pi`; upstream pi does not. */
-let ompHost = false;
-let lockTimer: NodeJS.Timeout | undefined;
-let unlockInFlight: Promise<string> | undefined;
 type BwItem = {
 	id?: string;
 	name?: string;
@@ -149,11 +150,30 @@ type BwItem = {
 };
 /** Only metadata is cached; secrets stay in the vault process until needed. */
 type LiteItem = { id: string; name: string; username: string; uri: string };
+type InjectedSecret = { value: string; item: string; field: string; at: number };
 
-let itemsCache: { at: number; items: LiteItem[] } | undefined;
+/**
+ * One session or subagent. omp rebinds the extension factory for each, so the
+ * session key, the injected variables, and the item cache belong to the binding
+ * that unlocked them and are never shared with another.
+ */
+export interface BwState {
+	key?: string;
+	verifiedAt: number;
+	lastActivity: number;
+	inFlight?: Promise<string>;
+	/** Bumped by lock(): an unlock that started earlier is discarded. */
+	epoch: number;
+	/** Metadata only; secrets stay with the CLI until a tool asks for one. */
+	cache?: { at: number; items: LiteItem[] };
+	/** pi only: ENV -> injected secret, read by this binding's bash tool. */
+	injected: Map<string, InjectedSecret>;
+	lockTimer?: NodeJS.Timeout;
+}
 
-/** Injected secrets: ENV -> { value, item, field, at }. Values never reach the model. */
-const injected = new Map<string, { value: string; item: string; field: string; at: number }>();
+export function newBwState(): BwState {
+	return { verifiedAt: 0, lastActivity: Date.now(), epoch: 0, injected: new Map() };
+}
 
 /**
  * Values the output scrubber must keep hiding, even after /bw clear or lock:
@@ -179,10 +199,6 @@ process.once("exit", () => {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-function hasDisplay(): boolean {
-	return !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
-}
-
 function safeStatus(ctx: ExtensionContext | undefined, text: string | undefined): void {
 	try {
 		ctx?.ui.setStatus("bitwarden", text);
@@ -197,27 +213,50 @@ function tail(s: string, n = 200): string {
 	return t.length > n ? t.slice(-n) : t;
 }
 
-function exec(
-	cmd: string,
-	args: string[],
-	opts: {
-		env?: Record<string, string>;
-		timeout?: number;
-		input?: string;
-		signal?: AbortSignal;
-		cwd?: string;
-	} = {},
-): Promise<{ stdout: string; stderr: string; code: number }> {
+/** Most output kept per stream; a runaway command must not exhaust memory. */
+const OUTPUT_CAP = 8 * 1024 * 1024;
+
+interface ExecOptions {
+	env?: Record<string, string>;
+	timeout?: number;
+	input?: string;
+	signal?: AbortSignal;
+	cwd?: string;
+	/** Run in its own process group, so a timeout also kills what it spawned. */
+	group?: boolean;
+}
+
+interface ExecResult {
+	stdout: string;
+	stderr: string;
+	code: number;
+	/** True when output past OUTPUT_CAP was dropped. */
+	truncated: boolean;
+}
+
+function exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
 	if (opts.signal?.aborted) return Promise.reject(new Error(`${cmd} cancelled`));
-	const { promise, resolve, reject } = Promise.withResolvers<{ stdout: string; stderr: string; code: number }>();
+	const { promise, resolve, reject } = Promise.withResolvers<ExecResult>();
 	const child = spawn(cmd, args, {
 		env: opts.env ? { ...process.env, ...opts.env } : process.env,
 		cwd: opts.cwd,
 		stdio: ["pipe", "pipe", "pipe"],
+		detached: opts.group === true,
 	});
 	let out = "";
 	let err = "";
+	let truncated = false;
 	let settled = false;
+	const kill = () => {
+		if (opts.group && child.pid) {
+			try {
+				process.kill(-child.pid, "SIGKILL");
+			} catch {
+				/* the group is already gone */
+			}
+		}
+		child.kill("SIGKILL");
+	};
 	const cleanup = () => {
 		clearTimeout(timer);
 		opts.signal?.removeEventListener("abort", onAbort);
@@ -230,23 +269,29 @@ function exec(
 	};
 	const onAbort = () =>
 		finish(() => {
-			child.kill("SIGKILL");
+			kill();
 			reject(new Error(`${cmd} cancelled`));
 		});
 	const timer = setTimeout(
 		() =>
 			finish(() => {
-				child.kill("SIGKILL");
+				kill();
 				reject(new Error(`${cmd} timed out after ${opts.timeout ?? BW_TIMEOUT_MS}ms`));
 			}),
 		opts.timeout ?? BW_TIMEOUT_MS,
 	);
 	opts.signal?.addEventListener("abort", onAbort, { once: true });
 	if (opts.signal?.aborted) onAbort();
-	child.stdout?.on("data", (d) => (out += d));
-	child.stderr?.on("data", (d) => (err += d));
+	child.stdout?.on("data", (chunk: Buffer | string) => {
+		if (out.length < OUTPUT_CAP) out += chunk;
+		else truncated = true;
+	});
+	child.stderr?.on("data", (chunk: Buffer | string) => {
+		if (err.length < OUTPUT_CAP) err += chunk;
+		else truncated = true;
+	});
 	child.on("error", (e) => finish(() => reject(e)));
-	child.on("close", (code) => finish(() => resolve({ stdout: out, stderr: err, code: code ?? -1 })));
+	child.on("close", (code) => finish(() => resolve({ stdout: out, stderr: err, code: code ?? -1, truncated })));
 	child.stdin?.on("error", () => {}); // EPIPE when the child dies before reading input
 	if (opts.input !== undefined) child.stdin?.write(opts.input);
 	child.stdin?.end();
@@ -347,47 +392,17 @@ async function bwStatus(session?: string, signal?: AbortSignal): Promise<any> {
 	return json;
 }
 
-async function askMasterPassword(
-	ctx: ExtensionContext | undefined,
-	reason: string,
-	signal?: AbortSignal,
-): Promise<string> {
+/** The Bitwarden master password, in a window or the host's input dialog. */
+async function askMasterPassword(ctx: ExtensionContext | undefined, signal?: AbortSignal): Promise<string> {
+	const pw = await promptSecret(ctx, "Bitwarden · 主密码", "解锁 Bitwarden 保险库", signal);
+	if (pw) return pw;
 	if (signal?.aborted) throw new Error("Cancelled.");
-	if (hasDisplay()) {
-		try {
-			const r = await exec(
-				"zenity",
-				["--password", `--title=pi · Bitwarden master password — ${reason}`],
-				{ timeout: 10 * 60_000, signal },
-			);
-			if (r.code !== 0) throw new Error("cancelled");
-			const pw = r.stdout.replace(/[\r\n]+$/, "");
-			if (!pw) throw new Error("cancelled");
-			return pw;
-		} catch (e: unknown) {
-			const message = e instanceof Error ? e.message : String(e);
-			if (message === "cancelled" || message === "Master password prompt cancelled.") {
-				throw new Error("Master password prompt cancelled.");
-			}
-			if (signal?.aborted) throw new Error("Cancelled.");
-			// zenity missing/broken → fall through to TUI input
-		}
-	}
-	if (ctx?.hasUI) {
-		// OMP honors `secret` and masks the input; upstream pi ignores the option.
-		const secretHint = { secret: true } as never;
-		const pw = await ctx.ui.input(
-			"Bitwarden master password (masked where supported — desktop prompt unavailable)",
-			reason,
-			secretHint,
+	if (!hasDisplay() && !ctx?.hasUI) {
+		throw new Error(
+			"No way to prompt for the master password (no desktop, no interactive UI). Run /bw unlock in an interactive session.",
 		);
-		if (signal?.aborted) throw new Error("Cancelled.");
-		if (!pw) throw new Error("Master password prompt cancelled.");
-		return pw;
 	}
-	throw new Error(
-		"No way to prompt for the master password (no TUI, no desktop). Run /bw unlock in an interactive pi session.",
-	);
+	throw new Error("Master password prompt cancelled.");
 }
 
 async function confirmAction(
@@ -396,51 +411,41 @@ async function confirmAction(
 	message: string,
 	signal?: AbortSignal,
 ): Promise<boolean> {
+	const ok = await confirmWindow(ctx, title, message, signal);
 	if (signal?.aborted) throw new Error("Cancelled.");
-	if (ctx?.hasUI) {
-		const ok = await ctx.ui.confirm(title, message);
-		if (signal?.aborted) throw new Error("Cancelled.");
-		return ok === true;
-	}
-	if (hasDisplay()) {
-		try {
-			const r = await exec("zenity", ["--question", `--title=${title}`, "--text", message], {
-				timeout: 10 * 60_000,
-				signal,
-			});
-			if (process.env.BW_MOCK_DIR) {
-				try { await fs.appendFile(`${process.env.BW_MOCK_DIR}/confirm.log`, `zenity code=${r.code} stderr=${tail(r.stderr, 40)}\n`); } catch {}
-			}
-			return r.code === 0;
-		} catch {
-			if (signal?.aborted) throw new Error("Cancelled.");
-			return false;
-		}
-	}
-	return false;
+	return ok;
 }
 
-function startAutoLock(): void {
-	lastActivity = Date.now();
-	if (lockTimer || !autoLockMs) return;
-	lockTimer = setInterval(() => {
-		if (sessionKey && autoLockMs && Date.now() - lastActivity > autoLockMs) {
-			void lock("auto-idle");
-		}
-	}, 30_000);
-	lockTimer.unref?.();
+function touchActivity(st: BwState): void {
+	st.lastActivity = Date.now();
 }
 
-async function lock(reason: string): Promise<void> {
-	const hadSession = !!sessionKey;
-	sessionKey = undefined;
-	sessionVerifiedAt = 0;
-	itemsCache = undefined;
-	injected.clear();
+function startAutoLock(st: BwState, ctx: ExtensionContext | undefined): void {
+	st.lastActivity = Date.now();
+	if (st.lockTimer || !autoLockMs) return;
+	const tick = () => {
+		if (st.key && autoLockMs && Date.now() - st.lastActivity > autoLockMs) {
+			void lock(st, "auto-idle");
+		}
+	};
+	// A timer made through omp's context is cleared for us on session_shutdown.
+	const host = ctx as { setInterval?: (callback: () => void, ms?: number) => NodeJS.Timeout } | undefined;
+	st.lockTimer = host?.setInterval ? host.setInterval(tick, 30_000) : setInterval(tick, 30_000);
+	st.lockTimer.unref?.();
+}
+
+/** Drop this binding's session key and injected variables, and the clipboard. */
+async function lock(st: BwState, reason: string): Promise<void> {
+	const hadSession = !!st.key;
+	st.epoch++;
+	st.key = undefined;
+	st.verifiedAt = 0;
+	st.cache = undefined;
+	st.injected.clear();
 	await clearClipboardIfOwner();
-	if (lockTimer) {
-		clearInterval(lockTimer);
-		lockTimer = undefined;
+	if (st.lockTimer) {
+		clearInterval(st.lockTimer);
+		st.lockTimer = undefined;
 	}
 	if (hadSession) {
 		await audit("lock", `reason=${reason}`);
@@ -453,35 +458,32 @@ async function lock(reason: string): Promise<void> {
 	}
 }
 
-function touchActivity(): void {
-	lastActivity = Date.now();
-}
-
-async function ensureUnlocked(ctx: ExtensionContext | undefined, signal?: AbortSignal): Promise<string> {
-	touchActivity();
+async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, signal?: AbortSignal): Promise<string> {
+	touchActivity(st);
 	if (signal?.aborted) throw new Error("Cancelled.");
-	if (sessionKey && Date.now() - sessionVerifiedAt < 30_000) return sessionKey;
-	if (sessionKey) {
+	if (st.key && Date.now() - st.verifiedAt < 30_000) return st.key;
+	if (st.key) {
 		try {
-			const st = await bwStatus(sessionKey, signal);
-			if (st?.status === "unlocked") {
-				sessionVerifiedAt = Date.now();
-				return sessionKey;
+			const status = await bwStatus(st.key, signal);
+			if (status?.status === "unlocked") {
+				st.verifiedAt = Date.now();
+				return st.key;
 			}
 		} catch {
 			if (signal?.aborted) throw new Error("Cancelled.");
 			/* stale session key */
 		}
-		sessionKey = undefined;
-		sessionVerifiedAt = 0;
+		st.key = undefined;
+		st.verifiedAt = 0;
 	}
-	if (unlockInFlight) return unlockInFlight;
+	if (st.inFlight) return st.inFlight;
 
-	unlockInFlight = (async () => {
-		const st = await bwStatus(undefined, signal); // no session env
-		if (st?.status === "unauthenticated") throw new Error(BW_LOGIN_HINT);
+	const epoch = st.epoch;
+	st.inFlight = (async () => {
+		const status = await bwStatus(undefined, signal); // no session env
+		if (status?.status === "unauthenticated") throw new Error(BW_LOGIN_HINT);
 
-		const pw = await askMasterPassword(ctx, "unlock vault", signal);
+		const pw = await askMasterPassword(ctx, signal);
 		const bin = await resolveBw();
 		const r = await exec(bin, ["unlock", "--passwordenv", "BW_MASTER_PASSWORD", "--raw"], {
 			env: { BW_MASTER_PASSWORD: pw },
@@ -496,12 +498,14 @@ async function ensureUnlocked(ctx: ExtensionContext | undefined, signal?: AbortS
 		if (!key) throw new Error("Unlock failed: empty session key.");
 		const verify = await bwStatus(key, signal);
 		if (verify?.status !== "unlocked") throw new Error("Unlock failed: session key not accepted.");
-		sessionKey = key;
-		sessionVerifiedAt = Date.now();
-		startAutoLock();
+		// /bw lock or a session switch ran while the password window was open.
+		if (epoch !== st.epoch || signal?.aborted) throw new Error("Cancelled.");
+		st.key = key;
+		st.verifiedAt = Date.now();
+		startAutoLock(st, ctx);
 		await audit("unlock", "ok");
 		// Refresh in the background: a full sync can take seconds on large vaults.
-		const lastSync = Date.parse(st?.lastSync ?? "");
+		const lastSync = Date.parse(status?.lastSync ?? "");
 		if (!Number.isFinite(lastSync) || Date.now() - lastSync > 15 * 60_000) {
 			void runBw(["sync"], { session: key }).catch(() => {
 				/* offline ok — cached vault */
@@ -509,9 +513,9 @@ async function ensureUnlocked(ctx: ExtensionContext | undefined, signal?: AbortS
 		}
 		return key;
 	})().finally(() => {
-		unlockInFlight = undefined;
+		st.inFlight = undefined;
 	});
-	return unlockInFlight;
+	return st.inFlight;
 }
 
 function toLite(raw: BwItem): LiteItem {
@@ -523,11 +527,11 @@ function toLite(raw: BwItem): LiteItem {
 	};
 }
 
-async function listItems(session: string, signal?: AbortSignal): Promise<LiteItem[]> {
-	if (itemsCache && Date.now() - itemsCache.at < 5 * 60_000) return itemsCache.items;
+async function listItems(st: BwState, session: string, signal?: AbortSignal): Promise<LiteItem[]> {
+	if (st.cache && Date.now() - st.cache.at < 5 * 60_000) return st.cache.items;
 	const raw = (await runBwJson(["list", "items"], session, signal)) as BwItem[];
 	const items = raw.map(toLite);
-	itemsCache = { at: Date.now(), items };
+	st.cache = { at: Date.now(), items };
 	return items;
 }
 
@@ -549,10 +553,10 @@ function itemScore(item: LiteItem, query: string): number {
 	return score;
 }
 
-async function resolveItem(session: string, ref: string, signal?: AbortSignal): Promise<BwItem> {
+async function resolveItem(st: BwState, session: string, ref: string, signal?: AbortSignal): Promise<BwItem> {
 	if (UUID_RE.test(ref)) return getItemById(session, ref, signal);
 
-	const items = await listItems(session, signal);
+	const items = await listItems(st, session, signal);
 	const query = ref.trim().toLowerCase();
 	if (!query) throw new Error("Item reference is empty; pass an item name or id.");
 	const exact = items.filter((i) => i.name.toLowerCase() === query);
@@ -598,37 +602,62 @@ function extractSecret(item: BwItem, field: string): string {
 	return v;
 }
 
-async function fetchSecret(
+/**
+ * Unlock, resolve the model's reference to the entry it really names, and ask
+ * the user about that entry. The window shows the resolved name and username,
+ * so a fuzzy or mistyped reference cannot be approved as some other entry, and
+ * nothing is read before the user agrees.
+ */
+async function approveItem(
+	st: BwState,
 	ctx: ExtensionContext | undefined,
+	event: string,
+	title: string,
 	itemRef: string,
+	field: string,
+	detail: string,
+	signal?: AbortSignal,
+): Promise<{ session: string; item: BwItem } | undefined> {
+	const session = await ensureUnlocked(st, ctx, signal);
+	const item = await resolveItem(st, session, itemRef, signal);
+	const name = item.name ?? "?";
+	const user = item.login?.username ? ` (user: ${item.login.username})` : "";
+	const ok = await confirmAction(ctx, title, `Item:   ${name}${user}\nField:  ${field}\n${detail}\n\nAllow?`, signal);
+	if (!ok) {
+		await audit(event, `deny item="${name}" field=${field}`);
+		return undefined;
+	}
+	return { session, item };
+}
+
+/** Read one field of an entry the user has already approved. */
+async function secretOf(
+	session: string,
+	item: BwItem,
 	field: string,
 	signal?: AbortSignal,
 ): Promise<{ value: string; itemId: string; itemName: string }> {
-	const session = await ensureUnlocked(ctx, signal);
-	const item = await resolveItem(session, itemRef, signal);
+	const itemName = item.name ?? "?";
 	if (field === "code") {
-		if (!item.id) throw new Error(`Bitwarden item "${item.name ?? "?"}" has no id, so no TOTP code can be generated.`);
+		if (!item.id) throw new Error(`Bitwarden item "${itemName}" has no id, so no TOTP code can be generated.`);
 		const code = (await runBw(["get", "totp", item.id], { session, signal })).trim();
-		if (!code) throw new Error(`No TOTP code available for item "${item.name ?? "?"}".`);
-		return { value: code, itemId: item.id, itemName: item.name ?? "?" };
+		if (!code) throw new Error(`No TOTP code available for item "${itemName}".`);
+		return { value: code, itemId: item.id, itemName };
 	}
-	return {
-		value: extractSecret(item, field),
-		itemId: item.id ?? "?",
-		itemName: item.name ?? "?",
-	};
+	return { value: extractSecret(item, field), itemId: item.id ?? "?", itemName };
 }
 
 export type BitwardenMeta = { id: string; name: string; username: string; uri: string };
 
 /** Metadata only. Unlocks Bitwarden (master-password window) on first use. */
 export async function queryBitwarden(
+	st: BwState,
 	ctx: ExtensionContext | undefined,
 	search: string | undefined,
 	signal?: AbortSignal,
 ): Promise<BitwardenMeta[]> {
-	const session = await ensureUnlocked(ctx, signal);
-	let items = await listItems(session, signal);
+	const session = await ensureUnlocked(st, ctx, signal);
+	let items = await listItems(st, session, signal);
 	const query = (search ?? "").trim().toLowerCase();
 	if (query) {
 		items = items.filter((item) => `${item.name}\n${item.username}\n${item.uri}`.toLowerCase().includes(query));
@@ -641,11 +670,12 @@ export async function queryBitwarden(
  * Call only after the user has agreed to the import — this reads secrets.
  */
 export async function pullBitwardenLogins(
+	st: BwState,
 	ctx: ExtensionContext | undefined,
 	search: string | undefined,
 	signal?: AbortSignal,
 ): Promise<LoginDraft[]> {
-	const session = await ensureUnlocked(ctx, signal);
+	const session = await ensureUnlocked(st, ctx, signal);
 	const raw: unknown = await runBwJson(["list", "items"], session, signal);
 	return filterLogins(bitwardenLogins(raw), search);
 }
@@ -661,9 +691,9 @@ function normalizeEnvName(raw: string): string {
 	return name;
 }
 
-function injectedListText(): string {
-	if (injected.size === 0) return "(none)";
-	return [...injected.entries()].map(([env, r]) => `$${env} ← "${r.item}" (${r.field})`).join(", ");
+function injectedListText(st: BwState): string {
+	if (st.injected.size === 0) return "(none)";
+	return [...st.injected.entries()].map(([env, r]) => `$${env} ← "${r.item}" (${r.field})`).join(", ");
 }
 
 // ---------------------------------------------------------------------------
@@ -822,17 +852,48 @@ async function scrubArtifact(details: unknown): Promise<void> {
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
-export function registerBitwarden(pi: ExtensionAPI): void {
-	ompHost = "pi" in pi;
+const itemField = {
+	item: Type.String({ description: "Item name or id (see bw_list)" }),
+	field: Type.Optional(
+		Type.String({
+			description:
+				"password | totp (seed) | code (rotating TOTP code) | notes | field:<customFieldName> (default: password)",
+		}),
+	),
+};
+const bwListParams = Type.Object({
+	search: Type.Optional(Type.String({ description: "Substring filter on name, username, or URI" })),
+	offset: Type.Optional(Type.Number({ description: "Rows to skip (default 0)" })),
+	limit: Type.Optional(Type.Number({ description: "Rows to return (default 60, max 200)" })),
+});
+const bwInjectParams = Type.Object({
+	...itemField,
+	env: Type.String({ description: "Env var name for bash commands, e.g. MYAPP_TOKEN" }),
+});
+const bwRunParams = Type.Object({
+	...itemField,
+	env: Type.Optional(Type.String({ description: "Env var name available to the command (default VAULT_SECRET)" })),
+	command: Type.String({ description: "Shell command; use $VAULT_SECRET for the value" }),
+	cwd: Type.Optional(Type.String({ description: "Working directory (default: current session cwd)" })),
+	timeout: Type.Optional(Type.Number({ description: "Seconds (default 120, max 600)" })),
+});
+const bwSecretParams = Type.Object(itemField);
+const bwRevealParams = Type.Object({
+	...itemField,
+	reason: Type.String({ description: "Why the plain-text value is needed (shown to the user)" }),
+});
 
-	// pi honors createBashTool's spawnHook. OMP already has its own bash tool
-	// and discards that env, so registering another bash would shadow it.
+/**
+ * Register the Bitwarden tools for one binding. `st` is that binding's own
+ * state (see BwState), so nothing here can reach another session's unlock.
+ */
+export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolean): void {
+	// pi honors createBashTool's spawnHook. OMP already has its own bash tool and
+	// discards that env, so registering another bash would only shadow it.
 	if (!ompHost) {
 		const bashTool = createBashTool(process.cwd(), {
 			spawnHook: ({ command, cwd, env }) => {
-				if (injected.size > 0) {
-					for (const [name, rec] of injected) env[name] = rec.value;
-				}
+				for (const [name, rec] of st.injected) env[name] = rec.value;
 				return { command, cwd, env };
 			},
 		});
@@ -841,30 +902,27 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 
 	// Bash activity counts toward the idle auto-lock.
 	pi.on("tool_call", async (event) => {
-		if (event.toolName === "bash") touchActivity();
+		if (event.toolName === "bash") touchActivity(st);
 		return undefined;
 	});
 
 	// --- bw_list: vault map without secrets ---
-	pi.registerTool({
+	const delivery = ompHost ? "bw_run" : "bw_inject";
+	const bwList: ToolDefinition<typeof bwListParams> = {
 		name: "bw_list",
 		label: "Bitwarden list",
 		description:
 			"List Bitwarden vault items: name, username, URI, id. NEVER returns passwords, TOTP, notes or field values. " +
 			"Search matches item name, username, or URI. Paginated with offset/limit. " +
-			"First use in a session prompts for the master password (unlock). Use it to find item names/ids before bw_inject or vault_import. " +
+			`First use in a session prompts for the Bitwarden master password (unlock). Use it to find item names/ids before ${delivery} or vault_import. ` +
 			"This reads Bitwarden live; vault_list is the separate local omp-vault store.",
 		promptSnippet: "List Bitwarden items (no secrets)",
 		promptGuidelines: [
-			"Use bw_list to find Bitwarden item names/ids, then bw_inject to pass a credential to a bash command.",
+			`Use bw_list to find Bitwarden item names/ids, then ${delivery} to pass a credential to a command.`,
 		],
-		parameters: Type.Object({
-			search: Type.Optional(Type.String({ description: "Substring filter on name, username, or URI" })),
-			offset: Type.Optional(Type.Number({ description: "Rows to skip (default 0)" })),
-			limit: Type.Optional(Type.Number({ description: "Rows to return (default 60, max 200)" })),
-		}),
+		parameters: bwListParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
-			const session = await ensureUnlocked(ctx, signal);
+			const session = await ensureUnlocked(st, ctx, signal);
 			const offsetInput = params.offset;
 			const limitInput = params.limit;
 			const offset =
@@ -875,7 +933,7 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 				typeof limitInput === "number" && Number.isFinite(limitInput)
 					? Math.min(200, Math.max(1, Math.trunc(limitInput)))
 					: 60;
-			let items = [...(await listItems(session, signal))].sort((a, b) => a.name.localeCompare(b.name));
+			let items = [...(await listItems(st, session, signal))].sort((a, b) => a.name.localeCompare(b.name));
 			const query = (params.search ?? "").trim().toLowerCase();
 			if (query) {
 				items = items.filter((i) => `${i.name}\n${i.username}\n${i.uri}`.toLowerCase().includes(query));
@@ -895,96 +953,86 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 				more;
 			return { content: [{ type: "text", text }], details: { count: items.length, offset, limit } };
 		},
-	});
+	};
+	pi.registerTool(withTier(bwList, "read"));
 
 	// --- bw_inject: secret -> bash env, model never sees the value ---
-	pi.registerTool({
-		name: "bw_inject",
-		label: "Bitwarden inject",
-		description:
-			"pi only (OMP requires bw_run): fetch a Bitwarden secret and inject it as an environment variable into bash tool commands. " +
-			"The VALUE IS NEVER SHOWN to you nor stored in the conversation; reference it as $VAR in later bash commands. " +
-			"Requires user confirmation per injection. Use when a command needs a credential (API token, docker login, git push, ...). " +
-			"Browser filling: agent-browser fill @ref \"$VAR\" types it into a form without the value entering the conversation. " +
-			"Prefer this over bw_reveal. field: 'password' (default) | 'totp' (seed) | 'code' (rotating TOTP code) | 'notes' | 'field:<customFieldName>'.",
-		promptSnippet: "Pass a Bitwarden secret to bash via env var (value hidden from model)",
-		promptGuidelines: [
-			"Use bw_inject when a bash command needs a Bitwarden credential; never ask the user to paste secrets into chat.",
-			"To fill a browser login with agent-browser: bw_inject the secret, then run agent-browser fill @ref \"$VAR\" — the value stays out of the conversation.",
-			"For repeated browser logins, import once with: printenv $VAR | agent-browser auth save <name> --username <user> --password-stdin — afterwards agent-browser auth login <name> needs no secret.",
-		],
-		parameters: Type.Object({
-			item: Type.String({ description: "Item name or id (see bw_list)" }),
-			field: Type.Optional(
-				Type.String({
-					description:
-						"password | totp (seed) | code (rotating TOTP) | notes | field:<customFieldName> (default: password)",
-				}),
-			),
-			env: Type.String({ description: "Env var name for bash commands, e.g. MYAPP_TOKEN" }),
-		}),
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			const field = (params.field ?? "password").trim();
-			if (!FIELD_RE.test(field)) {
-				throw new Error(`Invalid field "${field}". Use password | totp | code | notes | field:<name>.`);
-			}
-			if (ompHost) {
-				throw new Error(
-					"bw_inject does not work on OMP: its bash tool discards the spawnHook env. Use bw_run instead " +
-						"(command runs with $VAULT_SECRET in its env), or bw_clipboard/bw_reveal.",
+	// OMP drops the bash spawnHook env, so there the tool is not offered at all.
+	if (!ompHost) {
+		const bwInject: ToolDefinition<typeof bwInjectParams> = {
+			name: "bw_inject",
+			label: "Bitwarden inject",
+			description:
+				"Fetch a Bitwarden secret and inject it as an environment variable into bash tool commands. " +
+				"The VALUE IS NEVER SHOWN to you nor stored in the conversation; reference it as $VAR in later bash commands. " +
+				"Requires user confirmation per injection. Use when a command needs a credential (API token, docker login, git push, ...). " +
+				"Browser filling: agent-browser fill @ref \"$VAR\" types it into a form without the value entering the conversation. " +
+				"Prefer this over bw_reveal. field: 'password' (default) | 'totp' (seed) | 'code' (rotating TOTP code) | 'notes' | 'field:<customFieldName>'.",
+			promptSnippet: "Pass a Bitwarden secret to bash via env var (value hidden from model)",
+			promptGuidelines: [
+				"Use bw_inject when a bash command needs a Bitwarden credential; never ask the user to paste secrets into chat.",
+				"To fill a browser login with agent-browser: bw_inject the secret, then run agent-browser fill @ref \"$VAR\" — the value stays out of the conversation.",
+				"For repeated browser logins, import once with: printenv $VAR | agent-browser auth save <name> --username <user> --password-stdin — afterwards agent-browser auth login <name> needs no secret.",
+			],
+			parameters: bwInjectParams,
+			async execute(_id, params, signal, _onUpdate, ctx) {
+				const field = (params.field ?? "password").trim();
+				if (!FIELD_RE.test(field)) {
+					throw new Error(`Invalid field "${field}". Use password | totp | code | notes | field:<name>.`);
+				}
+				const envName = normalizeEnvName(params.env);
+				if (!st.injected.has(envName) && st.injected.size >= CONFIG.maxInjectedEnv) {
+					throw new Error(`Too many injected vars (max ${CONFIG.maxInjectedEnv}). Run /bw clear to drop some.`);
+				}
+
+				const replaced = st.injected.get(envName);
+				const approved = await approveItem(
+					st,
+					ctx,
+					"inject",
+					"Bitwarden: inject secret into AI bash environment",
+					params.item,
+					field,
+					`Env:     $${envName}` +
+						(replaced ? `\nReplaces: "${replaced.item}" (${replaced.field})` : "") +
+						`\n\nCommands run by the AI in this session will see $${envName}.` +
+						`\nThe value itself is never shown to the AI nor stored in the chat.` +
+						`\nDropped on ` +
+						(autoLockMs ? `idle lock (${Math.round(autoLockMs / 60000)} min) or /bw lock` : `/bw lock or session end`) +
+						`.`,
+					signal,
 				);
-			}
-			const envName = normalizeEnvName(params.env);
-			if (!injected.has(envName) && injected.size >= CONFIG.maxInjectedEnv) {
-				throw new Error(`Too many injected vars (max ${CONFIG.maxInjectedEnv}). Run /bw clear to drop some.`);
-			}
+				if (!approved) throw new Error("User declined the injection.");
 
-			const replaced = injected.get(envName);
-			const ok = await confirmAction(
-				ctx,
-				"Bitwarden: inject secret into AI bash environment",
-				`Item:   ${params.item}\nField:  ${field}\nEnv:    $${envName}` +
-					(replaced ? `\n\nReplaces current injection: "${replaced.item}" (${replaced.field})` : "") +
-					`\n\nCommands run by the AI in this pi session will see $${envName}.` +
-					`\nThe value itself is never shown to the AI nor stored in the chat.` +
-					`\nDropped on ` +
-					(autoLockMs ? `idle lock (${Math.round(autoLockMs / 60000)} min) or /bw lock` : `/bw lock or session end`) +
-					`.` +
-					`\n\nAllow?`,
-				signal,
-			);
-			if (!ok) {
-				await audit("inject", `deny env=${envName} item="${params.item}" field=${field}`);
-				throw new Error("User declined the injection.");
-			}
+				const { value, itemId, itemName } = await secretOf(approved.session, approved.item, field, signal);
+				st.injected.set(envName, { value, item: itemName, field, at: Date.now() });
+				rememberScrubValue(envName, value);
+				await audit("inject", `allow env=${envName} item="${itemName}" (${itemId}) field=${field}`);
+				safeStatus(ctx, `🔓 bw: ${st.injected.size} env var(s)`);
+				const weak =
+					value.length < 6
+						? " WARNING: this value is shorter than 6 characters, so tool output cannot be reliably scrubbed."
+						: "";
 
-			const { value, itemId, itemName } = await fetchSecret(ctx, params.item, field, signal);
-			injected.set(envName, { value, item: itemName, field, at: Date.now() });
-			rememberScrubValue(envName, value);
-			await audit("inject", `allow env=${envName} item="${itemName}" (${itemId}) field=${field}`);
-			safeStatus(ctx, `🔓 bw: ${injected.size} env var(s)`);
-			const weak =
-				value.length < 6
-					? " WARNING: this value is shorter than 6 characters, so tool output cannot be reliably scrubbed."
-					: "";
-
-			return {
-				content: [
-					{
-						type: "text",
-						text:
-							`Injected $${envName} (item "${itemName}", field ${field}) into the bash environment. ` +
-							`Use $${envName} in bash commands. Do NOT try to print, echo, or exfiltrate it — output is scrubbed.${weak} ` +
-							`Active injected vars: ${injectedListText()}`,
-					},
-				],
-				details: { env: envName, item: itemName, field },
-			};
-		},
-	});
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`Injected $${envName} (item "${itemName}", field ${field}) into the bash environment. ` +
+								`Use $${envName} in bash commands. Do NOT try to print, echo, or exfiltrate it — output is scrubbed.${weak} ` +
+								`Active injected vars: ${injectedListText(st)}`,
+						},
+					],
+					details: { env: envName, item: itemName, field },
+				};
+			},
+		};
+		pi.registerTool(bwInject);
+	}
 
 	// --- bw_run: one command with the secret in its env (works on OMP) ---
-	pi.registerTool({
+	const bwRun: ToolDefinition<typeof bwRunParams> = {
 		name: "bw_run",
 		label: "Bitwarden run",
 		description:
@@ -997,18 +1045,7 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 			"Use bw_run for a command that needs a Bitwarden credential; reference it as $VAULT_SECRET.",
 			"Never print or echo the value; prefer piping it into the consumer (e.g. --password-stdin).",
 		],
-		parameters: Type.Object({
-			item: Type.String({ description: "Item name or id (see bw_list)" }),
-			field: Type.Optional(
-				Type.String({ description: "password | totp (seed) | code (rotating TOTP) | notes | field:<name> (default: password)" }),
-			),
-			env: Type.Optional(
-				Type.String({ description: "Env var name available to the command (default VAULT_SECRET)" }),
-			),
-			command: Type.String({ description: "Shell command; use $VAULT_SECRET for the value" }),
-			cwd: Type.Optional(Type.String({ description: "Working directory (default: current session cwd)" })),
-			timeout: Type.Optional(Type.Number({ description: "Seconds (default 120, max 600)" })),
-		}),
+		parameters: bwRunParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const field = (params.field ?? "password").trim();
 			if (!FIELD_RE.test(field)) {
@@ -1022,25 +1059,26 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 					? Math.min(600, Math.max(1, Math.trunc(timeoutInput)))
 					: 120;
 			const cwd = params.cwd?.trim() || ctx.cwd || process.cwd();
-			const ok = await confirmAction(
+			const approved = await approveItem(
+				st,
 				ctx,
+				"run",
 				"Bitwarden: run command with secret",
-				`Item:    ${params.item}\nField:   ${field}\nEnv:     $${envName}\nCwd:     ${cwd}\n` +
-					`Command:\n${params.command}\n\n` +
-					`The command runs once with $${envName} set. The value never enters the chat; output is scrubbed.\n\nAllow?`,
+				params.item,
+				field,
+				`Env:     $${envName}\nCwd:     ${cwd}\nCommand:\n${params.command}\n\n` +
+					`The command runs once with $${envName} set. The value never enters the chat; output is scrubbed.`,
 				signal,
 			);
-			if (!ok) {
-				await audit("run", `deny env=${envName} item="${params.item}" field=${field}`);
-				throw new Error("User declined the command.");
-			}
-			const { value, itemName } = await fetchSecret(ctx, params.item, field, signal);
+			if (!approved) throw new Error("User declined the command.");
+			const { value, itemName } = await secretOf(approved.session, approved.item, field, signal);
 			rememberScrubValue(envName, value);
 			const r = await exec("bash", ["-c", params.command], {
 				env: { [envName]: value },
 				cwd,
 				timeout: seconds * 1000,
 				signal,
+				group: true,
 			});
 			await audit("run", `allow env=${envName} item="${itemName}" field=${field} exit=${r.code}`);
 			const raw = [r.stdout, r.stderr].filter((s) => s.length > 0).join("\n");
@@ -1049,22 +1087,24 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 				scrubbed.length > 32_000
 					? `... (truncated to the last 32000 chars)\n${scrubbed.slice(-32_000)}`
 					: scrubbed;
+			const dropped = r.truncated ? "(command output past 8 MiB was dropped)\n" : "";
 			return {
 				content: [
 					{
 						type: "text",
 						text:
-							`Ran with $${envName} (item "${itemName}", field ${field}); exit ${r.code}.\n` +
+							`Ran with $${envName} (item "${itemName}", field ${field}); exit ${r.code}.\n${dropped}` +
 							(output ? `--- output ---\n${output}` : "(no output)"),
 					},
 				],
-				details: { item: itemName, field, env: envName, exit: r.code },
+				details: { item: itemName, field, env: envName, exit: r.code, truncated: r.truncated },
 			};
 		},
-	});
+	};
+	pi.registerTool(withTier(bwRun, "exec"));
 
 	// --- bw_clipboard: secret -> clipboard, auto-cleared ---
-	pi.registerTool({
+	const bwClipboard: ToolDefinition<typeof bwSecretParams> = {
 		name: "bw_clipboard",
 		label: "Bitwarden clipboard",
 		description:
@@ -1073,26 +1113,22 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 			". The value never enters the conversation. Requires user confirmation. " +
 			"field: 'password' (default) | 'totp' (seed) | 'code' (rotating TOTP code) | 'notes' | 'field:<customFieldName>'.",
 		promptSnippet: "Copy a Bitwarden secret to clipboard (auto-clear)",
-		parameters: Type.Object({
-			item: Type.String({ description: "Item name or id (see bw_list)" }),
-			field: Type.Optional(
-				Type.String({ description: "password | totp (seed) | code (rotating TOTP) | notes | field:<name> (default: password)" }),
-			),
-		}),
+		parameters: bwSecretParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const field = (params.field ?? "password").trim();
 			if (!FIELD_RE.test(field)) throw new Error(`Invalid field "${field}".`);
-			const ok = await confirmAction(
+			const approved = await approveItem(
+				st,
 				ctx,
+				"clipboard",
 				"Bitwarden: copy secret to clipboard",
-				`Item:   ${params.item}\nField:  ${field}\n\nThe value is copied to the system clipboard; ${CLIPBOARD_CLEAR_TEXT}. It never enters the chat.\n\nAllow?`,
+				params.item,
+				field,
+				`The value is copied to the system clipboard; ${CLIPBOARD_CLEAR_TEXT}. It never enters the chat.`,
 				signal,
 			);
-			if (!ok) {
-				await audit("clipboard", `deny item="${params.item}" field=${field}`);
-				throw new Error("User declined.");
-			}
-			const { value, itemName } = await fetchSecret(ctx, params.item, field, signal);
+			if (!approved) throw new Error("User declined.");
+			const { value, itemName } = await secretOf(approved.session, approved.item, field, signal);
 			await copyToClipboard(value);
 			await audit("clipboard", `allow item="${itemName}" field=${field}`);
 			const clears =
@@ -1102,52 +1138,51 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 				details: { item: itemName, field },
 			};
 		},
-	});
+	};
+	pi.registerTool(withTier(bwClipboard, "write"));
 
 	// --- bw_reveal: plain text to the model, per-call confirmation ---
-	pi.registerTool({
+	const bwReveal: ToolDefinition<typeof bwRevealParams> = {
 		name: "bw_reveal",
 		label: "Bitwarden reveal (danger)",
 		description:
 			"Return a Bitwarden secret in PLAIN TEXT. DANGEROUS: the value will be sent to the LLM provider and stored in the session file. " +
-			"Requires explicit user confirmation every single call. Only use when bw_inject / bw_clipboard genuinely cannot do the job. " +
+			"Requires explicit user confirmation every single call, and is disabled unless allowReveal is set in the config. " +
+			"Only use when bw_inject / bw_clipboard genuinely cannot do the job. " +
 			"field: 'password' (default) | 'totp' (seed) | 'code' (rotating TOTP code) | 'notes' | 'field:<customFieldName>'.",
 		promptSnippet: "Reveal a Bitwarden secret in plain text (per-call approval)",
 		promptGuidelines: [
 			"Use bw_reveal only as a last resort; prefer bw_inject (bash env) or bw_clipboard which keep the value out of the conversation.",
 		],
-		parameters: Type.Object({
-			item: Type.String({ description: "Item name or id (see bw_list)" }),
-			field: Type.Optional(
-				Type.String({ description: "password | totp (seed) | code (rotating TOTP) | notes | field:<name> (default: password)" }),
-			),
-			reason: Type.String({ description: "Why the plain-text value is needed (shown to the user)" }),
-		}),
+		parameters: bwRevealParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
-			if (!CONFIG.allowReveal) throw new Error("bw_reveal is disabled in this installation (CONFIG.allowReveal).");
+			if (!CONFIG.allowReveal) {
+				throw new Error("bw_reveal is disabled in this installation (set allowReveal in ~/.bw/pi-extension/config.json to enable it).");
+			}
 			const field = (params.field ?? "password").trim();
 			if (!FIELD_RE.test(field)) throw new Error(`Invalid field "${field}".`);
 			const provider = ctx?.model?.provider ?? "the LLM provider";
-			const ok = await confirmAction(
+			const approved = await approveItem(
+				st,
 				ctx,
+				"reveal",
 				"⚠️ Bitwarden: reveal secret IN PLAIN TEXT",
-				`Item:   ${params.item}\nField:  ${field}\nReason: ${params.reason}\n\n` +
-					`The value will be shown to the AI, sent to ${provider}, and stored in the pi session file.\n` +
-					`bw_inject (env var) or bw_clipboard usually suffice.\n\nAllow?`,
+				params.item,
+				field,
+				`Reason: ${params.reason}\n\n` +
+					`The value will be shown to the AI, sent to ${provider}, and stored in the session file.`,
 				signal,
 			);
-			if (!ok) {
-				await audit("reveal", `deny item="${params.item}" field=${field}`);
-				throw new Error("User declined the reveal.");
-			}
-			const { value, itemName } = await fetchSecret(ctx, params.item, field, signal);
+			if (!approved) throw new Error("User declined the reveal.");
+			const { value, itemName } = await secretOf(approved.session, approved.item, field, signal);
 			await audit("reveal", `allow item="${itemName}" field=${field}`);
 			return {
 				content: [{ type: "text", text: `${itemName} (${field}):\n<secret>${value}</secret>` }],
 				details: { item: itemName, field },
 			};
 		},
-	});
+	};
+	pi.registerTool(bwReveal);
 
 	// --- Scrubber: active secrets never reach the model via tool results ---
 	pi.on("tool_result", async (event) => {
@@ -1180,7 +1215,7 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 			const parts = (args ?? "status").trim().split(/\s+/);
 			const sub = parts[0] || "status";
 			if (sub === "lock") {
-				await lock("user");
+				await lock(st, "user");
 				safeStatus(ctx, undefined);
 				ctx.ui.notify("Bitwarden: locked (session key + injected env dropped)", "info");
 				return;
@@ -1195,23 +1230,23 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 						ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
 						return;
 					}
-					const removed = injected.delete(envName);
-					safeStatus(ctx, sessionKey ? `🔓 bw: ${injected.size} env var(s)` : undefined);
+					const removed = st.injected.delete(envName);
+					safeStatus(ctx, st.key ? `🔓 bw: ${st.injected.size} env var(s)` : undefined);
 					ctx.ui.notify(
 						removed ? `Bitwarden: dropped $${envName}` : `Bitwarden: $${envName} was not injected`,
 						removed ? "info" : "warning",
 					);
 					return;
 				}
-				injected.clear();
-				safeStatus(ctx, sessionKey ? `🔓 bw: 0 env var(s)` : undefined);
+				st.injected.clear();
+				safeStatus(ctx, st.key ? `🔓 bw: 0 env var(s)` : undefined);
 				ctx.ui.notify("Bitwarden: injected env vars cleared", "info");
 				return;
 			}
 			if (sub === "unlock") {
 				try {
-					await ensureUnlocked(ctx);
-					safeStatus(ctx, "🔓 bw: 0 env var(s)");
+					await ensureUnlocked(st, ctx);
+					safeStatus(ctx, `🔓 bw: ${st.injected.size} env var(s)`);
 					ctx.ui.notify("Bitwarden: unlocked", "info");
 				} catch (e: unknown) {
 					ctx.ui.notify(`Bitwarden unlock failed: ${e instanceof Error ? e.message : String(e)}`, "error");
@@ -1221,16 +1256,16 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 			// status
 			let cli = "unknown";
 			try {
-				const st = await bwStatus();
-				cli = st?.status ?? "unknown";
+				const cliState = await bwStatus();
+				cli = cliState?.status ?? "unknown";
 			} catch (e: unknown) {
 				cli = `error: ${tail(e instanceof Error ? e.message : String(e), 80)}`;
 			}
-			const ttl = sessionKey && autoLockMs ? Math.max(0, Math.round((autoLockMs - (Date.now() - lastActivity)) / 60000)) : 0;
+			const ttl = st.key && autoLockMs ? Math.max(0, Math.round((autoLockMs - (Date.now() - st.lastActivity)) / 60000)) : 0;
 			ctx.ui.notify(
 				`bw CLI: ${cli}\n` +
-					`extension: ${sessionKey ? (autoLockMs ? `unlocked (auto-lock in ${ttl} min)` : "unlocked (session-lifetime)") : "locked"}\n` +
-					`injected env: ${injectedListText()}\n` +
+					`extension: ${st.key ? (autoLockMs ? `unlocked (auto-lock in ${ttl} min)` : "unlocked (session-lifetime)") : "locked"}\n` +
+					`injected env: ${injectedListText(st)}\n` +
 					`bw_reveal: ${CONFIG.allowReveal ? "enabled" : "disabled"}`,
 				"info",
 			);
@@ -1238,16 +1273,12 @@ export function registerBitwarden(pi: ExtensionAPI): void {
 	});
 
 	// --- Lifecycle ---
-	pi.on("session_start", async (event, ctx) => {
-		if (event.reason === "startup" || event.reason === "reload") return;
-		if (event.reason === "resume" && CONFIG.keepOnResume) return; // same process: keep unlock
-		// /new //fork: don't inherit secrets into a fresh session
-		await lock(`session-${event.reason}`);
+	// /new and /fork must not carry this unlock into the next transcript; a
+	// /resume keeps it when keepOnResume is set. Which event reports that is
+	// the host's business (see host.ts).
+	onSessionLeave(pi, ompHost, async (reason, ctx) => {
+		if (reason === "resume" && CONFIG.keepOnResume) return;
+		await lock(st, `session-${reason}`);
 		safeStatus(ctx, undefined);
-	});
-
-	pi.on("session_shutdown", async (event) => {
-		if (event.reason === "resume" && CONFIG.keepOnResume) return; // same process: keep unlock
-		await lock(`session-${event.reason}`);
 	});
 }

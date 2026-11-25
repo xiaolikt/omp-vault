@@ -2,9 +2,11 @@
  * Encrypted secret store for omp-vault.
  *
  * On-disk format (store.json):
- *   { "v": 1, "salt": "<hex>", "ct": "<base64 iv(12) || ciphertext || tag(16)>" }
+ *   { "v": 1, "salt": "<hex>", "kdf": { "N", "r", "p" },
+ *     "ct": "<base64 iv(12) || ciphertext || tag(16)>" }
  *
- * Key derivation: scrypt(passphrase, salt) -> 32 bytes.
+ * Key derivation: scrypt(passphrase, salt, kdf) -> 32 bytes. `kdf` is absent
+ * from files written before it was recorded; those used DEFAULT_KDF.
  * Cipher: ChaCha20-Poly1305 (AEAD) via node:crypto. No native dependencies.
  *
  * The derived key and decrypted items live only in module memory and are
@@ -18,8 +20,11 @@ import {
 } from "node:crypto";
 import {
 	chmodSync,
+	closeSync,
 	existsSync,
+	fsyncSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	renameSync,
 	writeFileSync,
@@ -34,28 +39,46 @@ export interface VaultItem {
 	password: string;
 	uris?: string[];
 	notes?: string;
+	/** Where the entry was copied from, so a re-import updates it after a rename. */
+	source?: { kind: "bitwarden"; id: string };
 	createdAt: string;
 	updatedAt: string;
+}
+
+export type VaultUpsert = Omit<VaultItem, "id" | "createdAt" | "updatedAt"> & { id?: string };
+
+interface KdfParams {
+	N: number;
+	r: number;
+	p: number;
 }
 
 interface StoreFile {
 	v: 1;
 	salt: string;
 	ct: string;
+	kdf?: KdfParams;
 }
 
 export const defaultVaultDir = (): string =>
 	process.env.OMP_VAULT_DIR ?? join(homedir(), ".omp", "vault");
 
-const SCRYPT = { N: 1 << 15, r: 8, p: 1, maxmem: 128 * 1024 * 1024 };
+const DEFAULT_KDF: KdfParams = { N: 1 << 15, r: 8, p: 1 };
 
-const deriveKey = (passphrase: string, salt: Buffer): Buffer =>
-	scryptSync(passphrase, salt, 32, SCRYPT);
+const isKdf = (value: unknown): value is KdfParams => {
+	if (!value || typeof value !== "object") return false;
+	const { N, r, p } = value as KdfParams;
+	return [N, r, p].every((n) => Number.isSafeInteger(n) && n > 0);
+};
+
+const deriveKey = (passphrase: string, salt: Buffer, kdf: KdfParams): Buffer =>
+	scryptSync(passphrase, salt, 32, { ...kdf, maxmem: 128 * 1024 * 1024 });
 
 export class Vault {
 	private readonly file: string;
 	private key: Buffer | undefined;
 	private salt: Buffer | undefined;
+	private kdf: KdfParams = DEFAULT_KDF;
 	private items: VaultItem[] = [];
 	private lastActivity = Date.now();
 
@@ -75,6 +98,12 @@ export class Vault {
 		return this.key !== undefined;
 	}
 
+	/** Number of stored entries, without decrypting copies for a count. */
+	get count(): number {
+		this.requireUnlocked();
+		return this.items.length;
+	}
+
 	/** Seconds since the last successful operation; used for idle auto-lock. */
 	get idleMs(): number {
 		return Date.now() - this.lastActivity;
@@ -84,18 +113,26 @@ export class Vault {
 	init(passphrase: string): void {
 		if (this.initialized) throw new Error("vault already initialized");
 		this.salt = randomBytes(16);
-		this.key = deriveKey(passphrase, this.salt);
+		this.kdf = DEFAULT_KDF;
+		this.key = deriveKey(passphrase, this.salt, this.kdf);
 		this.items = [];
 		this.persist();
+		this.touch();
 	}
 
-	/** Decrypt the store into memory. Returns false on a wrong passphrase. */
+	/**
+	 * Decrypt the store into memory. Returns false on a wrong passphrase and
+	 * leaves the current state untouched. Throws when the file is unreadable.
+	 */
 	unlock(passphrase: string): boolean {
 		const store = this.readStore();
 		if (!store) throw new Error("vault not initialized");
-		this.salt = Buffer.from(store.salt, "hex");
-		const key = deriveKey(passphrase, this.salt);
+		const kdf = store.kdf ?? DEFAULT_KDF;
+		if (!isKdf(kdf)) throw new Error("unsupported vault format");
+		const salt = Buffer.from(store.salt, "hex");
+		const key = deriveKey(passphrase, salt, kdf);
 		const buf = Buffer.from(store.ct, "base64");
+		if (buf.length < 28) return false;
 		const iv = buf.subarray(0, 12);
 		const body = buf.subarray(12);
 		try {
@@ -106,13 +143,14 @@ export class Vault {
 			const ct = body.subarray(0, body.length - 16);
 			decipher.setAuthTag(tag);
 			const json = Buffer.concat([decipher.update(ct), decipher.final()]);
-			this.items = JSON.parse(json.toString("utf8")) as VaultItem[];
+			const items = JSON.parse(json.toString("utf8")) as VaultItem[];
+			this.salt = salt;
+			this.kdf = kdf;
 			this.key = key;
+			this.items = items;
 			this.touch();
 			return true;
 		} catch {
-			this.key = undefined;
-			this.items = [];
 			return false;
 		}
 	}
@@ -136,10 +174,11 @@ export class Vault {
 		this.lastActivity = Date.now();
 	}
 
+	/** Copies: a caller must not be able to mutate stored items through them. */
 	list(): VaultItem[] {
 		this.requireUnlocked();
 		this.touch();
-		return this.items.map((i) => ({ ...i }));
+		return structuredClone(this.items);
 	}
 
 	find(name: string): VaultItem | undefined {
@@ -147,31 +186,24 @@ export class Vault {
 		this.touch();
 		const lower = name.toLowerCase();
 		const item = this.items.find((i) => i.name.toLowerCase() === lower);
-		return item ? { ...item } : undefined;
+		return item ? structuredClone(item) : undefined;
 	}
 
-	upsert(item: Omit<VaultItem, "id" | "createdAt" | "updatedAt"> & { id?: string }): VaultItem {
+	upsert(item: VaultUpsert): VaultItem {
 		this.requireUnlocked();
-		const now = new Date().toISOString();
-		const existing = item.id
-			? this.items.find((i) => i.id === item.id)
-			: this.items.find((i) => i.name.toLowerCase() === item.name.toLowerCase());
-		if (existing) {
-			Object.assign(existing, item, { id: existing.id, updatedAt: now });
-			this.persist();
-			this.touch();
-			return { ...existing };
-		}
-		const full: VaultItem = {
-			...item,
-			id: randomBytes(8).toString("hex"),
-			createdAt: now,
-			updatedAt: now,
-		};
-		this.items.push(full);
+		const stored = this.apply(item, new Date().toISOString());
 		this.persist();
-		this.touch();
-		return { ...full };
+		return structuredClone(stored);
+	}
+
+	/** Insert or update many entries with a single write of the store file. */
+	upsertMany(items: readonly VaultUpsert[]): number {
+		this.requireUnlocked();
+		if (items.length === 0) return 0;
+		const now = new Date().toISOString();
+		for (const item of items) this.apply(item, now);
+		this.persist();
+		return items.length;
 	}
 
 	remove(name: string): boolean {
@@ -183,6 +215,35 @@ export class Vault {
 		this.persist();
 		this.touch();
 		return true;
+	}
+
+	/** An entry is matched by local id, else by its source, else by name. */
+	private apply(item: VaultUpsert, now: string): VaultItem {
+		const lower = item.name.toLowerCase();
+		const source = item.source;
+		const existing = item.id
+			? this.items.find((i) => i.id === item.id)
+			: source
+				? (this.items.find((i) => i.source?.kind === source.kind && i.source.id === source.id) ??
+					this.items.find((i) => i.name.toLowerCase() === lower))
+				: this.items.find((i) => i.name.toLowerCase() === lower);
+		if (existing) {
+			const before = existing.name;
+			Object.assign(existing, item, { id: existing.id, updatedAt: now });
+			// Matched by source under a new name: keep the old one if another entry has it.
+			if (before !== existing.name && this.items.some((i) => i !== existing && i.name.toLowerCase() === lower)) {
+				existing.name = before;
+			}
+			return existing;
+		}
+		const full: VaultItem = {
+			...item,
+			id: randomBytes(8).toString("hex"),
+			createdAt: now,
+			updatedAt: now,
+		};
+		this.items.push(full);
+		return full;
 	}
 
 	private requireUnlocked(): void {
@@ -216,11 +277,18 @@ export class Vault {
 		const store: StoreFile = {
 			v: 1,
 			salt: this.salt.toString("hex"),
+			kdf: this.kdf,
 			ct: Buffer.concat([iv, ct, cipher.getAuthTag()]).toString("base64"),
 		};
-		// Atomic write: temp file + rename.
+		// Atomic write: temp file, flushed to disk, then rename.
 		const tmp = `${this.file}.tmp`;
-		writeFileSync(tmp, JSON.stringify(store), { mode: 0o600 });
+		const fd = openSync(tmp, "w", 0o600);
+		try {
+			writeFileSync(fd, JSON.stringify(store));
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
 		renameSync(tmp, this.file);
 	}
 }

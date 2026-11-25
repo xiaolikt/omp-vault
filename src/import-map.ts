@@ -1,6 +1,6 @@
 /**
  * Map a Bitwarden JSON export or `bw list items` payload onto local vault
- * drafts. Secrets stay in the returned objects for the caller to encrypt;
+ * entries. Secrets stay in the returned objects for the caller to encrypt;
  * this module never writes them.
  */
 export interface LoginDraft {
@@ -9,13 +9,21 @@ export interface LoginDraft {
 	password: string;
 	uris: string[];
 	notes?: string;
+	/** Bitwarden item id: a re-import updates the same entry even after a rename. */
+	source?: { kind: "bitwarden"; id: string };
 }
 
 function asItems(raw: unknown): unknown[] {
 	if (Array.isArray(raw)) return raw;
-	if (raw && typeof raw === "object" && "items" in raw) {
-		const items = (raw as { items?: unknown }).items;
-		if (Array.isArray(items)) return items;
+	if (raw && typeof raw === "object") {
+		const rec = raw as { encrypted?: unknown; items?: unknown };
+		// An encrypted export carries ciphertext under `data`, not entries.
+		if (rec.encrypted === true) {
+			throw new Error(
+				"This is an encrypted Bitwarden export. Use `bw export --format json` (password-protected, unencrypted) or /vault import-bw.",
+			);
+		}
+		if (Array.isArray(rec.items)) return rec.items;
 	}
 	return [];
 }
@@ -31,7 +39,8 @@ function uriList(login: Record<string, unknown>): string[] {
 
 /**
  * Login items that have a password. Names are sorted, then duplicates become
- * `Name (2)`, `Name (3)`, … so a later import updates the same rows.
+ * `Name (2)`, `Name (3)`, … Each entry keeps its Bitwarden id, so a later
+ * import updates the same row even when the numbering shifts.
  */
 export function bitwardenLogins(raw: unknown): LoginDraft[] {
 	const drafts: LoginDraft[] = [];
@@ -46,7 +55,15 @@ export function bitwardenLogins(raw: unknown): LoginDraft[] {
 		const notes = typeof rec.notes === "string" && rec.notes ? rec.notes : undefined;
 		const nameRaw = typeof rec.name === "string" ? rec.name : "";
 		const name = nameRaw.replace(/[\r\n]+/g, " ").trim().slice(0, 200) || "unnamed";
-		drafts.push({ name, username, password, uris: uriList(login), notes });
+		const id = typeof rec.id === "string" && rec.id ? rec.id : undefined;
+		drafts.push({
+			name,
+			username,
+			password,
+			uris: uriList(login),
+			notes,
+			...(id ? { source: { kind: "bitwarden" as const, id } } : {}),
+		});
 	}
 	drafts.sort(
 		(a, b) =>

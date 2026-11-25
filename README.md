@@ -1,103 +1,150 @@
 # omp-vault
 
-omp 和 pi 共用的密码扩展：可以**直接查 Bitwarden**，可以把 Bitwarden **导入**到本地库，也可以**自己单独存**。单独存的时候，主密码和条目密码走**桌面弹窗**（zenity），不经过对话。
+omp 和 pi 共用一个插件：本地加密密码库 + 在线 Bitwarden。可以**直接查 Bitwarden**，可以把它**导入**到本地库，也可以**自己单独存**——单独存的时候，主密码和条目密码走桌面弹窗，不经过对话。
 
-本地库用 ChaCha20-Poly1305 加密，文件在 `~/.omp/vault/store.json`（`0600`）。在线 Bitwarden 不把会话密钥写入磁盘，也不放进模型的 bash 环境。
+本地库：`~/.omp/vault/store.json`，ChaCha20-Poly1305 + scrypt，`0600`。Bitwarden 的会话密钥只留在 agent 进程内存里，不落盘、不进 bash 环境。
 
-不要同时安装 [pi-bitwarden](https://github.com/xiaolikt/pi-bitwarden)。两边都会注册 `bw_*`，工具会重复。
+**不要同时安装 [pi-bitwarden](https://github.com/xiaolikt/pi-bitwarden)。** 两边都会注册 `bw_*`，工具会重复。
 
-## 能做什么
+## 为什么是一个插件，而不是两个
 
-| 工具 / 命令 | 作用 | 模型看得到密码？ |
+omp 是 pi 的兼容分支，清单、工具、命令 API 一致，差异只有这几处，全部在 `src/host.ts` 里按运行时特性判断：
+
+| 差异 | pi | omp |
 |---|---|---|
-| `bw_list` | 在线查 Bitwarden（名称 / 用户名 / URI / id） | 否 |
-| `bw_inject` | 把 Bitwarden 密码注入后续 bash（**仅 pi**） | 否 |
-| `bw_run` | 用 `$VAULT_SECRET` 跑一条命令（**pi 和 omp**） | 否，输出会擦掉 |
-| `bw_clipboard` | 复制到剪贴板，到时清除 | 否 |
-| `bw_reveal` | 明文返回（每次都要确认） | 是，用户当场允许 |
-| `vault_list` | 本地库元数据 | 否 |
-| `vault_add` | 存进本地库；**密码由弹窗输入** | 否 |
-| `vault_import` | 把 Bitwarden 登录项抄进本地库（先弹窗确认） | 否 |
-| `vault_get` | 读本地库；弹窗授权，5 分钟内有效 | 是，用户当场允许 |
-| `/vault …` | 人来操作本地库 | — |
-| `/bw …` | 人来操作 Bitwarden 会话 | — |
+| 会话生命周期 | `session_start` / `session_shutdown` 带 `reason` | 两者都没有 `reason`；切换原因在 `session_switch` |
+| 子代理身份 | 无 | `ctx.agent.kind === "sub"` |
+| 工具审批等级 | 无此字段（忽略） | `approval: "read" \| "write" \| "exec"` |
+| bash 注入 | `createBashTool` 的 `spawnHook` 生效 | 丢弃 `spawnHook` 环境 → 只提供 `bw_run` |
+| 定时器 | 自己管 | `ctx.setInterval` 随会话清理 |
 
-`bw_list` / `bw_inject` / `bw_run` / `bw_clipboard` / `bw_reveal` 的字段：`password`（默认）· `totp`（种子）· `code`（动态验证码）· `notes` · `field:<自定义字段>`。
+核心（加密库、`bw` 调用、擦洗、导入）完全共用。拆成两个包只会把同一份核心复制两遍、让用户装错一个。
+
+## 工具
+
+| 工具 | 作用 | 等级 | 模型看到密码？ |
+|---|---|---|---|
+| `bw_list` | 查 Bitwarden 元数据（名称/用户名/URI/id） | read | 否 |
+| `bw_run` | 用 `$VAULT_SECRET` 跑一条命令，输出擦洗 | exec | 否 |
+| `bw_inject` | 注入 bash 环境（**仅 pi**，omp 不注册） | exec | 否 |
+| `bw_clipboard` | 复制到剪贴板，到时清除 | write | 否 |
+| `bw_reveal` | 明文返回（默认关闭，每次确认） | exec | 是，用户当场允许 |
+| `vault_list` | 本地库元数据 | read | 否 |
+| `vault_add` | 存进本地库；**密码由弹窗输入** | write | 否 |
+| `vault_import` | 把 Bitwarden 登录项抄进本地库（先弹窗确认） | write | 否 |
+| `vault_get` | 读本地库；弹窗授权，5 分钟内同一请求方有效 | exec | 是，用户当场允许 |
+
+字段选择：`password`（默认）· `totp`（种子）· `code`（动态验证码）· `notes` · `field:<自定义字段名>`。
+
+## 命令
+
+```
+/vault init                        创建本地库（弹窗设主密码，确认一次）
+/vault unlock | lock               解锁 / 锁定（只影响本会话）
+/vault status                      状态与授权剩余时间
+/vault list                        本地条目元数据
+/vault add [名称]                  新增条目（用户名、密码在弹窗里输入）
+/vault remove <名称>               删除（带空格的名称加引号："GitHub (2)"）
+/vault grant <名称> [分钟]         手动授权（默认 5 分钟，上限 60）
+/vault revoke <名称|all>           撤销授权
+/vault audit [n]                   最近 n 条审计（默认 30）
+/vault import <bitwarden.json>     从 Bitwarden 未加密 JSON 导出导入
+/vault import-bw [搜索词]          直接从 bw CLI 导入（先弹窗确认）
+/bw status|unlock|lock|clear       在线 Bitwarden 会话
+```
+
+## 会话与隔离
+
+omp 会为**每个会话和每个子代理**重新绑定插件工厂，所以每个绑定有自己的解锁状态和授权：
+
+- 父会话 `vault_get` 得到的授权，子代理**不能**继承；子代理要么自己解锁，要么由你当场点允许。确认窗口会写明「请求方: 子代理 0-Explore」。
+- `/new`、`/fork`、退出会清掉**这个绑定**的解锁和授权；`/resume` 保留（同一终端、同一个你）。会话里最后一个解锁的绑定离开时，内存里的密钥才被丢弃。
+- Bitwarden 同理：换会话不会把别人的解锁带走。
+- 库文件本身是共享的；同一个进程内只有一个内存副本，所以不会丢更新。**两个 omp 进程**同时写同一个库文件时，后写的会覆盖先写的（进程间没有锁）。
 
 ## 弹窗
 
-有桌面（`DISPLAY` 或 `WAYLAND_DISPLAY`）时，本地库这些操作打开 zenity 窗口：
+有桌面（`DISPLAY` 或 `WAYLAND_DISPLAY`）时，下面的操作打开 zenity 窗口：
 
-- `/vault init`：主密码，再确认一次
-- `/vault unlock`、以及任何需要解锁的工具：主密码
-- `/vault add`、`vault_add`：用户名，然后密码。工具参数里**没有密码字段**
-- `vault_get`、`vault_import`：确认窗口（默认焦点在「拒绝」）
+- 主密码：`/vault init`（两次）、解锁、Bitwarden 解锁
+- `/vault add`、`vault_add`：用户名，然后密码；工具参数里**没有密码字段**
+- `vault_get`、`vault_import`、`vault_remove`：确认窗口（焦点默认在「拒绝」）
 
-关掉窗口就是取消，不会再弹一个终端输入框。没装 zenity、或窗口起不来时，才退回 omp/pi 的 TUI。pi 的 TUI 输入是可见的；omp 会尽量掩码。
+关掉窗口就是取消，**不会**再弹一个终端输入框。zenity 不存在、拒绝参数、打不开显示时，才退回 omp/pi 的输入框。omp 会掩码输入；上游 pi 忽略掩码提示。
+
+## Bitwarden
+
+需要 `bw`（先 `bw login`）。第一次用到时弹窗要主密码，之后每次调用只在确认窗口里点允许。
+
+- 要跑一条命令、又不想让密码进对话：`bw_run`（omp 和 pi 都可用）。值在子进程环境里，命令结束就没了；stdout/stderr 里出现原值、base64/base64url/URL/hex 形式都会被替换成 `[BW_SCRUBBED:VAR]`。输出最多保留 8 MiB，超出部分丢弃并标注。
+- pi 上还可以 `bw_inject` 注入 bash 环境，后续多条命令都能用。
+- 确认窗口里显示的是**实际命中的条目**（名称+用户名），不是模型给的引用。
+
+## 导入
+
+- `/vault import-bw [搜索词]`：从 `bw` 现场读，先列出匹配项，确认后只导入带密码的登录项。
+- `/vault import <文件>`：Bitwarden 未加密 JSON 导出；路径支持 `~`；加密导出会明确报错，不会「导入 0 条」。
+- 每个条目都会记住它在 Bitwarden 里的 id：以后重导入时即使 `(2)` 编号漂移，也更新原来那一行，不会写错条目。
+
+## 安全
+
+- 主密码只经过弹窗或主机输入框；Bitwarden 主密码经环境变量交给 `bw unlock`，不进 argv。`BW_SESSION` 只在内存。
+- 本地库空闲 10 分钟自动锁定。`vault_get` 授权默认 5 分钟。
+- 审计：`~/.omp/vault/audit.log`（本地库）和 `~/.bw/pi-extension/audit.log`（Bitwarden），记录会话/子代理标签、条目名、允许/拒绝，从不记录值；写失败不影响主操作。
+- `bw_reveal` 默认关闭；要明文通道得在配置里显式打开。
+- 擦洗只在值长度 ≥ 6 时生效（更短的会误伤正常输出）；网络外传、单向哈希防不住——`bw_run` / `bw_inject` 的价值是值不进对话，不是防住被注入的 agent。
+- 原子写：临时文件 + `fsync` + `rename`；KDF 参数写进文件头，以后调参不会毁老库。
+
+## 配置 `~/.bw/pi-extension/config.json`
+
+```jsonc
+{
+  "autoLockMinutes": 0,        // 空闲自动锁；0 = 一次解锁用到会话结束
+  "keepOnResume": true,        // /resume 保留解锁状态（/new、/fork 一律锁）
+  "clipboardClearSeconds": 30, // 0 = 不自动清（锁定/退出仍清）
+  "allowReveal": false,        // 默认关闭明文通道
+  "maxInjectedEnv": 12
+}
+```
+
+类型或范围错误按 fail-closed 处理并往 stderr 打警告：`allowReveal`、`keepOnResume` 的非法值按 `false`；`autoLockMinutes` 非法按 15 分钟。
 
 ## 安装
 
-需要 Node 22+（omp 自带的运行时即可）、`bw`（先 `bw login`）和 `zenity`。
+需要 `bw`（先 `bw login`）；弹窗需要 zenity。
 
 ```bash
-# omp
+# omp（私有仓库用 SSH）
 omp plugin install git+ssh://git@github.com/xiaolikt/omp-vault.git
 
-# pi（私有仓库用 SSH）
+# pi
 pi install git:git@github.com:xiaolikt/omp-vault.git
 ```
 
-本地开发（改完即生效，omp 是链接）：
+本地开发（omp 是链接，改完即生效）：
 
 ```bash
 omp plugin install /path/to/omp-vault
 pi install /path/to/omp-vault
 ```
 
-已经装过 pi-bitwarden 时先卸掉，避免 `bw_*` 出现两套：
+已在用 pi-bitwarden 的，先卸掉：
 
 ```bash
 omp plugin uninstall pi-bitwarden
 pi remove git:github.com/xiaolikt/pi-bitwarden
 ```
 
-## 用法
-
-```
-/vault init                      创建本地库（弹窗设主密码）
-/vault unlock | lock             解锁 / 锁定
-/vault add [名称]                弹窗输入密码
-/vault import <bw.json>          从 Bitwarden 未加密 JSON 导入
-/vault import-bw [搜索词]        从 bw CLI 直接导入
-/bw status | unlock | lock       在线 Bitwarden
-```
-
-查在线库用 `bw_list`。要让命令用到密码、但对话里不出现，用 `bw_run`（omp）或 `bw_inject`（pi）。要把一批登录项留在本地，用 `vault_import` 或 `/vault import-bw`。之后即使不连 Bitwarden，也可以 `vault_list` / `vault_get`。
-
-JSON 导入只收**带密码的登录项**。同名条目会更新；Bitwarden 里重名的会存成 `名称 (2)`、`名称 (3)`。
-
-## 安全
-
-- 本地主密码和条目密码只出现在弹窗或（没有桌面时）TUI 里，不进工具参数。
-- Bitwarden 主密码经环境变量交给 `bw unlock`，不进 argv。`BW_SESSION` 只留在 agent 进程内存。
-- `bw_inject` 在 omp 上会直接失败：omp 丢掉了 bash 的 `spawnHook` 环境。用 `bw_run`。
-- 注入或 `bw_run` 过的值会从后续工具输出里擦掉（含 base64 / URL / hex）。短于 6 字符的值不擦。
-- 本地库 10 分钟无操作自动锁定。`vault_get` 的授权默认 5 分钟。
-- 审计：`~/.omp/vault/audit.log`。Bitwarden 侧的配置和审计仍在 `~/.bw/pi-extension/`（`autoLockMinutes`、`allowReveal`、`clipboardClearSeconds` 等，类型错误按关闭处理）。
-- omp 一个进程里多个会话时，Bitwarden 解锁状态是进程级的，不按会话隔离。
-
-`vault_get` 和 `bw_reveal` 得到的明文会进入模型上下文和会话文件，所以每次都要人点允许。
-
-## 环境变量
-
-- `OMP_VAULT_DIR` — 本地库目录，默认 `~/.omp/vault`
-
 ## 测试
 
 ```bash
-npm test
+npm test            # 52 个确定性用例：模拟 bw/zenity，驱动真实工具与命令
 npm run typecheck
+bash test/smoke.sh omp   # 模型驱动，真 omp 会话里跑一遍 bw_run
+bash test/smoke.sh pi    # 同上，pi
 ```
+
+`npm test` 里 `tests/vault-flow.test.mjs` 和 `tests/bitwarden-tools.test.mjs` 覆盖：omp 的 `session_start` 不锁、`session_switch` 的 new/fork 锁、子代理不继承授权、解锁中途锁定被丢弃、带空格名称、空用户名保留、base64 短密码擦洗、8 MiB 上限、进程组超时清理。
 
 ## License
 

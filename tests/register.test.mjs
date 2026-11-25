@@ -1,51 +1,48 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import ompVault from "../src/index.ts";
+import { bind, cleanUpOnExit, useMocks } from "./helpers.mjs";
 
-test("one extension registers the local vault and live Bitwarden on omp", () => {
-	const tools = [];
-	const commands = [];
-	// `"pi" in api` is how this package recognizes omp. That host already has bash.
-	const api = {
-		pi: {},
-		registerTool(tool) {
-			tools.push(tool.name);
-		},
-		registerCommand(name) {
-			commands.push(name);
-		},
-		on() {
-			return () => {};
-		},
-	};
-	ompVault(api);
-	assert.deepEqual(tools, [
+const dir = useMocks();
+const { default: ompVault } = await import("../src/index.ts");
+cleanUpOnExit(dir);
+
+test("omp: one extension registers the local vault and live Bitwarden, without bw_inject", () => {
+	const b = bind(ompVault, true);
+	assert.deepEqual([...b.tools.keys()], [
 		"vault_list",
 		"vault_get",
 		"vault_add",
 		"vault_import",
 		"bw_list",
-		"bw_inject",
 		"bw_run",
 		"bw_clipboard",
 		"bw_reveal",
 	]);
-	assert.equal(tools.includes("bash"), false);
-	assert.deepEqual(commands.sort(), ["bw", "vault"]);
+	assert.deepEqual([...b.commands.keys()].sort(), ["bw", "vault"]);
+	// omp reads the reason from session_switch; its session_start has none.
+	assert.equal(b.has("session_switch"), true);
+	assert.equal(b.has("session_start"), false);
 });
 
-test("pi registers bash so bw_inject can reach the child env", () => {
-	const tools = [];
-	const api = {
-		registerTool(tool) {
-			tools.push(tool.name);
-		},
-		registerCommand() {},
-		on() {
-			return () => {};
-		},
-	};
-	ompVault(api);
-	assert.equal(tools.includes("bash"), true);
-	assert.equal(tools.includes("bw_inject"), true);
+test("pi: bash and bw_inject are registered, and the lifecycle comes from session_start", () => {
+	const b = bind(ompVault, false);
+	const names = [...b.tools.keys()];
+	assert.equal(names.includes("bash"), true);
+	assert.equal(names.includes("bw_inject"), true);
+	assert.equal(names.includes("bw_run"), true);
+	assert.equal(b.has("session_start"), true);
+	assert.equal(b.has("session_switch"), false);
+});
+
+test("tools declare the approval tier omp prompts by: reads read, writes write", () => {
+	const b = bind(ompVault, true);
+	assert.equal(b.tools.get("vault_list").approval, "read");
+	assert.equal(b.tools.get("bw_list").approval, "read");
+	assert.equal(b.tools.get("vault_add").approval, "write");
+	assert.equal(b.tools.get("vault_import").approval, "write");
+	assert.equal(b.tools.get("bw_clipboard").approval, "write");
+	assert.equal(b.tools.get("bw_run").approval, "exec");
+	// A secret handed to the model keeps the strictest tier.
+	assert.equal(b.tools.get("vault_get").approval, undefined);
+	assert.equal(b.tools.get("bw_reveal").approval, undefined);
 });

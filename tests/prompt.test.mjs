@@ -11,18 +11,16 @@ const saved = {
 	WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY,
 	ZENITY_CODE: process.env.ZENITY_CODE,
 	ZENITY_VALUE: process.env.ZENITY_VALUE,
+	ZENITY_STDERR: process.env.ZENITY_STDERR,
 };
 
 function restore() {
-	process.env.PATH = saved.PATH;
-	if (saved.DISPLAY === undefined) delete process.env.DISPLAY;
-	else process.env.DISPLAY = saved.DISPLAY;
-	if (saved.WAYLAND_DISPLAY === undefined) delete process.env.WAYLAND_DISPLAY;
-	else process.env.WAYLAND_DISPLAY = saved.WAYLAND_DISPLAY;
-	if (saved.ZENITY_CODE === undefined) delete process.env.ZENITY_CODE;
-	else process.env.ZENITY_CODE = saved.ZENITY_CODE;
-	if (saved.ZENITY_VALUE === undefined) delete process.env.ZENITY_VALUE;
-	else process.env.ZENITY_VALUE = saved.ZENITY_VALUE;
+	const env = process.env;
+	env.PATH = saved.PATH;
+	for (const key of ["DISPLAY", "WAYLAND_DISPLAY", "ZENITY_CODE", "ZENITY_VALUE", "ZENITY_STDERR"]) {
+		if (saved[key] === undefined) delete env[key];
+		else env[key] = saved[key];
+	}
 }
 
 function mockZenity() {
@@ -32,6 +30,7 @@ function mockZenity() {
 		join(dir, "zenity"),
 		`#!/bin/sh
 printf '%s\\n' "$*" >> "${log}"
+if [ -n "$ZENITY_STDERR" ]; then printf '%s\\n' "$ZENITY_STDERR" >&2; fi
 if [ -n "$ZENITY_CODE" ]; then exit "$ZENITY_CODE"; fi
 printf '%s\\n' "$ZENITY_VALUE"
 `,
@@ -91,7 +90,52 @@ test("cancelling the window does not fall through to the TUI", async () => {
 
 test("a zenity crash falls back to the TUI, a deny does not", async () => {
 	const { dir } = mockZenity();
-	process.env.ZENITY_CODE = "99";
+	process.env.ZENITY_CODE = "255";
+	process.env.ZENITY_STDERR = "This option is not available. Please see --help for all possible usages.";
+	const calls = [];
+	try {
+		assert.equal(await confirmWindow(tui(calls), "确认", "允许？"), true);
+		assert.equal(calls.length, 1);
+	} finally {
+		restore();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("exit 1 with only GTK diagnostics is a cancel, not a failed window", async () => {
+	const { dir } = mockZenity();
+	process.env.ZENITY_CODE = "1";
+	process.env.ZENITY_STDERR =
+		"(zenity:4242): Gtk-WARNING **: 10:00:00.000: Trying to measure GtkLabel 0x1 for height of 9";
+	const calls = [];
+	try {
+		assert.equal(await promptSecret(tui(calls), "omp-vault", "主密码"), undefined);
+		assert.equal(await confirmWindow(tui(calls), "确认", "允许？"), false);
+		assert.equal(calls.length, 0, "a cancel was re-asked in the terminal");
+	} finally {
+		restore();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("exit 1 with a startup error means no window opened: fall back to the TUI", async () => {
+	const { dir } = mockZenity();
+	process.env.ZENITY_CODE = "1";
+	process.env.ZENITY_STDERR = "This option is not available. Please see --help for all possible usages.";
+	const calls = [];
+	try {
+		assert.equal(await promptSecret(tui(calls), "omp-vault", "主密码"), "from-tui");
+		assert.equal(calls[0][0], "input");
+	} finally {
+		restore();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("exit 1 with 'cannot open display' falls back even behind a GTK prefix", async () => {
+	const { dir } = mockZenity();
+	process.env.ZENITY_CODE = "1";
+	process.env.ZENITY_STDERR = "** (zenity:4242): WARNING **: cannot open display: :99";
 	const calls = [];
 	try {
 		assert.equal(await confirmWindow(tui(calls), "确认", "允许？"), true);
