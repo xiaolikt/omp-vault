@@ -1,12 +1,16 @@
 {
 	"name": "omp-vault",
-	"version": "0.1.0",
-	"description": "omp/pi extension: a scoped, user-authorized secret vault for AI agents. Secrets are ChaCha20-Poly1305 encrypted at rest; every read requires an interactive grant that auto-expires, and all access is audit-logged.",
+	"version": "0.2.0",
+	"description": "omp/pi extension: local encrypted vault plus live Bitwarden. Query Bitwarden, import logins, or store secrets yourself — local passwords are entered in a desktop dialog.",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/xiaolikt/omp-vault.git"
+	},
 	"author": "hljhljhlj",
 	"license": "MIT",
 	"type": "module",
 	"engines": {
-		"node": ">=20"
+		"node": ">=22"
 	},
 	"keywords": [
 		"omp-package",

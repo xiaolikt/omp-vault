@@ -1,5 +1,5 @@
 /** Append-only JSONL audit log for omp-vault. */
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -18,7 +18,8 @@ export interface AuditEntry {
 		| "revoke"
 		| "read_allow"
 		| "read_deny"
-		| "list";
+		| "list"
+		| "import";
 	item?: string;
 	reason?: string;
 }
@@ -27,7 +28,13 @@ export const defaultAuditPath = (): string =>
 	join(process.env.OMP_VAULT_DIR ?? join(homedir(), ".omp", "vault"), "audit.log");
 
 export function appendAudit(entry: Omit<AuditEntry, "ts">, file = defaultAuditPath()): void {
-	mkdirSync(join(file, ".."), { recursive: true });
+	const dir = join(file, "..");
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	try {
+		chmodSync(dir, 0o700);
+	} catch {
+		/* best-effort */
+	}
 	appendFileSync(
 		file,
 		JSON.stringify({ ...entry, ts: new Date().toISOString() }) + "\n",

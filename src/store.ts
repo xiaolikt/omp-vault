@@ -17,6 +17,7 @@ import {
 	scryptSync,
 } from "node:crypto";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
@@ -197,7 +198,13 @@ export class Vault {
 
 	private persist(): void {
 		if (!this.key || !this.salt) throw new Error("vault is locked");
-		mkdirSync(join(this.file, ".."), { recursive: true });
+		const dir = join(this.file, "..");
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		try {
+			chmodSync(dir, 0o700);
+		} catch {
+			/* best-effort; the store file itself is 0600 */
+		}
 		const iv = randomBytes(12);
 		const cipher = createCipheriv("chacha20-poly1305", this.key, iv, {
 			authTagLength: 16,
