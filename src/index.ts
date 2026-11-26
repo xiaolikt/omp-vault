@@ -352,12 +352,20 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 	if (!name) return "cancelled: no entry name";
 	const existing = vault.find(name);
 	if (req.confirm) {
+		// Show the metadata the model supplied: the user is approving these
+		// values too, not just the name.
+		const meta = [
+			req.username?.trim() ? `用户名: ${req.username.trim()}` : "",
+			req.uri?.trim() ? `URI: ${req.uri.trim()}` : "",
+			req.notes?.trim() ? `备注: ${req.notes.trim()}` : "",
+		]
+			.filter(Boolean)
+			.join("\n");
+		const action = existing ? `更新已有条目「${name}」。` : `新建条目「${name}」。`;
 		const ok = await confirmWindow(
 			dialogs(ctx),
 			"omp-vault · 保存到本地库",
-			existing
-				? `更新已有条目「${name}」。\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`
-				: `新建条目「${name}」。\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`,
+			`${action}${meta ? `\n${meta}` : ""}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`,
 			req.signal,
 		);
 		if (!ok) return `user denied saving "${name}"`;
@@ -573,7 +581,9 @@ function commandHandler(scope: Scope, bw: BwState) {
 			}
 			case "grant": {
 				const last = rest.at(-1) ?? "";
-				const minutes = /^\d+$/.test(last) ? Number(rest.pop()) : GRANT_MS_DEFAULT / 60_000;
+				// A single numeric token is the entry name ("/vault grant 123");
+				// minutes are only read when a name comes before them.
+				const minutes = rest.length > 1 && /^\d+$/.test(last) ? Number(rest.pop()) : GRANT_MS_DEFAULT / 60_000;
 				const name = rest.join(" ");
 				if (!name || !unlocked(scope) || !vault.find(name)) {
 					note(ctx, "先解锁；用法: /vault grant <名称> [分钟]（带空格的名称加引号）", "warning");
@@ -587,8 +597,10 @@ function commandHandler(scope: Scope, bw: BwState) {
 				return;
 			}
 			case "revoke": {
+				const target = rest[0] === "all" ? "all" : rest.join(" ").trim();
 				if (rest[0] === "all") scope.grants.clear();
 				else if (rest[0]) scope.grants.delete(rest.join(" ").toLowerCase());
+				if (target) appendAudit({ session: label, event: "revoke", item: target });
 				setStatus(ctx, scope);
 				note(ctx, "revoked");
 				return;

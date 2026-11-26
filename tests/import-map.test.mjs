@@ -37,6 +37,11 @@ test("an encrypted export is refused instead of importing nothing", () => {
 	);
 });
 
+test("a payload that is neither an export nor an item array is refused", () => {
+	assert.throws(() => bitwardenLogins({ hello: "world" }), /Not a Bitwarden export/);
+	assert.throws(() => bitwardenLogins(null), /Not a Bitwarden export/);
+});
+
 test("skips items with no login password and blank names", () => {
 	const drafts = bitwardenLogins({
 		items: [

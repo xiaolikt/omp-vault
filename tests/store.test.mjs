@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createCipheriv, scryptSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -160,6 +161,23 @@ test("a corrupt store fails with an error instead of opening", () => {
 	const dir = mkdtempSync(join(tmpdir(), "omp-vault-"));
 	writeFileSync(join(dir, "store.json"), "{ not json");
 	assert.throws(() => new Vault(dir).unlock(PW));
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("a decrypted payload that is not an array is refused", () => {
+	const dir = mkdtempSync(join(tmpdir(), "omp-vault-"));
+	const file = join(dir, "store.json");
+	new Vault(dir).init(PW);
+	const store = JSON.parse(readFileSync(file, "utf8"));
+	const key = scryptSync(PW, Buffer.from(store.salt, "hex"), 32, { ...store.kdf, maxmem: 128 * 1024 * 1024 });
+	const iv = Buffer.from(store.ct, "base64").subarray(0, 12);
+	const cipher = createCipheriv("chacha20-poly1305", key, iv, { authTagLength: 16 });
+	const ct = Buffer.concat([cipher.update(JSON.stringify({ not: "an array" })), cipher.final()]);
+	writeFileSync(
+		file,
+		JSON.stringify({ ...store, ct: Buffer.concat([iv, ct, cipher.getAuthTag()]).toString("base64") }),
+	);
+	assert.throws(() => new Vault(dir).unlock(PW), /unsupported vault format/);
 	rmSync(dir, { recursive: true, force: true });
 });
 

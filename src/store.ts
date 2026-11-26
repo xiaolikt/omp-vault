@@ -136,6 +136,7 @@ export class Vault {
 		if (buf.length < 28) return false;
 		const iv = buf.subarray(0, 12);
 		const body = buf.subarray(12);
+		let items: unknown;
 		try {
 			const decipher = createDecipheriv("chacha20-poly1305", key, iv, {
 				authTagLength: 16,
@@ -144,20 +145,25 @@ export class Vault {
 			const ct = body.subarray(0, body.length - 16);
 			decipher.setAuthTag(tag);
 			const json = Buffer.concat([decipher.update(ct), decipher.final()]);
-			const items = JSON.parse(json.toString("utf8")) as VaultItem[];
-			this.salt = salt;
-			this.kdf = kdf;
-			this.key = key;
-			this.items = items;
-			this.touch();
-			return true;
+			items = JSON.parse(json.toString("utf8"));
 		} catch {
 			return false;
 		}
+		if (!Array.isArray(items)) {
+			key.fill(0);
+			throw new Error("unsupported vault format");
+		}
+		this.salt = salt;
+		this.kdf = kdf;
+		this.key = key;
+		this.items = items as VaultItem[];
+		this.touch();
+		return true;
 	}
 
 	/** Drop the key and plaintext items from memory. */
 	lock(): void {
+		this.key?.fill(0);
 		this.key = undefined;
 		this.items = [];
 	}

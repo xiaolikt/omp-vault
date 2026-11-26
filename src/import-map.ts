@@ -25,7 +25,7 @@ function asItems(raw: unknown): unknown[] {
 		}
 		if (Array.isArray(rec.items)) return rec.items;
 	}
-	return [];
+	throw new Error("Not a Bitwarden export: expected an array of items or an object with `items`.");
 }
 
 function uriList(login: Record<string, unknown>): string[] {

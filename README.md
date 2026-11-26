@@ -85,7 +85,7 @@ omp 会为**每个会话和每个子代理**重新绑定插件工厂，所以每
 ## 导入
 
 - `/vault import-bw [搜索词]`：从 `bw` 现场读，先列出匹配项，确认后只导入带密码的登录项。
-- `/vault import <文件>`：Bitwarden 未加密 JSON 导出；路径支持 `~`；加密导出会明确报错，不会「导入 0 条」。
+- `/vault import <文件>`：Bitwarden 未加密 JSON 导出；路径支持 `~`；加密导出或结构不认识的文件会明确报错，不会「导入 0 条」。
 - 每个条目都会记住它在 Bitwarden 里的 id：以后重导入时即使 `(2)` 编号漂移，也更新原来那一行，不会写错条目。
 
 ## 安全
@@ -142,13 +142,13 @@ pi remove git:github.com/xiaolikt/pi-bitwarden
 ## 测试
 
 ```bash
-npm test            # 66 个确定性用例：模拟 bw/zenity，驱动真实工具与命令
+npm test            # 70 个确定性用例：模拟 bw/zenity，驱动真实工具与命令
 npm run typecheck
 bash test/smoke.sh omp   # 模型驱动，真 omp 会话里跑一遍 bw_run
 bash test/smoke.sh pi    # 同上，pi
 ```
 
-`npm test` 里 `tests/vault-flow.test.mjs`、`tests/vault-idle.test.mjs` 和 `tests/bitwarden-tools.test.mjs` 覆盖：omp 的 `session_start` 不锁、`session_switch` 的 new/fork 锁、子代理不继承授权、解锁/确认窗口中途锁定被丢弃、弹窗期间自动锁定后保存/删除会重新解锁、带空格名称、空用户名保留、base64 短密码与换行编码擦洗、剪贴板值擦洗与复制/锁定竞态、`BW_SESSION` 不进子进程、只擦洗 bash 自己的临时输出文件、拒绝确认前不读取条目、审计会话标签、8 MiB 上限、进程组超时清理。
+`npm test` 里 `tests/vault-flow.test.mjs`、`tests/vault-idle.test.mjs` 和 `tests/bitwarden-tools.test.mjs` 覆盖：omp 的 `session_start` 不锁、`session_switch` 的 new/fork 锁、子代理不继承授权、解锁/确认窗口中途锁定被丢弃、弹窗期间自动锁定后保存/删除会重新解锁、带空格名称、空用户名保留、base64 短密码与换行编码擦洗、剪贴板值擦洗与复制/锁定竞态、`BW_SESSION` 不进子进程、只擦洗 bash 自己的临时输出文件、拒绝确认前不读取条目、审计会话标签、数字名称授权与撤销审计、保存确认显示元数据、8 MiB 上限、进程组超时清理。
 
 ## License
 

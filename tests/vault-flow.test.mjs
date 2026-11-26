@@ -124,6 +124,34 @@ test("/vault grant accepts a quoted name and a minute count", async () => {
 	await b.cmd("status", ctx.ctx);
 	assert.match(ctx.last().message, /grant: mail \(2\) \(\d+s left\)/);
 	answers.deny(dir, false);
+
+	// A numeric name is a name, not a minute count; minutes need a name before them.
+	await addEntry(b, ctx.ctx, "123", "pw-num");
+	await b.cmd("grant 123", ctx.ctx);
+	assert.match(ctx.last().message, /granted "123" for 5m/);
+	await b.cmd("grant 123 7", ctx.ctx);
+	assert.match(ctx.last().message, /granted "123" for 7m/);
+
+	// Revoking is audited like granting.
+	await b.cmd("revoke 123", ctx.ctx);
+	assert.ok(readAudit().some((e) => e.event === "revoke" && e.item === "123"), "revoke was not audited");
+});
+
+test("vault_add's confirm window shows the metadata the model supplied", async () => {
+	const b = bind(ompVault, true);
+	const ctx = makeCtx();
+	answers.master(dir, PW);
+	answers.entryPassword(dir, "meta-secret");
+	const result = await b.tool(
+		"vault_add",
+		{ name: "Meta", username: "alice", uri: "https://x", notes: "hello" },
+		ctx.ctx,
+	);
+	assert.equal(result.isError, undefined);
+	const trace = dialogTrace(dir);
+	assert.match(trace, /用户名: alice/);
+	assert.match(trace, /URI: https:\/\/x/);
+	assert.match(trace, /备注: hello/);
 });
 
 test("a blank username keeps the stored one when the password is updated", async () => {

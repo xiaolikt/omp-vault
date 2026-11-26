@@ -434,7 +434,9 @@ async function runBwJson(args: string[], session?: string, signal?: AbortSignal)
 let statusCache: { at: number; json: any } | undefined;
 
 async function bwStatus(session?: string, signal?: AbortSignal): Promise<any> {
-	// `bw status` with a stale BW_SESSION exits non-zero; strip env session for the probe.
+	// With a session, this verifies that key. Without one it asks whether the CLI
+	// itself is locked; a stale BW_SESSION in the host env would make it exit
+	// non-zero, so the probe never inherits the env (see childEnv).
 	if (session) {
 		const r = await runBw(["status"], { session, signal });
 		return JSON.parse(r);
@@ -1363,7 +1365,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 		description: "Bitwarden: status | unlock | lock | clear [ENV]",
 		handler: async (args: string, ctx) => {
 			const parts = (args ?? "status").trim().split(/\s+/);
-			const sub = parts[0] || "status";
+			const sub = (parts[0] || "status").toLowerCase();
 			if (sub === "lock") {
 				await lock(st, "user");
 				safeStatus(ctx, undefined);

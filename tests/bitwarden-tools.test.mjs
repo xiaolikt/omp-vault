@@ -34,6 +34,15 @@ test("one binding's lock does not destroy another binding's Bitwarden key", asyn
 	answers.master(dir);
 });
 
+test("/bw subcommands are case-insensitive", async () => {
+	const b = bind(ompVault, true);
+	answers.master(dir, "testmaster");
+	await b.tool("bw_list", {}, makeCtx().ctx);
+	const ctx = makeCtx();
+	await b.commands.get("bw").handler("LOCK", ctx.ctx);
+	assert.match(ctx.last().message, /locked/);
+});
+
 test("omp: bw_run gives one command the secret and scrubs it and its base64, for short passwords too", async () => {
 	const b = bind(ompVault, true);
 	assert.equal(b.tools.has("bw_inject"), false, "bw_inject cannot work on omp, so it is not offered");
