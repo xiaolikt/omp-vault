@@ -6,7 +6,7 @@
 		"type": "git",
 		"url": "git+https://github.com/xiaolikt/omp-vault.git"
 	},
-	"author": "hljhljhlj",
+	"author": "xiaolikt",
 	"license": "MIT",
 	"type": "module",
 	"engines": {
