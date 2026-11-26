@@ -79,3 +79,20 @@ test("leaves a Date, a Buffer, or a class instance as the object it was", () => 
 	assert.equal(result.value.handle, handle);
 	assert.equal(result.value.note, "[BW_SCRUBBED:T1]");
 });
+
+test("scrubs a Buffer, Map, Set, and Error that carry a secret", () => {
+	const blob = Buffer.from(`raw ${SECRET}`);
+	const map = new Map([[SECRET, "value"], ["key", SECRET]]);
+	const set = new Set([SECRET, "plain"]);
+	const err = new Error(`failed with ${SECRET}`);
+	const result = scrubDeep({ blob, map, set, err }, values);
+	assert.equal(result.changed, true);
+	assert.equal(result.value.blob.toString("utf8").includes(SECRET), false);
+	assert.equal([...result.value.map.keys()].some((k) => String(k).includes(SECRET)), false);
+	assert.equal([...result.value.map.values()].some((v) => String(v).includes(SECRET)), false);
+	assert.equal([...result.value.set].some((v) => String(v).includes(SECRET)), false);
+	assert.equal(result.value.err.message.includes(SECRET), false);
+	assert.ok(result.value.err instanceof Error);
+	// The clean forms keep their identity, so the host's own objects are not replaced.
+	assert.equal(scrubDeep(blob, []).value, blob);
+});

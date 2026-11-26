@@ -12,12 +12,13 @@ const saved = {
 	ZENITY_CODE: process.env.ZENITY_CODE,
 	ZENITY_VALUE: process.env.ZENITY_VALUE,
 	ZENITY_STDERR: process.env.ZENITY_STDERR,
+	XDPYINFO_FAIL: process.env.XDPYINFO_FAIL,
 };
 
 function restore() {
 	const env = process.env;
 	env.PATH = saved.PATH;
-	for (const key of ["DISPLAY", "WAYLAND_DISPLAY", "ZENITY_CODE", "ZENITY_VALUE", "ZENITY_STDERR"]) {
+	for (const key of ["DISPLAY", "WAYLAND_DISPLAY", "ZENITY_CODE", "ZENITY_VALUE", "ZENITY_STDERR", "XDPYINFO_FAIL"]) {
 		if (saved[key] === undefined) delete env[key];
 		else env[key] = saved[key];
 	}
@@ -33,6 +34,15 @@ printf '%s\\n' "$*" >> "${log}"
 if [ -n "$ZENITY_STDERR" ]; then printf '%s\\n' "$ZENITY_STDERR" >&2; fi
 if [ -n "$ZENITY_CODE" ]; then exit "$ZENITY_CODE"; fi
 printf '%s\\n' "$ZENITY_VALUE"
+`,
+		{ mode: 0o755 },
+	);
+	// A deterministic X display probe: the tests run without a real X server.
+	writeFileSync(
+		join(dir, "xdpyinfo"),
+		`#!/bin/sh
+if [ -n "$XDPYINFO_FAIL" ]; then exit 1; fi
+exit 0
 `,
 		{ mode: 0o755 },
 	);
@@ -82,6 +92,21 @@ test("cancelling the window does not fall through to the TUI", async () => {
 		assert.equal(await promptSecret(tui(calls), "omp-vault", "主密码"), undefined);
 		assert.equal(await confirmWindow(tui(calls), "导入", "允许？"), false);
 		assert.equal(calls.length, 0);
+	} finally {
+		restore();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a silent zenity failure on an unreachable display falls back to the TUI", async () => {
+	const { dir } = mockZenity();
+	process.env.ZENITY_CODE = "1";
+	process.env.XDPYINFO_FAIL = "1";
+	delete process.env.ZENITY_STDERR;
+	const calls = [];
+	try {
+		assert.equal(await promptSecret(tui(calls), "omp-vault", "主密码"), "from-tui");
+		assert.equal(calls[0][0], "input");
 	} finally {
 		restore();
 		rmSync(dir, { recursive: true, force: true });

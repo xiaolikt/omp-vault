@@ -46,7 +46,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { constants as fsConstants, readFileSync, promises as fs } from "node:fs";
+import { constants as fsConstants, accessSync, readFileSync, promises as fs } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
@@ -804,18 +804,32 @@ type ClipboardBackend = {
 	read: [string, string[]];
 };
 
+/** Whether an executable is on PATH, so a Wayland session can fall back to X11. */
+function commandExists(command: string): boolean {
+	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+		if (!dir) continue;
+		try {
+			accessSync(path.join(dir, command), fsConstants.X_OK);
+			return true;
+		} catch {
+			/* not in this directory */
+		}
+	}
+	return false;
+}
+
 function clipboardBackend(): ClipboardBackend | undefined {
 	if (process.platform === "darwin") {
 		return { copy: ["pbcopy", []], clear: ["pbcopy", []], read: ["pbpaste", []] };
 	}
-	if (process.env.WAYLAND_DISPLAY) {
+	if (process.env.WAYLAND_DISPLAY && commandExists("wl-copy") && commandExists("wl-paste")) {
 		return {
 			copy: ["wl-copy", []],
 			clear: ["wl-copy", ["-c"]],
 			read: ["wl-paste", ["--no-newline"]],
 		};
 	}
-	if (process.env.DISPLAY) {
+	if (process.env.DISPLAY && commandExists("xclip")) {
 		return {
 			copy: ["xclip", ["-selection", "clipboard"]],
 			clear: ["xclip", ["-selection", "clipboard", "/dev/null"]],

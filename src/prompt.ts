@@ -7,7 +7,9 @@
  * an option it rejects, a display it cannot reach) the host dialog is used
  * instead. Upstream pi shows typed text in the clear; OMP masks it.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 
 const DIALOG_MS = 10 * 60_000;
 const STDERR_CAP = 16_000;
@@ -72,14 +74,32 @@ function zenity(args: string[], signal?: AbortSignal): Promise<ZenityResult> {
 }
 
 /**
+ * True when the configured display looks usable. Only consulted when zenity
+ * exits 1 with no output at all: that is either a cancel (display fine) or a
+ * silent start failure (display unreachable).
+ */
+function displayReachable(): boolean {
+	if (process.env.WAYLAND_DISPLAY) {
+		const runtime = process.env.XDG_RUNTIME_DIR;
+		return !!runtime && existsSync(join(runtime, process.env.WAYLAND_DISPLAY));
+	}
+	if (!process.env.DISPLAY) return false;
+	const probe = spawnSync("xdpyinfo", [], { stdio: "ignore", timeout: 1500 });
+	// If the probe itself cannot run, do not turn a normal cancel into a second prompt.
+	return probe.error ? true : probe.status === 0;
+}
+
+/**
  * True when no dialog ran. Exit 1 is ambiguous on some zenity builds (cancel
  * and a failed start both use it), so stderr decides: GTK's own diagnostics
  * carry a `(zenity:PID): Gtk-WARNING` prefix; any other line, or a display
- * failure, means the window never opened.
+ * failure, means the window never opened. With no output at all, a display
+ * that cannot be reached is the one remaining signal; otherwise it is a cancel.
  */
 function failedToOpen(result: ZenityResult): boolean {
 	if (!result.spawned) return true;
 	if (result.code === 0 || result.code === 5) return false;
+	if (result.code === 1 && result.stdout === "" && result.stderr === "") return !displayReachable();
 	if (/cannot open display|unable to (?:open|init)|failed to (?:open|init)/i.test(result.stderr)) return true;
 	const gtkDiagnostic = /^\**\s*\(\w+:\d+\):\s+[\w-]+-(?:WARNING|CRITICAL|MESSAGE|DEBUG)\b/;
 	return result.stderr.split(/\r?\n/).some((line) => line.trim() !== "" && !gtkDiagnostic.test(line));

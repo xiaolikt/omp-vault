@@ -55,6 +55,66 @@ export function scrubText(input: string, values: Iterable<ScrubValue>): { text: 
 	return { text, changed };
 }
 
+/** A Buffer's text may hold a secret; only replace it when something changed. */
+function scrubBuffer(value: Buffer, values: Iterable<ScrubValue>): { value: unknown; changed: boolean } {
+	const result = scrubText(value.toString("utf-8"), values);
+	return result.changed ? { value: Buffer.from(result.text, "utf-8"), changed: true } : { value, changed: false };
+}
+
+/** Rebuild a Map/Set/Error only when a contained string changed, so identity is kept otherwise. */
+function scrubMap(
+	value: Map<unknown, unknown>,
+	values: Iterable<ScrubValue>,
+	depth: number,
+): { value: unknown; changed: boolean } {
+	let changed = false;
+	const next = new Map<unknown, unknown>();
+	for (const [key, entry] of value) {
+		const k = scrubDeep(key, values, depth + 1);
+		const v = scrubDeep(entry, values, depth + 1);
+		if (k.changed || v.changed) changed = true;
+		next.set(k.value, v.value);
+	}
+	return { value: changed ? next : value, changed };
+}
+
+function scrubSet(
+	value: Set<unknown>,
+	values: Iterable<ScrubValue>,
+	depth: number,
+): { value: unknown; changed: boolean } {
+	let changed = false;
+	const next = new Set<unknown>();
+	for (const entry of value) {
+		const result = scrubDeep(entry, values, depth + 1);
+		if (result.changed) changed = true;
+		next.add(result.value);
+	}
+	return { value: changed ? next : value, changed };
+}
+
+function scrubError(
+	value: Error,
+	values: Iterable<ScrubValue>,
+	depth: number,
+): { value: unknown; changed: boolean } {
+	const message = scrubText(value.message, values);
+	const stack = typeof value.stack === "string" ? scrubText(value.stack, values) : undefined;
+	const cause =
+		"cause" in value
+			? scrubDeep((value as Error & { cause?: unknown }).cause, values, depth + 1)
+			: undefined;
+	if (!message.changed && !stack?.changed && !cause?.changed) return { value, changed: false };
+	const copy = Object.create(Object.getPrototypeOf(value)) as Error;
+	Object.defineProperties(copy, Object.getOwnPropertyDescriptors(value));
+	if (message.changed) Object.defineProperty(copy, "message", { value: message.text, writable: true, configurable: true });
+	if (stack?.changed) Object.defineProperty(copy, "stack", { value: stack.text, writable: true, configurable: true });
+	if (cause?.changed) {
+		Object.defineProperty(copy, "cause", { value: cause.value, writable: true, configurable: true });
+	}
+	return { value: copy, changed: true };
+}
+
 /** OMP's bash `details.trace` can echo the sourced env file; scrub nested values. */
 export function scrubDeep(
 	value: unknown,
@@ -75,8 +135,12 @@ export function scrubDeep(
 		});
 		return { value: changed ? next : value, changed };
 	}
+	if (Buffer.isBuffer(value)) return scrubBuffer(value, values);
+	if (value instanceof Map) return scrubMap(value, values, depth);
+	if (value instanceof Set) return scrubSet(value, values, depth);
+	if (value instanceof Error) return scrubError(value, values, depth);
 	if (value && typeof value === "object") {
-		// Only plain data is rebuilt. A Date, Buffer, or class instance keeps its
+		// Only plain data is rebuilt. A Date or another class instance keeps its
 		// prototype: it is returned as is instead of being turned into `{}`.
 		const proto = Object.getPrototypeOf(value);
 		if (proto !== Object.prototype && proto !== null) return { value, changed: false };

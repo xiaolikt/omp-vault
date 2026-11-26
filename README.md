@@ -70,7 +70,7 @@ omp 会为**每个会话和每个子代理**重新绑定插件工厂，所以每
 - `/vault add`、`vault_add`：用户名，然后密码；工具参数里**没有密码字段**
 - `vault_get`、`vault_import`、`vault_remove`：确认窗口（焦点默认在「拒绝」）
 
-关掉窗口就是取消，**不会**再弹一个终端输入框。zenity 不存在、拒绝参数、打不开显示时，才退回 omp/pi 的输入框。omp 会掩码输入；上游 pi 忽略掩码提示。
+关掉窗口就是取消，**不会**再弹一个终端输入框。zenity 不存在、拒绝参数、打不开显示时，才退回 omp/pi 的输入框；如果 zenity 静默退出且显示不可达，也会回退，避免完全没有输入框。omp 会掩码输入；上游 pi 忽略掩码提示。
 
 ## Bitwarden
 
@@ -78,7 +78,7 @@ omp 会为**每个会话和每个子代理**重新绑定插件工厂，所以每
 
 - 要跑一条命令、又不想让密码进对话：`bw_run`（omp 和 pi 都可用）。值在子进程环境里，命令结束就没了；stdout/stderr 里出现原值、base64/base64url/URL/hex 形式（包括 `base64` 的 76 列换行和 `xxd` 的空格 hex）都会被替换成 `[BW_SCRUBBED:VAR]`。输出最多保留 8 MiB，超出部分丢弃并标注。
 - pi 上还可以 `bw_inject` 注入 bash 环境，后续多条命令都能用。
-- `bw_clipboard` 复制的值也会登记到擦洗列表：之后用 `pbpaste` / `xclip -o` / `wl-paste` 读回剪贴板，结果同样会被擦洗。
+- `bw_clipboard` 复制的值也会登记到擦洗列表：之后用 `pbpaste` / `xclip -o` / `wl-paste` 读回剪贴板，结果同样会被擦洗。Wayland 下 `wl-copy`/`wl-paste` 缺失时会回退到 X11 的 `xclip`。
 - 确认窗口里显示的是**实际命中的条目**（名称+用户名），不是模型给的引用。
 - `/bw lock` 只丢弃当前绑定的会话密钥；同一进程里还有别的绑定持有时不会执行全局 `bw lock`，最后一个绑定释放时才真正作废 CLI 会话。
 
@@ -96,7 +96,7 @@ omp 会为**每个会话和每个子代理**重新绑定插件工厂，所以每
 - `bw_reveal` 默认关闭；要明文通道得在配置里显式打开。
 - 擦洗只在值长度 ≥ 6 时生效（更短的会误伤正常输出）；网络外传、单向哈希防不住——`bw_run` / `bw_inject` 的价值是值不进对话，不是防住被注入的 agent。
 - 原子写：临时文件（按进程和写入唯一命名）+ `fsync` + `rename` + 目录 `fsync`；KDF 参数写进文件头，以后调参不会毁老库。
-- 擦洗列表保留最近使用的 512 个值；超过上限后，最久未用的值会失去保护（正常会话远达不到）。
+- 擦洗列表保留最近使用的 512 个值；超过上限后，最久未用的值会失去保护（正常会话远达不到）。除普通对象/数组外，`Buffer`、`Map`、`Set`、`Error` 里的字符串也会擦洗。
 - Bitwarden 确认窗口只使用列表里的元数据；条目的字段在用户点允许之后才按 id 读取。
 
 ## 配置 `~/.bw/pi-extension/config.json`
@@ -142,7 +142,7 @@ pi remove git:github.com/xiaolikt/pi-bitwarden
 ## 测试
 
 ```bash
-npm test            # 70 个确定性用例：模拟 bw/zenity，驱动真实工具与命令
+npm test            # 72 个确定性用例：模拟 bw/zenity，驱动真实工具与命令
 npm run typecheck
 bash test/smoke.sh omp   # 模型驱动，真 omp 会话里跑一遍 bw_run
 bash test/smoke.sh pi    # 同上，pi
