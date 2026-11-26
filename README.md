@@ -76,9 +76,11 @@ omp 会为**每个会话和每个子代理**重新绑定插件工厂，所以每
 
 需要 `bw`（先 `bw login`）。第一次用到时弹窗要主密码，之后每次调用只在确认窗口里点允许。
 
-- 要跑一条命令、又不想让密码进对话：`bw_run`（omp 和 pi 都可用）。值在子进程环境里，命令结束就没了；stdout/stderr 里出现原值、base64/base64url/URL/hex 形式都会被替换成 `[BW_SCRUBBED:VAR]`。输出最多保留 8 MiB，超出部分丢弃并标注。
+- 要跑一条命令、又不想让密码进对话：`bw_run`（omp 和 pi 都可用）。值在子进程环境里，命令结束就没了；stdout/stderr 里出现原值、base64/base64url/URL/hex 形式（包括 `base64` 的 76 列换行和 `xxd` 的空格 hex）都会被替换成 `[BW_SCRUBBED:VAR]`。输出最多保留 8 MiB，超出部分丢弃并标注。
 - pi 上还可以 `bw_inject` 注入 bash 环境，后续多条命令都能用。
+- `bw_clipboard` 复制的值也会登记到擦洗列表：之后用 `pbpaste` / `xclip -o` / `wl-paste` 读回剪贴板，结果同样会被擦洗。
 - 确认窗口里显示的是**实际命中的条目**（名称+用户名），不是模型给的引用。
+- `/bw lock` 只丢弃当前绑定的会话密钥；同一进程里还有别的绑定持有时不会执行全局 `bw lock`，最后一个绑定释放时才真正作废 CLI 会话。
 
 ## 导入
 
@@ -88,7 +90,7 @@ omp 会为**每个会话和每个子代理**重新绑定插件工厂，所以每
 
 ## 安全
 
-- 主密码只经过弹窗或主机输入框；Bitwarden 主密码经环境变量交给 `bw unlock`，不进 argv。`BW_SESSION` 只在内存。
+- 主密码只经过弹窗或主机输入框；Bitwarden 主密码经环境变量交给 `bw unlock`，不进 argv。`BW_SESSION` 只在内存。插件启动的子进程（`bw`、`bw_run` 的 bash、剪贴板工具）都会剔除宿主环境里的 `BW_*`，避免用户 shell 里导出的会话密钥漏进命令环境。
 - 本地库空闲 10 分钟自动锁定。`vault_get` 授权默认 5 分钟。
 - 审计：`~/.omp/vault/audit.log`（本地库）和 `~/.bw/pi-extension/audit.log`（Bitwarden），记录会话/子代理标签、条目名、允许/拒绝，从不记录值；写失败不影响主操作。
 - `bw_reveal` 默认关闭；要明文通道得在配置里显式打开。
@@ -138,13 +140,13 @@ pi remove git:github.com/xiaolikt/pi-bitwarden
 ## 测试
 
 ```bash
-npm test            # 52 个确定性用例：模拟 bw/zenity，驱动真实工具与命令
+npm test            # 58 个确定性用例：模拟 bw/zenity，驱动真实工具与命令
 npm run typecheck
 bash test/smoke.sh omp   # 模型驱动，真 omp 会话里跑一遍 bw_run
 bash test/smoke.sh pi    # 同上，pi
 ```
 
-`npm test` 里 `tests/vault-flow.test.mjs` 和 `tests/bitwarden-tools.test.mjs` 覆盖：omp 的 `session_start` 不锁、`session_switch` 的 new/fork 锁、子代理不继承授权、解锁中途锁定被丢弃、带空格名称、空用户名保留、base64 短密码擦洗、8 MiB 上限、进程组超时清理。
+`npm test` 里 `tests/vault-flow.test.mjs` 和 `tests/bitwarden-tools.test.mjs` 覆盖：omp 的 `session_start` 不锁、`session_switch` 的 new/fork 锁、子代理不继承授权、解锁/确认窗口中途锁定被丢弃、带空格名称、空用户名保留、base64 短密码与换行编码擦洗、剪贴板值擦洗、`BW_SESSION` 不进子进程、只擦洗 bash 自己的临时输出文件、8 MiB 上限、进程组超时清理。
 
 ## License
 

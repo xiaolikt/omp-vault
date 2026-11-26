@@ -221,6 +221,7 @@ function vaultGetTool(scope: Scope): ToolDefinition<typeof vaultGetParams, Vault
 				};
 			}
 			const sub = subagentId(ctx);
+			const epoch = scope.epoch;
 			const allowed = await confirmWindow(
 				dialogs(ctx),
 				"omp-vault · 读取本地密码",
@@ -237,13 +238,29 @@ function vaultGetTool(scope: Scope): ToolDefinition<typeof vaultGetParams, Vault
 					isError: true,
 				};
 			}
+			// /vault lock (or the idle sweeper, or a session switch) ran while the
+			// window was open: the approval belonged to the old, unlocked state.
+			if (scope.epoch !== epoch || !unlocked(scope)) {
+				appendAudit({ session: label, event: "read_deny", item: item.name, reason: "locked-during-confirm" });
+				setStatus(ctx, scope, "·locked");
+				return { content: [{ type: "text" as const, text: LOCKED }], details: { ok: false }, isError: true };
+			}
+			// Read again after the approval, from the state the user actually approved.
+			const approvedItem = vault.find(params.name);
+			if (!approvedItem) {
+				return {
+					content: [{ type: "text" as const, text: `"${item.name}" was removed while the window was open` }],
+					details: { ok: false },
+					isError: true,
+				};
+			}
 			scope.grants.set(key, Date.now() + GRANT_MS_DEFAULT);
-			appendAudit({ session: label, event: "grant", item: item.name });
-			appendAudit({ session: label, event: "read_allow", item: item.name, reason: params.reason });
+			appendAudit({ session: label, event: "grant", item: approvedItem.name });
+			appendAudit({ session: label, event: "read_allow", item: approvedItem.name, reason: params.reason });
 			setStatus(ctx, scope, "·granted");
 			return {
-				content: [{ type: "text" as const, text: JSON.stringify(item, null, 1) }],
-				details: { item: item.name, via: "interactive-grant" },
+				content: [{ type: "text" as const, text: JSON.stringify(approvedItem, null, 1) }],
+				details: { item: approvedItem.name, via: "interactive-grant" },
 			};
 		},
 	};

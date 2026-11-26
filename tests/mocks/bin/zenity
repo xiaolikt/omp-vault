@@ -14,7 +14,9 @@ take_first() {
 	local first rest
 	first="$(head -n 1 "$1" 2>/dev/null)"
 	rest="$(tail -n +2 "$1" 2>/dev/null)"
-	printf '%s\n' "$rest" > "$1"
+	# An exhausted queue is removed, not left as an empty line: the next dialog
+	# then falls back to its default instead of reading an empty answer.
+	if [[ -n "$rest" ]]; then printf '%s\n' "$rest" > "$1"; else rm -f "$1"; fi
 	printf '%s\n' "$first"
 }
 for arg in "$@"; do

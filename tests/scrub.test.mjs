@@ -19,6 +19,21 @@ test("redacts base64 and base64url", () => {
 	assert.equal(result.text, "[BW_SCRUBBED-B64:T1] [BW_SCRUBBED-B64URL:T1]");
 });
 
+test("redacts base64 and hex that are wrapped or spaced", () => {
+	// GNU base64 wraps at 76 columns; xxd/od put spaces between hex bytes.
+	const raw = `${"correct-horse-battery-staple-".repeat(4)}end`;
+	const b64 = Buffer.from(raw).toString("base64");
+	assert.ok(b64.length > 76, "the fixture is long enough to wrap");
+	const wrapped = b64.match(/.{1,76}/g).join("\n");
+	const hex = Buffer.from(raw).toString("hex");
+	const spaced = hex.match(/.{1,2}/g).join(" ");
+	const result = scrubText(`b64:\n${wrapped}\nhex: ${spaced}\n`, [{ env: "W", value: raw }]);
+	assert.equal(result.changed, true);
+	assert.equal(result.text.includes("correct-horse"), false);
+	assert.match(result.text, /\[BW_SCRUBBED-B64:W\]/);
+	assert.match(result.text, /\[BW_SCRUBBED-HEX:W\]/);
+});
+
 test("redacts base64 of a short password", () => {
 	// `echo -n "$VAULT_SECRET" | base64` must not leak an everyday password.
 	const raw = "hunter2abcd";

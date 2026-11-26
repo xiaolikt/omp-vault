@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, passwordPrompts, textOf, useMocks } from "./helpers.mjs";
@@ -14,6 +16,23 @@ const bwAudit = () => {
 	const file = join(process.env.HOME, ".bw", "pi-extension", "audit.log");
 	return existsSync(file) ? readFileSync(file, "utf8") : "";
 };
+
+test("one binding's lock does not destroy another binding's Bitwarden key", async () => {
+	// First test in the file: no earlier binding has left a key behind.
+	const first = bind(ompVault, true);
+	const second = bind(ompVault, true);
+	answers.master(dir, "testmaster", "testmaster");
+	await first.tool("bw_list", {}, makeCtx().ctx);
+	await second.tool("bw_list", {}, makeCtx().ctx);
+
+	await first.commands.get("bw").handler("lock", makeCtx().ctx);
+	assert.equal(existsSync(join(dir, "locked")), false, "the first lock ran a global bw lock");
+
+	await second.commands.get("bw").handler("lock", makeCtx().ctx);
+	assert.equal(existsSync(join(dir, "locked")), true, "the last lock did not run bw lock");
+	// Leave the mock back at its default password for the tests that follow.
+	answers.master(dir);
+});
 
 test("omp: bw_run gives one command the secret and scrubs it and its base64, for short passwords too", async () => {
 	const b = bind(ompVault, true);
@@ -34,6 +53,86 @@ test("omp: bw_run gives one command the secret and scrubs it and its base64, for
 	const short = textOf(await b.tool("bw_run", { item: "OtherService", command: 'printf %s "$VAULT_SECRET" | base64' }));
 	assert.equal(short.includes("b3RoZXItcHctOTk5"), false, "base64 of a short secret leaked");
 	assert.match(short, /\[BW_SCRUBBED-B64:VAULT_SECRET\]/);
+});
+
+test("a BW_SESSION exported in the host shell does not reach bw_run", async () => {
+	const b = bind(ompVault, true);
+	answers.master(dir, "testmaster");
+	answers.deny(dir, false);
+	const saved = process.env.BW_SESSION;
+	process.env.BW_SESSION = "LEAKED_HOST_SESSION";
+	try {
+		const out = textOf(
+			await b.tool("bw_run", { item: "TestService", command: 'printf "session=%s\\n" "${BW_SESSION:-unset}"' }),
+		);
+		assert.equal(out.includes("LEAKED_HOST_SESSION"), false);
+		assert.match(out, /session=unset/);
+	} finally {
+		if (saved === undefined) delete process.env.BW_SESSION;
+		else process.env.BW_SESSION = saved;
+	}
+});
+
+test("only bash's own temp output artifact can be scrubbed or removed", async () => {
+	const b = bind(ompVault, true);
+	answers.master(dir, "testmaster");
+	answers.deny(dir, false);
+	await b.tool("bw_run", { item: "TestService", command: "true" });
+
+	// A real bash artifact: scrubbed in place.
+	const artifact = join(tmpdir(), `pi-bash-${randomBytes(8).toString("hex")}.log`);
+	writeFileSync(artifact, `before ${SECRET} after`);
+	try {
+		await b.fire("tool_result", {
+			toolName: "bash",
+			content: [{ type: "text", text: "ok" }],
+			details: { fullOutputPath: artifact },
+		});
+		const text = readFileSync(artifact, "utf8");
+		assert.equal(text.includes(SECRET), false);
+		assert.match(text, /BW_SCRUBBED/);
+	} finally {
+		rmSync(artifact, { force: true });
+	}
+
+	// A non-bash result, or a bash result pointing outside the temp dir, is ignored.
+	const outside = mkdtempSync(join(tmpdir(), "omp-vault-artifact-"));
+	const big = join(outside, "big.log");
+	writeFileSync(big, "x".repeat(9 * 1024 * 1024));
+	try {
+		await b.fire("tool_result", {
+			toolName: "read",
+			content: [{ type: "text", text: "ok" }],
+			details: { fullOutputPath: big },
+		});
+		assert.equal(existsSync(big), true, "a non-bash result deleted a file");
+		await b.fire("tool_result", {
+			toolName: "bash",
+			content: [{ type: "text", text: "ok" }],
+			details: { fullOutputPath: big },
+		});
+		assert.equal(existsSync(big), true, "a bash result deleted a file outside the temp dir");
+	} finally {
+		rmSync(outside, { recursive: true, force: true });
+	}
+
+	// A symlink with an artifact name is not followed.
+	const targetDir = mkdtempSync(join(tmpdir(), "omp-vault-artifact-"));
+	const target = join(targetDir, "target");
+	writeFileSync(target, `target ${SECRET}`);
+	const link = join(tmpdir(), `pi-bash-${randomBytes(8).toString("hex")}.log`);
+	symlinkSync(target, link);
+	try {
+		await b.fire("tool_result", {
+			toolName: "bash",
+			content: [{ type: "text", text: "ok" }],
+			details: { fullOutputPath: link },
+		});
+		assert.match(readFileSync(target, "utf8"), /target/);
+	} finally {
+		rmSync(link, { force: true });
+		rmSync(targetDir, { recursive: true, force: true });
+	}
 });
 
 test("the confirm window names the entry that was really matched", async () => {
@@ -118,15 +217,27 @@ test("a timed-out bw_run takes the processes it spawned down with it", async () 
 	assert.equal(spawnSync("pgrep", ["-f", "sleep 987"]).status, 1, "the spawned sleep outlived the command");
 });
 
-test("bw_clipboard copies the value without it entering the result", async () => {
+test("bw_clipboard copies the value without it entering the result, and registers it for scrubbing", async () => {
 	delete process.env.DISPLAY;
 	process.env.WAYLAND_DISPLAY = "wayland-99";
+	// A custom field that no earlier test has put in the scrub list.
+	const CLIP = "hf_sk-abc987xyz456";
 	try {
 		const b = bind(ompVault, true);
-		const out = textOf(await b.tool("bw_clipboard", { item: "TestService" }));
-		assert.match(out, /Copied "TestService" \(password\) to clipboard/);
-		assert.equal(out.includes(SECRET), false);
-		assert.equal(readFileSync(join(dir, "clipboard"), "utf8"), SECRET);
+		const out = textOf(await b.tool("bw_clipboard", { item: "TestService", field: "field:API_KEY" }));
+		assert.match(out, /Copied "TestService" \(field:API_KEY\) to clipboard/);
+		assert.equal(out.includes(CLIP), false);
+		assert.equal(readFileSync(join(dir, "clipboard"), "utf8"), CLIP);
+
+		// `pbpaste`/`xclip -o`/`wl-paste` in bash can now read the value back,
+		// so its appearance in any tool result must be scrubbed.
+		const [scrubbed] = await b.fire("tool_result", {
+			toolName: "bash",
+			content: [{ type: "text", text: `clip=${CLIP}` }],
+			details: {},
+		});
+		assert.match(textOf(scrubbed), /\[BW_SCRUBBED:CLIPBOARD\]/);
+		assert.equal(textOf(scrubbed).includes(CLIP), false);
 	} finally {
 		delete process.env.WAYLAND_DISPLAY;
 		process.env.DISPLAY = ":99";

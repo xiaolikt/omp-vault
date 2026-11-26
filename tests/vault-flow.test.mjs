@@ -160,6 +160,67 @@ test("a corrupt store is reported, not thrown", async () => {
 	}
 });
 
+test("vault_get keeps a user-approved secret that the Bitwarden scrubber also knows", async () => {
+	const b = bind(ompVault, true);
+	const ctx = makeCtx();
+	await addEntry(b, ctx.ctx, "LeakCheck", "supersecret-value-123");
+
+	// Put the same value in the Bitwarden scrub list, then read it locally.
+	answers.master(dir, "testmaster");
+	answers.deny(dir, false);
+	await b.tool("bw_run", { item: "TestService", command: "true" }, ctx.ctx);
+	await b.cmd("grant LeakCheck", ctx.ctx);
+	const got = await b.tool("vault_get", { name: "LeakCheck" }, ctx.ctx);
+	assert.match(textOf(got), /supersecret-value-123/);
+
+	// A bash result carrying that value is scrubbed, proving it is in the list;
+	// the vault_get result itself is deliberately exempt.
+	const [bash] = await b.fire("tool_result", { toolName: "bash", content: got.content, details: {} }, ctx.ctx);
+	assert.match(textOf(bash), /BW_SCRUBBED/);
+	const [vault] = await b.fire(
+		"tool_result",
+		{ toolName: "vault_get", content: got.content, details: got.details },
+		ctx.ctx,
+	);
+	assert.equal(vault, undefined);
+});
+
+test("a lock during the vault_get confirm window releases nothing and writes no grant", async () => {
+	const b = bind(ompVault, true);
+	const ctx = makeCtx();
+	await addEntry(b, ctx.ctx, "RaceEntry", "race-secret-value");
+	delete process.env.DISPLAY;
+	delete process.env.WAYLAND_DISPLAY;
+	try {
+		let answer;
+		const cctx = makeCtx({ confirm: () => new Promise((resolve) => (answer = resolve)) });
+		const pending = b.tool("vault_get", { name: "RaceEntry" }, cctx.ctx).then(
+			(result) => result,
+			(error) => error,
+		);
+		for (let i = 0; i < 50 && !answer; i++) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(typeof answer, "function", "the confirm dialog opened");
+
+		await b.cmd("lock", cctx.ctx);
+		answer(true);
+		const result = await pending;
+		assert.equal(result.isError, true);
+		assert.match(textOf(result), /locked/);
+		assert.equal(textOf(result).includes("race-secret-value"), false);
+
+		// No grant was written: after unlocking again, the confirm is asked and
+		// its denial is what stops the read (an existing grant would skip it).
+		const after = await b.tool(
+			"vault_get",
+			{ name: "RaceEntry" },
+			makeCtx({ input: () => Promise.resolve(PW), confirm: () => Promise.resolve(false) }).ctx,
+		);
+		assert.equal(after.details.denied, true);
+	} finally {
+		process.env.DISPLAY = ":99";
+	}
+});
+
 test("a lock that runs while the password dialog is open discards the unlock", async () => {
 	// No display: the host dialog is used, and this test decides when it answers.
 	delete process.env.DISPLAY;

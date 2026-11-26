@@ -19,7 +19,7 @@ export function useMocks() {
 	process.env.DISPLAY = ":99";
 	delete process.env.WAYLAND_DISPLAY;
 	process.env.PATH = `${MOCKS}:${process.env.PATH}`;
-	process.env.BW_MOCK_DIR = dir;
+	process.env.OMP_VAULT_BW_MOCK_DIR = dir;
 	process.env.OMP_VAULT_MOCK = dir;
 	process.env.OMP_VAULT_DIR = join(dir, "vault");
 	return dir;
@@ -60,7 +60,7 @@ export function makeCtx({ sessionId, agent, hasUI = true, input, confirm } = {})
 	const sid = sessionId ?? uuid();
 	const ctx = {
 		hasUI,
-		cwd: process.env.BW_MOCK_DIR,
+		cwd: process.env.OMP_VAULT_BW_MOCK_DIR,
 		mode: "tui",
 		sessionManager: { getSessionId: () => sid },
 		agent,

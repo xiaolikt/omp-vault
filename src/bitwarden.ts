@@ -23,12 +23,16 @@
  *   model's reference, and is answered before any secret is read.
  * - bw_clipboard: copies a secret to the system clipboard, auto-cleared after
  *   the configured delay and on lock/exit (only if it still holds our value).
+ *   The copied value also joins the scrub list, so reading it back with
+ *   pbpaste/xclip/wl-paste in a later tool result does not leak it.
  * - bw_reveal (off by default, per-call confirmation): returns a secret in
  *   plain text. The value then transits the LLM provider and the session file —
  *   that is inherent, hence every reveal needs explicit approval.
  * - Auto-lock: configurable idle timeout (config.json, default: session-lifetime,
  *   i.e. unlock once per session); always on /bw lock and when the session is
  *   left (/new, /fork, exit; a /resume keeps it when keepOnResume is set).
+ *   `bw lock` is global, so it runs only when the last binding releases its
+ *   key; one session's lock cannot invalidate another session's unlock.
  * - Audit log: ~/.bw/pi-extension/audit.log (timestamps, item names, env var
  *   names, allow/deny — never secret values).
  * - Config: ~/.bw/pi-extension/config.json (autoLockMinutes, keepOnResume,
@@ -40,8 +44,8 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, promises as fs } from "node:fs";
-import { homedir } from "node:os";
+import { constants as fsConstants, readFileSync, promises as fs } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
@@ -183,6 +187,25 @@ export function newBwState(): BwState {
 const scrubValues = new Map<string, { env: string; value: string }>();
 const MAX_SCRUB_VALUES = 64;
 
+/**
+ * Bindings in this process that still hold a Bitwarden session key.
+ *
+ * `bw lock` destroys every active session key, not just ours, so it must run
+ * only when the last binding lets go. A /new, /fork, idle lock or subagent
+ * shutdown in one session must not invalidate another session's unlock.
+ */
+let liveSessionKeys = 0;
+
+function acquireSessionKey(): void {
+	liveSessionKeys++;
+}
+
+/** Returns true when this was the last key, i.e. a global `bw lock` is now safe. */
+function releaseSessionKey(): boolean {
+	if (liveSessionKeys > 0) liveSessionKeys--;
+	return liveSessionKeys === 0;
+}
+
 function rememberScrubValue(env: string, value: string): void {
 	scrubValues.set(`${env}\u0000${value}`, { env, value });
 	while (scrubValues.size > MAX_SCRUB_VALUES) {
@@ -234,11 +257,26 @@ interface ExecResult {
 	truncated: boolean;
 }
 
+/**
+ * Environment for a child process: the host's environment without any BW_*
+ * variables. The session key is passed explicitly per call (BW_SESSION for
+ * `bw`, BW_MASTER_PASSWORD for one unlock), so a key exported in the user's
+ * shell can never leak into bash or a bw_run command.
+ */
+function childEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (!key.startsWith("BW_")) env[key] = value;
+	}
+	if (extra) Object.assign(env, extra);
+	return env;
+}
+
 function exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
 	if (opts.signal?.aborted) return Promise.reject(new Error(`${cmd} cancelled`));
 	const { promise, resolve, reject } = Promise.withResolvers<ExecResult>();
 	const child = spawn(cmd, args, {
-		env: opts.env ? { ...process.env, ...opts.env } : process.env,
+		env: childEnv(opts.env),
 		cwd: opts.cwd,
 		stdio: ["pipe", "pipe", "pipe"],
 		detached: opts.group === true,
@@ -442,6 +480,9 @@ async function lock(st: BwState, reason: string): Promise<void> {
 	st.verifiedAt = 0;
 	st.cache = undefined;
 	st.injected.clear();
+	// An unlock that was waiting for its password window must not be reused;
+	// its epoch check already discards the result, and the next call asks again.
+	st.inFlight = undefined;
 	await clearClipboardIfOwner();
 	if (st.lockTimer) {
 		clearInterval(st.lockTimer);
@@ -449,6 +490,7 @@ async function lock(st: BwState, reason: string): Promise<void> {
 	}
 	if (hadSession) {
 		await audit("lock", `reason=${reason}`);
+		if (!releaseSessionKey()) return; // another binding still uses its own key
 		try {
 			const bin = await resolveBw();
 			await exec(bin, ["lock", "--nointeraction"], { timeout: 15_000 });
@@ -475,11 +517,12 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 		}
 		st.key = undefined;
 		st.verifiedAt = 0;
+		releaseSessionKey();
 	}
 	if (st.inFlight) return st.inFlight;
 
 	const epoch = st.epoch;
-	st.inFlight = (async () => {
+	const pending = (async () => {
 		const status = await bwStatus(undefined, signal); // no session env
 		if (status?.status === "unauthenticated") throw new Error(BW_LOGIN_HINT);
 
@@ -502,6 +545,7 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 		if (epoch !== st.epoch || signal?.aborted) throw new Error("Cancelled.");
 		st.key = key;
 		st.verifiedAt = Date.now();
+		acquireSessionKey();
 		startAutoLock(st, ctx);
 		await audit("unlock", "ok");
 		// Refresh in the background: a full sync can take seconds on large vaults.
@@ -512,10 +556,19 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 			});
 		}
 		return key;
-	})().finally(() => {
-		st.inFlight = undefined;
-	});
-	return st.inFlight;
+	})();
+	st.inFlight = pending;
+	// Only clear the slot if it still belongs to this attempt: a lock followed
+	// by a new unlock must not have its promise erased by the old one.
+	void pending.then(
+		() => {
+			if (st.inFlight === pending) st.inFlight = undefined;
+		},
+		() => {
+			if (st.inFlight === pending) st.inFlight = undefined;
+		},
+	);
+	return pending;
 }
 
 function toLite(raw: BwItem): LiteItem {
@@ -741,7 +794,7 @@ async function copyToClipboard(value: string): Promise<void> {
 	const [cmd, args] = backend.copy;
 	const { promise, resolve, reject } = Promise.withResolvers<void>();
 	// wl-copy/xclip stay alive to own the selection; a quick clean exit also means success.
-	const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "pipe"], detached: true });
+	const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "pipe"], detached: true, env: childEnv() });
 	let settled = false;
 	let stderr = "";
 	const finish = (err?: Error) => {
@@ -818,34 +871,61 @@ function clearClipboardSync(): void {
 	clipboardPending = undefined;
 	if (!value || !backend) return;
 	try {
-		const r = spawnSync(backend.read[0], backend.read[1], { encoding: "utf8", timeout: 1000 });
+		const r = spawnSync(backend.read[0], backend.read[1], { encoding: "utf8", timeout: 1000, env: childEnv() });
 		if (r.status === 0 && typeof r.stdout === "string" && r.stdout.length > 0 && !clipboardMatches(r.stdout, value)) return;
 	} catch {
 		/* clear anyway */
 	}
 	try {
-		spawnSync(backend.clear[0], backend.clear[1], { input: "", timeout: 2000 });
+		spawnSync(backend.clear[0], backend.clear[1], { input: "", timeout: 2000, env: childEnv() });
 	} catch {
 		/* best-effort */
 	}
 }
 
-/** Bash truncation can leave the full output in a file; scrub that copy too. */
-async function scrubArtifact(details: unknown): Promise<void> {
-	if (!details || typeof details !== "object" || !("fullOutputPath" in details)) return;
-	const file = details.fullOutputPath;
-	if (typeof file !== "string" || !file) return;
+/** The exact file shape pi's bash tool writes for truncated output. */
+const ARTIFACT_RE = /^pi-bash-[0-9a-f]{16}\.log$/;
+
+/** A path is only an output artifact if it is one of bash's files in the OS temp dir. */
+function artifactPath(details: unknown): string | undefined {
+	if (!details || typeof details !== "object" || !("fullOutputPath" in details)) return undefined;
+	const file = (details as { fullOutputPath?: unknown }).fullOutputPath;
+	if (typeof file !== "string" || !file) return undefined;
+	const resolved = path.resolve(file);
+	if (path.dirname(resolved) !== path.resolve(tmpdir())) return undefined;
+	if (!ARTIFACT_RE.test(path.basename(resolved))) return undefined;
+	return resolved;
+}
+
+/**
+ * Bash truncation can leave the full output in a file; scrub that copy too.
+ * Only bash's own temp artifact is touched: a tool cannot use `fullOutputPath`
+ * to make the extension delete or rewrite an arbitrary file.
+ */
+async function scrubArtifact(toolName: string, details: unknown): Promise<void> {
+	if (toolName !== "bash") return;
+	const file = artifactPath(details);
+	if (!file) return;
+	let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
 	try {
-		const stat = await fs.stat(file);
-		if (stat.size > 8 * 1024 * 1024) {
+		// O_NOFOLLOW: never read or rewrite through a symlink placed in the temp dir.
+		handle = await fs.open(file, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+		const stat = await handle.stat();
+		if (!stat.isFile()) return;
+		if (stat.size > OUTPUT_CAP) {
 			await fs.rm(file, { force: true });
 			return;
 		}
-		const raw = await fs.readFile(file, "utf-8");
+		const raw = await handle.readFile({ encoding: "utf-8" });
 		const { text, changed } = scrubText(raw, scrubValues.values());
-		if (changed) await fs.writeFile(file, text, { mode: 0o600 });
+		if (changed) {
+			await handle.truncate(0);
+			await handle.write(text, 0, "utf-8");
+		}
 	} catch {
-		/* artifact already gone or unreadable */
+		/* artifact already gone, unreadable, or not a regular file */
+	} finally {
+		if (handle) await handle.close().catch(() => {});
 	}
 }
 
@@ -893,6 +973,8 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 	if (!ompHost) {
 		const bashTool = createBashTool(process.cwd(), {
 			spawnHook: ({ command, cwd, env }) => {
+				// A BW_SESSION exported in the user's shell must not reach bash.
+				for (const name of Object.keys(env)) if (name.startsWith("BW_")) delete env[name];
 				for (const [name, rec] of st.injected) env[name] = rec.value;
 				return { command, cwd, env };
 			},
@@ -1129,6 +1211,9 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 			);
 			if (!approved) throw new Error("User declined.");
 			const { value, itemName } = await secretOf(approved.session, approved.item, field, signal);
+			// The value is now in a place bash can read back (pbpaste/xclip -o),
+			// so tool output carrying it must be scrubbed like an injected var.
+			rememberScrubValue("CLIPBOARD", value);
 			await copyToClipboard(value);
 			await audit("clipboard", `allow item="${itemName}" field=${field}`);
 			const clears =
@@ -1186,7 +1271,9 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 
 	// --- Scrubber: active secrets never reach the model via tool results ---
 	pi.on("tool_result", async (event) => {
-		if (event.toolName === "bw_reveal") return undefined; // intentional
+		// bw_reveal and vault_get are intentional, user-approved plain-text
+		// reveals; scrubbing them would corrupt the value the user asked for.
+		if (event.toolName === "bw_reveal" || event.toolName === "vault_get") return undefined;
 		if (scrubValues.size === 0) return undefined;
 		let changed = false;
 		const content = event.content.map((block: any) => {
@@ -1199,7 +1286,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 		const details = scrubDeep(event.details, scrubValues.values());
 		const structured = scrubDeep(event.structuredContent, scrubValues.values());
 		if (details.changed || structured.changed) changed = true;
-		await scrubArtifact(event.details);
+		await scrubArtifact(event.toolName, event.details);
 		if (!changed) return undefined;
 		const result: ToolResultEventResult = { content };
 		if (details.changed) result.details = details.value;

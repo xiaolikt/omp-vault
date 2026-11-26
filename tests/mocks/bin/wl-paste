@@ -1,6 +1,6 @@
 #!/bin/bash
 # Mock wl-paste: read the mock clipboard so auto-clear can verify ownership.
-MOCK_DIR="${BW_MOCK_DIR:-/tmp/bw-mock-state}"
+MOCK_DIR="${OMP_VAULT_BW_MOCK_DIR:-/tmp/bw-mock-state}"
 if [[ "${1:-}" == "--no-newline" ]]; then
 	printf '%s' "$(cat "$MOCK_DIR/clipboard" 2>/dev/null)"
 else

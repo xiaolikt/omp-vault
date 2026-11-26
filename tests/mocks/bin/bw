@@ -1,7 +1,7 @@
 #!/bin/bash
 # Mock Bitwarden CLI for the omp-vault tests: two items, one session key.
-# Controlled via env: BW_MOCK_UNAUTH=1 (unauthenticated), BW_MOCK_DIR (state dir).
-MOCK_DIR="${BW_MOCK_DIR:-/tmp/bw-mock-state}"
+# Controlled via env: OMP_VAULT_BW_MOCK_UNAUTH=1 (unauthenticated), OMP_VAULT_BW_MOCK_DIR (state dir).
+MOCK_DIR="${OMP_VAULT_BW_MOCK_DIR:-/tmp/bw-mock-state}"
 mkdir -p "$MOCK_DIR"
 args="$*"
 if [[ "$1" == "--version" ]]; then echo "mock-1.0.0"; exit 0; fi
@@ -11,7 +11,7 @@ if [[ -f "$MOCK_DIR/locked" ]]; then
 fi
 case "$args" in
 	"status --nointeraction")
-		if [[ "${BW_MOCK_UNAUTH:-0}" == "1" ]]; then
+		if [[ "${OMP_VAULT_BW_MOCK_UNAUTH:-0}" == "1" ]]; then
 			echo '{"serverUrl":null,"lastSync":null,"status":"unauthenticated"}'
 		elif [[ "$BW_SESSION" == "GOOD_SESSION" ]]; then
 			echo '{"serverUrl":"https://vault.example.com","status":"unlocked","userEmail":"t@example.com"}'
