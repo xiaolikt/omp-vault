@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Vault } from "../src/store.ts";
@@ -131,6 +131,31 @@ test("init counts as activity, so a long-running process does not lock a new sto
 	}
 });
 
+test("saving counts as activity, so an idle store does not lock right after a write", () => {
+	const v = newVault();
+	v.init("passphrase-6");
+	const now = Date.now;
+	Date.now = () => now() + 11 * 60_000;
+	try {
+		v.upsert({ name: "a", password: "x" });
+		assert.equal(v.maybeAutoLock(10 * 60_000), false);
+		v.upsertMany([{ name: "b", password: "y" }]);
+		assert.equal(v.maybeAutoLock(10 * 60_000), false);
+	} finally {
+		Date.now = now;
+	}
+});
+
+test("a write leaves no temp file behind", () => {
+	const dir = mkdtempSync(join(tmpdir(), "omp-vault-"));
+	const v = new Vault(dir);
+	v.init(PW);
+	v.upsert({ name: "a", password: "x" });
+	v.remove("a");
+	assert.deepEqual(readdirSync(dir), ["store.json"]);
+	rmSync(dir, { recursive: true, force: true });
+});
+
 test("a corrupt store fails with an error instead of opening", () => {
 	const dir = mkdtempSync(join(tmpdir(), "omp-vault-"));
 	writeFileSync(join(dir, "store.json"), "{ not json");
@@ -160,6 +185,17 @@ test("audit append + read", () => {
 	assert.equal(entries.length, 2);
 	assert.equal(entries[0]?.event, "read_allow");
 	assert.ok(entries[1]?.ts);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("the audit log rotates at 1 MiB, and a zero limit returns nothing", () => {
+	const dir = mkdtempSync(join(tmpdir(), "omp-vault-"));
+	const file = join(dir, "audit.log");
+	writeFileSync(file, "x".repeat(1024 * 1024 + 1));
+	assert.equal(readAudit(file, 0).length, 0);
+	assert.equal(appendAudit({ session: "t", event: "list" }, file), true);
+	assert.ok(existsSync(`${file}.1`), "the old log was not rotated");
+	assert.equal(readAudit(file, 10).length, 1);
 	rmSync(dir, { recursive: true, force: true });
 });
 

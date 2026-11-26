@@ -27,6 +27,7 @@ import {
 	openSync,
 	readFileSync,
 	renameSync,
+	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -193,6 +194,7 @@ export class Vault {
 		this.requireUnlocked();
 		const stored = this.apply(item, new Date().toISOString());
 		this.persist();
+		this.touch();
 		return structuredClone(stored);
 	}
 
@@ -203,6 +205,7 @@ export class Vault {
 		const now = new Date().toISOString();
 		for (const item of items) this.apply(item, now);
 		this.persist();
+		this.touch();
 		return items.length;
 	}
 
@@ -280,15 +283,33 @@ export class Vault {
 			kdf: this.kdf,
 			ct: Buffer.concat([iv, ct, cipher.getAuthTag()]).toString("base64"),
 		};
-		// Atomic write: temp file, flushed to disk, then rename.
-		const tmp = `${this.file}.tmp`;
-		const fd = openSync(tmp, "w", 0o600);
+		// Atomic write: temp file, flushed to disk, then rename. The temp name is
+		// unique per process and write, so two omp processes cannot truncate each
+		// other's temp file; the last rename still wins (see README).
+		const tmp = `${this.file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
 		try {
-			writeFileSync(fd, JSON.stringify(store));
-			fsyncSync(fd);
-		} finally {
-			closeSync(fd);
+			const fd = openSync(tmp, "w", 0o600);
+			try {
+				writeFileSync(fd, JSON.stringify(store));
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+			renameSync(tmp, this.file);
+		} catch (e) {
+			rmSync(tmp, { force: true });
+			throw e;
 		}
-		renameSync(tmp, this.file);
+		// Make the rename itself durable where the platform allows opening a directory.
+		try {
+			const dirFd = openSync(dir, "r");
+			try {
+				fsyncSync(dirFd);
+			} finally {
+				closeSync(dirFd);
+			}
+		} catch {
+			/* best-effort: Windows cannot open a directory this way */
+		}
 	}
 }

@@ -375,6 +375,9 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 	}
 	const password = await promptSecret(dialogs(ctx), "omp-vault · 密码", name, req.signal);
 	if (!password) return "cancelled: no password entered";
+	// A dialog can stay open past the idle auto-lock. Unlock again (usually a
+	// no-op) so the entry is not lost to "vault is locked" after the user typed it.
+	if (!(await ensureUnlocked(scope, ctx, req.signal))) return LOCKED;
 	// A blank username keeps the stored one; there is no way to clear it short of removing the entry.
 	const user = username.trim() || existing?.username;
 	vault.upsert({
@@ -420,6 +423,9 @@ async function importBitwarden(
 		signal,
 	);
 	if (!allowed) return { text: "user denied the Bitwarden import", ok: false, count: 0 };
+	// The confirmation (and the Bitwarden password prompt before it) may have
+	// outlasted the local vault's idle lock.
+	if (!(await ensureUnlocked(scope, ctx, signal))) return { text: LOCKED, ok: false, count: 0 };
 	let drafts: LoginDraft[];
 	try {
 		drafts = await pullBitwardenLogins(bw, ctx, search, signal);
@@ -429,6 +435,8 @@ async function importBitwarden(
 	if (drafts.length === 0) {
 		return { text: "matched items have no login password; nothing imported", ok: false, count: 0 };
 	}
+	// Reading Bitwarden can prompt for its master password, another long dialog.
+	if (!(await ensureUnlocked(scope, ctx, signal))) return { text: LOCKED, ok: false, count: 0 };
 	vault.upsertMany(drafts);
 	appendAudit({ session: sessionLabel(ctx), event: "import", item: `bitwarden:${drafts.length}` });
 	setStatus(ctx, scope);
@@ -549,6 +557,13 @@ function commandHandler(scope: Scope, bw: BwState) {
 				}
 				const sure = await confirmWindow(dialogs(ctx), "omp-vault · 删除条目", `删除「${name}」？删除后无法恢复。`);
 				if (!sure) return;
+				// The confirm may have outlasted the idle lock; unlock again and
+				// re-check the entry instead of throwing "vault is locked".
+				if (!(await ensureUnlocked(scope, ctx))) return;
+				if (!vault.find(name)) {
+					note(ctx, `没有叫「${name}」的条目`, "warning");
+					return;
+				}
 				const removed = vault.remove(name);
 				scope.grants.delete(name.toLowerCase());
 				appendAudit({ session: label, event: "remove", item: name });
@@ -640,6 +655,8 @@ export default function ompVault(pi: ExtensionAPI): void {
 		const was = unlocked(scope);
 		release(scope);
 		if (was) appendAudit({ session: sessionLabel(ctx), event: "lock", reason: `session-${reason}` });
-		if (reason === "quit" || reason === "reload") scopes.delete(scope);
+		// /new, /fork, quit and reload all end this binding. Any later use of the
+		// same scope (pi reuses it) re-registers it through track().
+		scopes.delete(scope);
 	});
 }

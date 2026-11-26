@@ -91,11 +91,13 @@ omp 会为**每个会话和每个子代理**重新绑定插件工厂，所以每
 ## 安全
 
 - 主密码只经过弹窗或主机输入框；Bitwarden 主密码经环境变量交给 `bw unlock`，不进 argv。`BW_SESSION` 只在内存。插件启动的子进程（`bw`、`bw_run` 的 bash、剪贴板工具）都会剔除宿主环境里的 `BW_*`，避免用户 shell 里导出的会话密钥漏进命令环境。
-- 本地库空闲 10 分钟自动锁定。`vault_get` 授权默认 5 分钟。
-- 审计：`~/.omp/vault/audit.log`（本地库）和 `~/.bw/pi-extension/audit.log`（Bitwarden），记录会话/子代理标签、条目名、允许/拒绝，从不记录值；写失败不影响主操作。
+- 本地库空闲 10 分钟自动锁定；解锁、读取、保存、导入、删除都算活动。`vault_get` 授权默认 5 分钟。
+- 审计：`~/.omp/vault/audit.log`（本地库）和 `~/.bw/pi-extension/audit.log`（Bitwarden），记录会话/子代理标签、条目名、允许/拒绝，从不记录值；写失败不影响主操作。两个日志都在 1 MiB 时轮转成 `.1`。
 - `bw_reveal` 默认关闭；要明文通道得在配置里显式打开。
 - 擦洗只在值长度 ≥ 6 时生效（更短的会误伤正常输出）；网络外传、单向哈希防不住——`bw_run` / `bw_inject` 的价值是值不进对话，不是防住被注入的 agent。
-- 原子写：临时文件 + `fsync` + `rename`；KDF 参数写进文件头，以后调参不会毁老库。
+- 原子写：临时文件（按进程和写入唯一命名）+ `fsync` + `rename` + 目录 `fsync`；KDF 参数写进文件头，以后调参不会毁老库。
+- 擦洗列表保留最近使用的 512 个值；超过上限后，最久未用的值会失去保护（正常会话远达不到）。
+- Bitwarden 确认窗口只使用列表里的元数据；条目的字段在用户点允许之后才按 id 读取。
 
 ## 配置 `~/.bw/pi-extension/config.json`
 
@@ -140,13 +142,13 @@ pi remove git:github.com/xiaolikt/pi-bitwarden
 ## 测试
 
 ```bash
-npm test            # 58 个确定性用例：模拟 bw/zenity，驱动真实工具与命令
+npm test            # 66 个确定性用例：模拟 bw/zenity，驱动真实工具与命令
 npm run typecheck
 bash test/smoke.sh omp   # 模型驱动，真 omp 会话里跑一遍 bw_run
 bash test/smoke.sh pi    # 同上，pi
 ```
 
-`npm test` 里 `tests/vault-flow.test.mjs` 和 `tests/bitwarden-tools.test.mjs` 覆盖：omp 的 `session_start` 不锁、`session_switch` 的 new/fork 锁、子代理不继承授权、解锁/确认窗口中途锁定被丢弃、带空格名称、空用户名保留、base64 短密码与换行编码擦洗、剪贴板值擦洗、`BW_SESSION` 不进子进程、只擦洗 bash 自己的临时输出文件、8 MiB 上限、进程组超时清理。
+`npm test` 里 `tests/vault-flow.test.mjs`、`tests/vault-idle.test.mjs` 和 `tests/bitwarden-tools.test.mjs` 覆盖：omp 的 `session_start` 不锁、`session_switch` 的 new/fork 锁、子代理不继承授权、解锁/确认窗口中途锁定被丢弃、弹窗期间自动锁定后保存/删除会重新解锁、带空格名称、空用户名保留、base64 短密码与换行编码擦洗、剪贴板值擦洗与复制/锁定竞态、`BW_SESSION` 不进子进程、只擦洗 bash 自己的临时输出文件、拒绝确认前不读取条目、审计会话标签、8 MiB 上限、进程组超时清理。
 
 ## License
 

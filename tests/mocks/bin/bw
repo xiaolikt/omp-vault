@@ -4,6 +4,8 @@
 MOCK_DIR="${OMP_VAULT_BW_MOCK_DIR:-/tmp/bw-mock-state}"
 mkdir -p "$MOCK_DIR"
 args="$*"
+# One line per call, arguments only (a session key travels in the env, never here).
+[[ "$1" == "--version" ]] || printf '%s\n' "$*" >> "$MOCK_DIR/bw.log"
 if [[ "$1" == "--version" ]]; then echo "mock-1.0.0"; exit 0; fi
 if [[ -f "$MOCK_DIR/locked" ]]; then
 	# Simulate an external lock (e.g. /bw lock in another pi session)
@@ -34,5 +36,6 @@ case "$args" in
 	"get item bbbb2222-2222-4222-8222-222222222222 --nointeraction")
 		echo '{"id":"bbbb2222-2222-4222-8222-222222222222","name":"OtherService","login":{"username":"bob","password":"other-pw-999","uris":[]},"fields":[]}' ;;
 	"lock --nointeraction") touch "$MOCK_DIR/locked"; exit 0 ;;
+	"get item "*" --nointeraction") echo "Not found." >&2; exit 1 ;;
 	*) echo "mock bw: unhandled: $args" >&2; exit 1 ;;
 esac

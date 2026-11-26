@@ -4,6 +4,12 @@
 MOCK_DIR="${OMP_VAULT_BW_MOCK_DIR:-/tmp/bw-mock-state}"
 mkdir -p "$MOCK_DIR"
 if [[ "${1:-}" == "-c" ]]; then : > "$MOCK_DIR/clipboard"; exit 0; fi
+# Test hook: while a `clipboard-hold` file exists, announce the copy and wait
+# before taking the value, so a lock can run while the copy is in flight.
+if [[ -f "$MOCK_DIR/clipboard-hold" ]]; then
+	: > "$MOCK_DIR/clipboard-started"
+	while [[ -f "$MOCK_DIR/clipboard-hold" ]]; do sleep 0.02; done
+fi
 cat > "$MOCK_DIR/clipboard"
 cat "$MOCK_DIR/clipboard" >> "$MOCK_DIR/clipboard.copies"
 printf '\n' >> "$MOCK_DIR/clipboard.copies"

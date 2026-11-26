@@ -20,7 +20,8 @@
  *   OMP path (OMP discards spawnHook env), and also works on pi. Output is
  *   scrubbed; nothing is persisted after the command exits.
  * - Every confirmation names the entry that was really matched, not the
- *   model's reference, and is answered before any secret is read.
+ *   model's reference. Only the listing's metadata is used to build it; the
+ *   entry's fields are fetched by id after the user has agreed.
  * - bw_clipboard: copies a secret to the system clipboard, auto-cleared after
  *   the configured delay and on lock/exit (only if it still holds our value).
  *   The copied value also joins the scrub list, so reading it back with
@@ -33,8 +34,9 @@
  *   left (/new, /fork, exit; a /resume keeps it when keepOnResume is set).
  *   `bw lock` is global, so it runs only when the last binding releases its
  *   key; one session's lock cannot invalidate another session's unlock.
- * - Audit log: ~/.bw/pi-extension/audit.log (timestamps, item names, env var
- *   names, allow/deny — never secret values).
+ * - Audit log: ~/.bw/pi-extension/audit.log (timestamps, session/subagent
+ *   labels, item names, env var names, allow/deny — never secret values;
+ *   rotated at 1 MiB).
  * - Config: ~/.bw/pi-extension/config.json (autoLockMinutes, keepOnResume,
  *   clipboardClearSeconds, allowReveal, maxInjectedEnv).
  *
@@ -51,7 +53,7 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolResultEventRes
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { bitwardenLogins, filterLogins, type LoginDraft } from "./import-map.js";
-import { onSessionLeave, withTier } from "./host.js";
+import { onSessionLeave, sessionLabel, withTier } from "./host.js";
 import { confirmWindow, hasDisplay, promptSecret } from "./prompt.js";
 import { scrubDeep, scrubText } from "./scrub.js";
 
@@ -168,8 +170,10 @@ export interface BwState {
 	inFlight?: Promise<string>;
 	/** Bumped by lock(): an unlock that started earlier is discarded. */
 	epoch: number;
-	/** Metadata only; secrets stay with the CLI until a tool asks for one. */
+	/** Metadata only; an entry's fields are fetched by id, for an approved request. */
 	cache?: { at: number; items: LiteItem[] };
+	/** Audit label of the session or subagent this binding serves (set when it unlocks). */
+	sessionLabel?: string;
 	/** pi only: ENV -> injected secret, read by this binding's bash tool. */
 	injected: Map<string, InjectedSecret>;
 	lockTimer?: NodeJS.Timeout;
@@ -183,9 +187,14 @@ export function newBwState(): BwState {
  * Values the output scrubber must keep hiding, even after /bw clear or lock:
  * a command may already have copied $VAR to a file, and a later `cat` would
  * otherwise leak it. Keyed by ENV + value so replacements keep both.
+ *
+ * The list is bounded so a session that asks for many different values (every
+ * TOTP code is a new one) cannot grow it without end. It is kept large enough
+ * that an ordinary session never evicts a value that may still be on disk;
+ * past the bound, the least recently used value loses its protection.
  */
 const scrubValues = new Map<string, { env: string; value: string }>();
-const MAX_SCRUB_VALUES = 64;
+const MAX_SCRUB_VALUES = 512;
 
 /**
  * Bindings in this process that still hold a Bitwarden session key.
@@ -207,7 +216,11 @@ function releaseSessionKey(): boolean {
 }
 
 function rememberScrubValue(env: string, value: string): void {
-	scrubValues.set(`${env}\u0000${value}`, { env, value });
+	const key = `${env}\u0000${value}`;
+	// Re-insert so a value that is still in use moves to the back: the oldest
+	// entry to drop is the one that has gone unused the longest.
+	scrubValues.delete(key);
+	scrubValues.set(key, { env, value });
 	while (scrubValues.size > MAX_SCRUB_VALUES) {
 		const oldest = scrubValues.keys().next();
 		if (oldest.done) break;
@@ -339,7 +352,8 @@ function exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<Exec
 const AUDIT_MAX_BYTES = 1024 * 1024;
 let auditModeFixed = false;
 
-async function audit(event: string, detail: string): Promise<void> {
+/** One audit line per event. `session` is the binding's label, so a subagent's `bw_run` can be told from its parent's. */
+async function audit(event: string, detail: string, session?: string): Promise<void> {
 	try {
 		await fs.mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
 		const log = path.join(STATE_DIR, "audit.log");
@@ -356,7 +370,8 @@ async function audit(event: string, detail: string): Promise<void> {
 		}
 		// Item names are model/vault supplied: keep one entry per line.
 		const safeDetail = detail.replace(/[\r\n]+/g, " ").slice(0, 500);
-		const line = `${new Date().toISOString()} ${event} ${safeDetail}\n`;
+		const safeSession = session?.replace(/[^\w./-]/g, "").slice(0, 48);
+		const line = `${new Date().toISOString()} ${event}${safeSession ? ` session=${safeSession}` : ""} ${safeDetail}\n`;
 		await fs.appendFile(log, line, { mode: 0o600 });
 	} catch {
 		/* best-effort */
@@ -483,13 +498,16 @@ async function lock(st: BwState, reason: string): Promise<void> {
 	// An unlock that was waiting for its password window must not be reused;
 	// its epoch check already discards the result, and the next call asks again.
 	st.inFlight = undefined;
+	// From here on the clipboard is not ours to keep: a copy still in flight
+	// must clear again when it lands (see copyToClipboard).
+	clipboardDrops++;
 	await clearClipboardIfOwner();
 	if (st.lockTimer) {
 		clearInterval(st.lockTimer);
 		st.lockTimer = undefined;
 	}
 	if (hadSession) {
-		await audit("lock", `reason=${reason}`);
+		await audit("lock", `reason=${reason}`, st.sessionLabel);
 		if (!releaseSessionKey()) return; // another binding still uses its own key
 		try {
 			const bin = await resolveBw();
@@ -502,6 +520,8 @@ async function lock(st: BwState, reason: string): Promise<void> {
 
 async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, signal?: AbortSignal): Promise<string> {
 	touchActivity(st);
+	// Every audit line of this binding names the session or subagent that asked.
+	st.sessionLabel = sessionLabel(ctx);
 	if (signal?.aborted) throw new Error("Cancelled.");
 	if (st.key && Date.now() - st.verifiedAt < 30_000) return st.key;
 	if (st.key) {
@@ -534,7 +554,7 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 			signal,
 		});
 		if (r.code !== 0) {
-			await audit("unlock", "deny=bad-password");
+			await audit("unlock", "deny=bad-password", st.sessionLabel);
 			throw new Error(`Unlock failed (wrong master password or CLI error). ${tail(r.stderr, 120)}`);
 		}
 		const key = r.stdout.replace(/[\r\n]+$/, "");
@@ -547,7 +567,7 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 		st.verifiedAt = Date.now();
 		acquireSessionKey();
 		startAutoLock(st, ctx);
-		await audit("unlock", "ok");
+		await audit("unlock", "ok", st.sessionLabel);
 		// Refresh in the background: a full sync can take seconds on large vaults.
 		const lastSync = Date.parse(status?.lastSync ?? "");
 		if (!Number.isFinite(lastSync) || Date.now() - lastSync > 15 * 60_000) {
@@ -580,19 +600,27 @@ function toLite(raw: BwItem): LiteItem {
 	};
 }
 
-async function listItems(st: BwState, session: string, signal?: AbortSignal): Promise<LiteItem[]> {
-	if (st.cache && Date.now() - st.cache.at < 5 * 60_000) return st.cache.items;
+async function listItems(
+	st: BwState,
+	session: string,
+	signal?: AbortSignal,
+	opts: { fresh?: boolean } = {},
+): Promise<LiteItem[]> {
+	if (!opts.fresh && st.cache && Date.now() - st.cache.at < 5 * 60_000) return st.cache.items;
 	const raw = (await runBwJson(["list", "items"], session, signal)) as BwItem[];
 	const items = raw.map(toLite);
 	st.cache = { at: Date.now(), items };
 	return items;
 }
 
+/** The whole entry, secret fields included. Called only for an entry the user already approved, by id. */
 async function getItemById(session: string, id: string, signal?: AbortSignal): Promise<BwItem> {
 	try {
 		return (await runBwJson(["get", "item", id], session, signal)) as BwItem;
-	} catch {
-		throw new Error(`No Bitwarden item with id ${id}.`);
+	} catch (e) {
+		// Only a missing item is reported as such; a CLI or network error keeps its own message.
+		if (e instanceof Error && /not found/i.test(e.message)) throw new Error(`No Bitwarden item with id ${id}.`);
+		throw e;
 	}
 }
 
@@ -606,8 +634,20 @@ function itemScore(item: LiteItem, query: string): number {
 	return score;
 }
 
-async function resolveItem(st: BwState, session: string, ref: string, signal?: AbortSignal): Promise<BwItem> {
-	if (UUID_RE.test(ref)) return getItemById(session, ref, signal);
+/**
+ * Resolve the model's reference to the entry it really names, as metadata.
+ * Asking the user only needs the name and username; the entry's fields are
+ * fetched by id in secretOf(), after the user has agreed.
+ */
+async function resolveItem(st: BwState, session: string, ref: string, signal?: AbortSignal): Promise<LiteItem> {
+	if (UUID_RE.test(ref)) {
+		let items = await listItems(st, session, signal);
+		// An item created after the cache was filled is missing from it: look once more.
+		if (!items.some((i) => i.id === ref)) items = await listItems(st, session, signal, { fresh: true });
+		const byId = items.find((i) => i.id === ref);
+		if (byId) return byId;
+		throw new Error(`No Bitwarden item with id ${ref}. Use bw_list to browse item ids.`);
+	}
 
 	const items = await listItems(st, session, signal);
 	const query = ref.trim().toLowerCase();
@@ -618,7 +658,7 @@ async function resolveItem(st: BwState, session: string, ref: string, signal?: A
 	);
 	const hits = exact.length > 0 ? exact : partial;
 	const only = hits[0];
-	if (hits.length === 1 && only) return getItemById(session, only.id, signal);
+	if (hits.length === 1 && only) return only;
 
 	const list = (items: LiteItem[]) =>
 		items
@@ -658,8 +698,9 @@ function extractSecret(item: BwItem, field: string): string {
 /**
  * Unlock, resolve the model's reference to the entry it really names, and ask
  * the user about that entry. The window shows the resolved name and username,
- * so a fuzzy or mistyped reference cannot be approved as some other entry, and
- * nothing is read before the user agrees.
+ * so a fuzzy or mistyped reference cannot be approved as some other entry.
+ * Only metadata is resolved here; the entry's fields are fetched after the
+ * user agrees, by the id that was shown.
  */
 async function approveItem(
 	st: BwState,
@@ -670,34 +711,37 @@ async function approveItem(
 	field: string,
 	detail: string,
 	signal?: AbortSignal,
-): Promise<{ session: string; item: BwItem } | undefined> {
+): Promise<{ session: string; item: LiteItem } | undefined> {
 	const session = await ensureUnlocked(st, ctx, signal);
 	const item = await resolveItem(st, session, itemRef, signal);
-	const name = item.name ?? "?";
-	const user = item.login?.username ? ` (user: ${item.login.username})` : "";
+	const name = item.name || "?";
+	const user = item.username ? ` (user: ${item.username})` : "";
 	const ok = await confirmAction(ctx, title, `Item:   ${name}${user}\nField:  ${field}\n${detail}\n\nAllow?`, signal);
 	if (!ok) {
-		await audit(event, `deny item="${name}" field=${field}`);
+		await audit(event, `deny item="${name}" field=${field}`, st.sessionLabel);
 		return undefined;
 	}
 	return { session, item };
 }
 
-/** Read one field of an entry the user has already approved. */
+/** Read one field of an entry the user has just approved: the entry is fetched now, by the id that was shown. */
 async function secretOf(
 	session: string,
-	item: BwItem,
+	item: LiteItem,
 	field: string,
 	signal?: AbortSignal,
 ): Promise<{ value: string; itemId: string; itemName: string }> {
-	const itemName = item.name ?? "?";
+	const itemName = item.name || "?";
+	if (!item.id) {
+		throw new Error(`Bitwarden item "${itemName}" has no id, so ${field === "code" ? "no TOTP code can be generated" : "its fields cannot be read"}.`);
+	}
 	if (field === "code") {
-		if (!item.id) throw new Error(`Bitwarden item "${itemName}" has no id, so no TOTP code can be generated.`);
 		const code = (await runBw(["get", "totp", item.id], { session, signal })).trim();
 		if (!code) throw new Error(`No TOTP code available for item "${itemName}".`);
 		return { value: code, itemId: item.id, itemName };
 	}
-	return { value: extractSecret(item, field), itemId: item.id ?? "?", itemName };
+	const full = await getItemById(session, item.id, signal);
+	return { value: extractSecret(full, field), itemId: item.id, itemName };
 }
 
 export type BitwardenMeta = { id: string; name: string; username: string; uri: string };
@@ -783,6 +827,13 @@ let clipboardValue: string | undefined;
 /** Set while a copy is in flight, so exit cleanup can still clear it. */
 let clipboardPending: string | undefined;
 let clipboardTimer: NodeJS.Timeout | undefined;
+/**
+ * Bumped whenever the clipboard is dropped for good (a lock or an exit), not by
+ * the auto-clear timer. A copy that was in flight across a drop puts its value
+ * back afterwards, so it compares this and clears again instead of only
+ * arming its own timer.
+ */
+let clipboardDrops = 0;
 
 function clipboardMatches(current: string, value: string): boolean {
 	return current === value || current.replace(/[\r\n]+$/, "") === value.replace(/[\r\n]+$/, "");
@@ -791,6 +842,7 @@ function clipboardMatches(current: string, value: string): boolean {
 async function copyToClipboard(value: string): Promise<void> {
 	const backend = clipboardBackend();
 	if (!backend) throw new Error("No clipboard available (need Wayland, X11, or macOS).");
+	const drops = clipboardDrops;
 	const [cmd, args] = backend.copy;
 	const { promise, resolve, reject } = Promise.withResolvers<void>();
 	// wl-copy/xclip stay alive to own the selection; a quick clean exit also means success.
@@ -825,13 +877,23 @@ async function copyToClipboard(value: string): Promise<void> {
 	try {
 		await promise;
 	} catch (e) {
-		clipboardPending = undefined;
+		if (clipboardPending === value) clipboardPending = undefined;
 		throw e;
 	}
-	clipboardPending = undefined;
+	if (clipboardPending === value) clipboardPending = undefined;
 	clearTimeout(clipboardTimer);
 	clipboardValue = value;
 	clipboardTimer = undefined;
+	// A lock or an exit ran while this copy was in flight: the value is back in
+	// the clipboard, so it goes again, now and once more in case the copy
+	// command has not taken the selection yet.
+	if (drops !== clipboardDrops) {
+		await clearClipboardIfOwner();
+		clipboardValue = value;
+		clipboardTimer = setTimeout(() => void clearClipboardIfOwner(), 1000);
+		clipboardTimer.unref?.();
+		throw new Error("Bitwarden was locked while copying; the clipboard is being cleared.");
+	}
 	if (CONFIG.clipboardClearSeconds > 0) {
 		clipboardTimer = setTimeout(() => void clearClipboardIfOwner(), CONFIG.clipboardClearSeconds * 1000);
 		clipboardTimer.unref?.();
@@ -865,6 +927,7 @@ async function clearClipboardIfOwner(): Promise<boolean> {
 
 /** Exit-path cleanup: timers never run after the process exits. */
 function clearClipboardSync(): void {
+	clipboardDrops++;
 	const value = clipboardValue ?? clipboardPending;
 	const backend = clipboardBackend();
 	clipboardValue = undefined;
@@ -1089,7 +1152,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 				const { value, itemId, itemName } = await secretOf(approved.session, approved.item, field, signal);
 				st.injected.set(envName, { value, item: itemName, field, at: Date.now() });
 				rememberScrubValue(envName, value);
-				await audit("inject", `allow env=${envName} item="${itemName}" (${itemId}) field=${field}`);
+				await audit("inject", `allow env=${envName} item="${itemName}" (${itemId}) field=${field}`, st.sessionLabel);
 				safeStatus(ctx, `🔓 bw: ${st.injected.size} env var(s)`);
 				const weak =
 					value.length < 6
@@ -1162,7 +1225,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 				signal,
 				group: true,
 			});
-			await audit("run", `allow env=${envName} item="${itemName}" field=${field} exit=${r.code}`);
+			await audit("run", `allow env=${envName} item="${itemName}" field=${field} exit=${r.code}`, st.sessionLabel);
 			const raw = [r.stdout, r.stderr].filter((s) => s.length > 0).join("\n");
 			const scrubbed = scrubText(raw, scrubValues.values()).text;
 			const output =
@@ -1215,7 +1278,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 			// so tool output carrying it must be scrubbed like an injected var.
 			rememberScrubValue("CLIPBOARD", value);
 			await copyToClipboard(value);
-			await audit("clipboard", `allow item="${itemName}" field=${field}`);
+			await audit("clipboard", `allow item="${itemName}" field=${field}`, st.sessionLabel);
 			const clears =
 				CONFIG.clipboardClearSeconds > 0 ? `Clears in ${CONFIG.clipboardClearSeconds}s.` : "Auto-clear disabled.";
 			return {
@@ -1260,7 +1323,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 			);
 			if (!approved) throw new Error("User declined the reveal.");
 			const { value, itemName } = await secretOf(approved.session, approved.item, field, signal);
-			await audit("reveal", `allow item="${itemName}" field=${field}`);
+			await audit("reveal", `allow item="${itemName}" field=${field}`, st.sessionLabel);
 			return {
 				content: [{ type: "text", text: `${itemName} (${field}):\n<secret>${value}</secret>` }],
 				details: { item: itemName, field },

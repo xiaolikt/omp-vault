@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, passwordPrompts, textOf, useMocks } from "./helpers.mjs";
+import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, passwordPrompts, subCtx, textOf, useMocks } from "./helpers.mjs";
 
 const dir = useMocks();
 const { default: ompVault } = await import("../src/index.ts");
@@ -142,8 +142,45 @@ test("the confirm window names the entry that was really matched", async () => {
 
 	answers.deny(dir, true);
 	await assert.rejects(b.tool("bw_run", { item: "Test", command: "true" }), /User declined/);
-	assert.match(bwAudit(), /run deny item="TestService" field=password/);
+	assert.match(bwAudit(), /run session=\S+ deny item="TestService" field=password/);
 	answers.deny(dir, false);
+});
+
+test("a denied confirmation never fetches the entry; an approved one fetches it by id", async () => {
+	const b = bind(ompVault, true);
+	answers.master(dir, "testmaster");
+	answers.deny(dir, true);
+	rmSync(join(dir, "bw.log"), { force: true });
+	await assert.rejects(b.tool("bw_run", { item: "TestService", command: "true" }), /User declined/);
+	const denied = existsSync(join(dir, "bw.log")) ? readFileSync(join(dir, "bw.log"), "utf8") : "";
+	assert.equal(denied.includes("get item"), false, "the entry was fetched before the user agreed");
+
+	answers.deny(dir, false);
+	rmSync(join(dir, "bw.log"), { force: true });
+	await b.tool("bw_run", { item: "TestService", command: "true" });
+	assert.match(
+		readFileSync(join(dir, "bw.log"), "utf8"),
+		/get item aaaa1111-1111-4111-8111-111111111111/,
+		"the approved entry was not fetched by the id the window showed",
+	);
+
+	// An id is looked up in the listing, so a wrong one fails before any window.
+	await assert.rejects(
+		b.tool("bw_run", { item: "cccc3333-3333-4333-8333-333333333333", command: "true" }),
+		/No Bitwarden item with id cccc3333/,
+	);
+});
+
+test("the Bitwarden audit names the session, or the subagent, behind each command", async () => {
+	const b = bind(ompVault, true);
+	answers.master(dir, "testmaster", "testmaster");
+	answers.deny(dir, false);
+	const main = makeCtx();
+	await b.tool("bw_run", { item: "TestService", command: "true" }, main.ctx);
+	await b.tool("bw_run", { item: "TestService", command: "true" }, subCtx().ctx);
+	const log = bwAudit();
+	assert.match(log, new RegExp(`run session=${main.sid.replace(/-/g, "").slice(0, 8)} allow`));
+	assert.match(log, /run session=[0-9a-f]{8}\/0-Explore allow/);
 });
 
 test("omp: /new and /fork lock Bitwarden; session_start and /resume do not", async () => {
@@ -164,7 +201,7 @@ test("omp: /new and /fork lock Bitwarden; session_start and /resume do not", asy
 	await b.fire("session_switch", { reason: "fork" }, ctx.ctx);
 	await b.tool("bw_list", {}, ctx.ctx);
 	assert.equal(passwordPrompts(dir), prompts + 2, "/fork did not lock Bitwarden");
-	assert.match(bwAudit(), /lock reason=session-new/);
+	assert.match(bwAudit(), /lock session=\S+ reason=session-new/);
 });
 
 test("a second binding, a subagent or another session, does not inherit the unlock", async () => {
@@ -239,6 +276,45 @@ test("bw_clipboard copies the value without it entering the result, and register
 		assert.match(textOf(scrubbed), /\[BW_SCRUBBED:CLIPBOARD\]/);
 		assert.equal(textOf(scrubbed).includes(CLIP), false);
 	} finally {
+		delete process.env.WAYLAND_DISPLAY;
+		process.env.DISPLAY = ":99";
+	}
+});
+
+test("a lock that runs while a copy is in flight clears the value when it lands", async () => {
+	delete process.env.DISPLAY;
+	process.env.WAYLAND_DISPLAY = "wayland-99";
+	const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+	const hold = join(dir, "clipboard-hold");
+	const started = join(dir, "clipboard-started");
+	const clipboardText = () => (existsSync(join(dir, "clipboard")) ? readFileSync(join(dir, "clipboard"), "utf8") : "");
+	writeFileSync(hold, "");
+	try {
+		const b = bind(ompVault, true);
+		answers.master(dir, "testmaster");
+		answers.deny(dir, false);
+		const ctx = makeCtx();
+		const pending = b.tool("bw_clipboard", { item: "OtherService" }, ctx.ctx).then(
+			(result) => result,
+			(error) => error,
+		);
+		for (let i = 0; i < 200 && !existsSync(started); i++) await sleep(10);
+		assert.ok(existsSync(started), "the copy started");
+
+		await b.commands.get("bw").handler("lock", ctx.ctx);
+		const outcome = await pending;
+		assert.ok(outcome instanceof Error, "a copy that crossed a lock must not report success");
+		assert.match(outcome.message, /locked while copying/);
+
+		// The held copy lands the value only now; the delayed clear takes it away.
+		rmSync(hold, { force: true });
+		for (let i = 0; i < 300 && clipboardText() !== "other-pw-999"; i++) await sleep(10);
+		assert.equal(clipboardText(), "other-pw-999", "the held copy landed");
+		for (let i = 0; i < 300 && clipboardText() !== ""; i++) await sleep(10);
+		assert.equal(clipboardText(), "", "the clipboard kept the secret after the lock");
+	} finally {
+		rmSync(hold, { force: true });
+		rmSync(started, { force: true });
 		delete process.env.WAYLAND_DISPLAY;
 		process.env.DISPLAY = ":99";
 	}
