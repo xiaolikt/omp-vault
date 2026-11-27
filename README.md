@@ -37,6 +37,14 @@ npm publish npm/linux-x64 --access public
 npm publish --access public
 ```
 
+邮箱 OTP 2FA 的账号不能直接用 `--otp` 发布（npm 会回 `E403 ... granular access token with bypass 2fa enabled is required`）。做法：网页 Settings → Access Tokens → **Granular Access Token**，勾上 *Bypass 2FA*、权限 *Read and write (publish and stage)*，把令牌写进 `~/.npmrc`：
+
+```bash
+printf '//registry.npmjs.org/:_authToken=%s\n' "<token>" > ~/.npmrc && chmod 600 ~/.npmrc
+```
+
+这类令牌 npm 会在 2027 年 1 月起逐步作废，届时改用 trusted publishing 或 TOTP 2FA。
+
 别的平台要有自己的二进制包：`./scripts/stage-npm.sh darwin-arm64 --from <交叉编译产物>`，发布后把对应名字加进 `optionalDependencies`。没有匹配的平台包时，shim 会明确报错并提示 `cargo install --path crates/ai-vault`。
 
 ### 从源码 / git
