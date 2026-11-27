@@ -1,7 +1,7 @@
 {
-	"name": "ai-vault",
-	"version": "0.4.0",
-	"description": "One machine-wide encrypted secret store for AI coding agents: a Rust CLI (ai-vault) that owns the store, plus a thin pi/omp extension that calls it.",
+	"name": "@xiaolikt/ai-vault",
+	"version": "0.4.1",
+	"description": "One machine-wide encrypted secret store for AI coding agents: the ai-vault Rust CLI (npm-installable) plus a thin pi/omp extension that calls it.",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/xiaolikt/ai-vault.git"
@@ -10,24 +10,37 @@
 	"license": "MIT",
 	"type": "module",
 	"engines": {
-		"node": ">=22"
+		"node": ">=18"
 	},
 	"keywords": [
 		"ai-vault",
+		"vault",
+		"secrets",
+		"password-store",
+		"cli",
+		"rust",
 		"omp-package",
 		"pi",
 		"pi-coding-agent",
 		"extension",
-		"vault",
-		"secrets",
 		"security",
-		"rust",
 		"omp"
 	],
+	"bin": {
+		"ai-vault": "./bin/ai-vault.cjs"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"optionalDependencies": {
+		"@xiaolikt/ai-vault-linux-x64": "0.4.1"
+	},
 	"files": [
+		"bin",
 		"src",
 		"crates",
 		"Cargo.toml",
+		"Cargo.lock",
 		"install.sh",
 		"test",
 		"tests",
@@ -36,9 +49,11 @@
 	],
 	"scripts": {
 		"build:cli": "cargo build --release",
+		"stage:npm": "bash scripts/stage-npm.sh",
 		"pretest": "cargo build --release",
 		"test": "node --import tsx --test tests/*.test.mjs",
 		"test:cli": "bash test/cli.sh",
+		"test:npm": "bash test/npm.sh",
 		"test:cargo": "cargo test",
 		"test:smoke": "bash test/smoke.sh",
 		"typecheck": "tsc --noEmit"

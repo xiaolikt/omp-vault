@@ -2,3 +2,5 @@ node_modules/
 target/
 *.tsbuildinfo
 .DS_Store
+npm/
+*.tgz

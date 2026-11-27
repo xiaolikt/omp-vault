@@ -20,14 +20,35 @@ $XDG_RUNTIME_DIR/ai-vault/sessions/<token>.json   解锁令牌（0600，tmpfs）
 
 ## 安装
 
+### npm（CLI）
+
+```bash
+npm i -g @xiaolikt/ai-vault     # 主包 + 本平台的二进制包
+ai-vault --version
+```
+
+npm 上的裸名 `ai-vault` 已被别人占用（3.5.1），所以用 scope。主包 `@xiaolikt/ai-vault` 里的 `bin/ai-vault.cjs` 只是个转发器：找到 `@xiaolikt/ai-vault-<os>-<arch>` 里的真二进制，把 argv、stdio 和**退出码**（3/4/5 是宿主契约，不能改）原样交出去。
+
+发布（需要 `npm login`）：
+
+```bash
+./scripts/stage-npm.sh                  # 编译并staging到 npm/linux-x64
+npm publish npm/linux-x64 --access public
+npm publish --access public
+```
+
+别的平台要有自己的二进制包：`./scripts/stage-npm.sh darwin-arm64 --from <交叉编译产物>`，发布后把对应名字加进 `optionalDependencies`。没有匹配的平台包时，shim 会明确报错并提示 `cargo install --path crates/ai-vault`。
+
+### 从源码 / git
+
 ```bash
 # 1. 编译 CLI 并放进 PATH（~/.local/bin/ai-vault）
 ./install.sh
 
-# 2. 插件：pi（开发中直接用本地目录；发布后换成 git:github.com/xiaolikt/ai-vault）
-pi install /path/to/ai-vault
+# 2. 插件：pi
+pi install git:github.com/xiaolikt/ai-vault     # 或 npm:@xiaolikt/ai-vault
 #    omp
-omp plugin install /path/to/ai-vault
+omp plugin install git+ssh://git@github.com/xiaolikt/ai-vault.git
 
 # 3. 建库（弹窗设主密码，两次）
 /vault init
@@ -146,6 +167,7 @@ ai-vault [--dir DIR] [--json] <命令>
 ```bash
 cargo test                  # Rust 单元测试（存储、加密格式、导入映射）
 npm test                    # 先把 CLI 编译出来，再跑插件测试（真实 CLI + mock zenity）
+npm run test:npm            # 打 tarball、临时 prefix 全局安装、跑 shim 与退出码
 npm run test:cli            # 只测二进制：无桌面时的退出码契约、加密落盘、审计
 npm run typecheck
 bash test/smoke.sh pi       # 真宿主冒烟（需要模型凭据）
@@ -155,8 +177,11 @@ bash test/smoke.sh pi       # 真宿主冒烟（需要模型凭据）
 
 ```
 crates/ai-vault/src/   main.rs cli.rs crypto.rs store.rs session.rs dialog.rs import.rs audit.rs paths.rs
+bin/ai-vault.cjs       npm 入口：找平台包、转发 argv/stdio/退出码
+scripts/stage-npm.sh   把 release 二进制 stage 成 npm 平台包
 src/                   index.ts（工具/命令） cli.ts（CLI 客户端） bitwarden.ts prompt.ts host.ts import-map.ts scrub.ts
 test/cli.sh            二进制级集成测试
+test/npm.sh            npm 打包/安装/转发测试
 ```
 
 ## License

@@ -228,7 +228,9 @@ pub fn run() -> i32 {
 /// (~/.omp/vault). The old file is copied, not removed: rolling back to that
 /// extension still works.
 fn migrate_legacy(paths: &Paths) {
-    if paths.store().exists() || paths.dir != Paths::resolve(None).dir {
+    // Only the real default directory: AI_VAULT_DIR is an explicit choice and
+    // must never inherit another location's store.
+    if paths.store().exists() || paths.dir != crate::paths::home().join(".ai-vault") {
         return;
     }
     let legacy = crate::paths::home().join(".omp").join("vault");
