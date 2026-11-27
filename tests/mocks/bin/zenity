@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mock zenity for the omp-vault tests. Every call is one line in
+# Mock zenity for the ai-vault tests. Every call is one line in
 # $OMP_VAULT_MOCK/zenity.log (newlines inside an argument show as ⏎).
 #   --password   a master-password dialog (its title says 主密码) answers with
 #                the first line of $OMP_VAULT_MOCK/passwords, or "testmaster"
@@ -23,7 +23,7 @@ for arg in "$@"; do
 	case "$arg" in
 		--password)
 			kind="entry"
-			for a in "$@"; do [[ "$a" == --title=*主密码* ]] && kind="master"; done
+			for a in "$@"; do [[ "$a" == --title=*主密码* || "$a" == --title=*解锁* || "$a" == --title=*创建* ]] && kind="master"; done
 			if [[ "$kind" == "master" ]]; then
 				if [[ -s "$DIR/passwords" ]]; then take_first "$DIR/passwords"; else echo "testmaster"; fi
 			elif [[ -f "$DIR/entry-passwords" ]]; then

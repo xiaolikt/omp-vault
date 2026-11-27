@@ -1,10 +1,10 @@
 {
-	"name": "omp-vault",
-	"version": "0.3.0",
-	"description": "omp/pi extension: local encrypted vault plus live Bitwarden. Query Bitwarden, import logins, or store secrets yourself — per-session unlock and grants, local passwords typed in a desktop dialog.",
+	"name": "ai-vault",
+	"version": "0.4.0",
+	"description": "One machine-wide encrypted secret store for AI coding agents: a Rust CLI (ai-vault) that owns the store, plus a thin pi/omp extension that calls it.",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/xiaolikt/omp-vault.git"
+		"url": "git+https://github.com/xiaolikt/ai-vault.git"
 	},
 	"author": "xiaolikt",
 	"license": "MIT",
@@ -13,6 +13,7 @@
 		"node": ">=22"
 	},
 	"keywords": [
+		"ai-vault",
 		"omp-package",
 		"pi",
 		"pi-coding-agent",
@@ -20,19 +21,27 @@
 		"vault",
 		"secrets",
 		"security",
+		"rust",
 		"omp"
 	],
 	"files": [
 		"src",
-		"tests",
+		"crates",
+		"Cargo.toml",
+		"install.sh",
 		"test",
+		"tests",
 		"README.md",
 		"LICENSE"
 	],
 	"scripts": {
-		"typecheck": "tsc --noEmit",
+		"build:cli": "cargo build --release",
+		"pretest": "cargo build --release",
 		"test": "node --import tsx --test tests/*.test.mjs",
-		"test:smoke": "bash test/smoke.sh"
+		"test:cli": "bash test/cli.sh",
+		"test:cargo": "cargo test",
+		"test:smoke": "bash test/smoke.sh",
+		"typecheck": "tsc --noEmit"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "^1.5.0",

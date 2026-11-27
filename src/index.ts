@@ -1,156 +1,206 @@
 /**
- * omp-vault — local encrypted vault + live Bitwarden, for omp and pi.
+ * ai-vault — the pi/omp extension.
  *
- * Local store (~/.omp/vault): ChaCha20-Poly1305 at rest. The master password,
- * new secrets, and read grants open a desktop window when a display is
- * available.
+ * The store itself lives in the `ai-vault` Rust binary, in one machine-wide
+ * directory (~/.ai-vault), so pi, omp, and anything else on this computer
+ * share the same imported passwords. This file only registers tools and a
+ * command, keeps one session token per binding, and opens host dialogs when
+ * the CLI has no desktop window of its own.
  *
- * Access is per binding. omp rebinds the extension factory for every session
- * and subagent, and each binding carries its own Scope: a subagent, or a
- * second session in the same process, cannot read on an unlock or a grant that
- * is not its own, and leaving a session (/new, /fork, exit) drops only that
- * binding's access.
- *
- * Bitwarden (bw CLI): bw_list / bw_run / bw_clipboard / bw_reveal (+ bw_inject
- * on pi) query the live vault; vault_import copies login items into the local
- * store after a confirm window.
+ * Bitwarden stays here: `bw_*` tools query the live vault through the `bw`
+ * CLI, and `vault_import` copies login items into the local store via
+ * `ai-vault save`.
  */
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { appendAudit, readAudit } from "./audit.js";
 import { newBwState, pullBitwardenLogins, queryBitwarden, registerBitwarden, type BitwardenMeta, type BwState } from "./bitwarden.js";
-import { bitwardenLogins, type LoginDraft } from "./import-map.js";
+import { CliError, VaultCli } from "./cli.js";
 import { isOmpHost, onSessionLeave, sessionLabel, subagentId, withTier } from "./host.js";
 import { confirmWindow, promptSecret, promptText, type PromptHost } from "./prompt.js";
-import { Vault, type VaultItem } from "./store.js";
-
-const GRANT_MS_DEFAULT = 5 * 60_000;
-const GRANT_MS_MAX = 60 * 60_000;
-const AUTO_LOCK_MS = 10 * 60_000;
 
 type Ctx = ExtensionToolContext | ExtensionCommandContext;
 
-/** One store, one key, one item list per process: every binding writes through it. */
-const vault = new Vault();
+const GRANT_MS_DEFAULT = 5 * 60_000;
+
+interface StatusResult {
+	ok: boolean;
+	unlocked: boolean;
+	items: number;
+	requester: string;
+	idleMs: number;
+	expiresAt: number;
+	grants: Record<string, { expiresAt: number; leftMs: number }>;
+}
+
+interface UnlockResult {
+	ok: boolean;
+	token: string;
+	expiresAt: number;
+	items: number;
+}
+
+interface ListResult {
+	ok: boolean;
+	count: number;
+	items: { name: string; username?: string | null; uris: string[]; updatedAt: string }[];
+}
+
+interface RemovingResult {
+	ok: boolean;
+	removed: boolean;
+}
+
+interface SaveResult {
+	ok: boolean;
+	count: number;
+	names: string[];
+}
+
+interface AuditResult {
+	ok: boolean;
+	entries: { ts: string; session: string; event: string; item?: string; reason?: string }[];
+}
 
 /**
- * What one binding (a session or a subagent) may do. omp rebinds the factory
- * for each; pi has a single binding per process.
+ * One binding (a session, or a subagent) and the CLI session token it holds.
+ * The token is not the key: the key never leaves the ai-vault process tree.
  */
-export interface Scope {
-	/** This binding entered the master password. Another binding's unlock does not count. */
-	authed: boolean;
-	/** item name (lowercase) -> grant expiry epoch ms */
-	grants: Map<string, number>;
-	/** Bumped whenever access is dropped; an unlock prompt opened before is discarded. */
+interface Scope {
+	token?: string;
+	/** Bumped when access is dropped; an unlock prompt opened before is discarded. */
 	epoch: number;
-	unlocking: Promise<boolean> | undefined;
+	/** Cached entry count for the status line. */
+	items: number;
+	unlocking?: Promise<boolean>;
 }
 
-const scopes = new Set<Scope>();
-let sweeper: NodeJS.Timeout | undefined;
+const cli = new VaultCli();
 
-/** Note that `scope` is in use, so the idle sweep covers it. One timer per process. */
-function track(scope: Scope): void {
-	scopes.add(scope);
-	if (sweeper) return;
-	sweeper = setInterval(expire, 30_000);
-	sweeper.unref?.();
-}
-
-/** End grants that ran out; when the store has been idle too long, lock it for everyone. */
-function expire(): void {
-	for (const scope of scopes) {
-		for (const [name, until] of scope.grants) if (until <= Date.now()) scope.grants.delete(name);
-	}
-	if (vault.maybeAutoLock(AUTO_LOCK_MS)) {
-		lockVault();
-		appendAudit({ session: "bg", event: "auto_lock" });
-	}
-}
-
-/** The key leaves memory: no binding keeps access, and every grant ends. */
-function lockVault(): void {
-	vault.lock();
-	for (const scope of scopes) {
-		scope.epoch++;
-		scope.authed = false;
-		scope.grants.clear();
-	}
-}
-
-/** One binding gives up its access. The key stays only while another binding still has it. */
-function release(scope: Scope): void {
-	scope.epoch++;
-	scope.authed = false;
-	scope.grants.clear();
-	if (![...scopes].some((other) => other.authed)) lockVault();
-}
-
-const unlocked = (scope: Scope): boolean => scope.authed && vault.unlocked;
-
-const dialogs = (ctx: Ctx): PromptHost => ctx as unknown as PromptHost;
-
-const note = (ctx: Ctx, text: string, level: "info" | "warning" | "error" = "info"): void =>
-	ctx.ui.notify(text, level);
-
+const CLI_MISSING =
+	"ai-vault CLI 没找到。装一次就有全机共享的库：cargo install --path <repo>/crates/ai-vault（或用 AI_VAULT_BIN 指向编译好的二进制）";
+const NOT_INITIALIZED = "本地库还没初始化 — 运行 /vault init";
 const LOCKED = "local vault is locked (no master password entered, or the window was cancelled)";
 
-/**
- * Make this binding's unlock happen: its own master-password window, or a
- * prompt already waiting for one. Never throws.
- */
+const dialogs = (ctx: Ctx): PromptHost => ctx as unknown as PromptHost;
+const note = (ctx: Ctx, text: string, level: "info" | "warning" | "error" = "info"): void => ctx.ui.notify(text, level);
+
+const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+interface Failure {
+	content: { type: "text"; text: string }[];
+	details: { ok: false; denied?: boolean };
+	isError: true;
+}
+
+const fail = (text: string, denied = false): Failure => ({
+	content: [{ type: "text" as const, text }],
+	details: { ok: false, ...(denied ? { denied: true } : {}) },
+	isError: true,
+});
+
+/** Turn a CLI error into a tool result, dropping a token the CLI rejected. */
+function failure(scope: Scope, error: unknown): Failure {
+	if (error instanceof CliError && error.auth) {
+		scope.token = undefined;
+		return fail(LOCKED);
+	}
+	if (error instanceof CliError && error.denied) return fail(error.message, true);
+	return fail(describe(error));
+}
+
+const setStatus = (ctx: Ctx, scope: Scope, suffix = ""): void => {
+	const base = scope.token ? `vault:open(${scope.items})` : "vault:locked";
+	ctx.ui.setStatus("ai-vault", `${base}${suffix}`);
+};
+
+/** End this binding's CLI session. The CLI deletes the token file. */
+async function lockNow(scope: Scope): Promise<void> {
+	const token = scope.token;
+	scope.token = undefined;
+	scope.epoch++;
+	scope.items = 0;
+	if (!token || !cli.available) return;
+	try {
+		await cli.run(["lock", "--token", token]);
+	} catch {
+		/* the token dies on its own idle timeout */
+	}
+}
+
+/** Make this binding's unlock happen; never throws. */
 async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Promise<boolean> {
-	if (unlocked(scope)) return true;
-	if (!vault.initialized) {
-		note(ctx, "omp-vault 还没初始化 — 运行 /vault init", "warning");
+	if (!cli.available) {
+		note(ctx, CLI_MISSING, "error");
 		return false;
 	}
 	if (scope.unlocking) return scope.unlocking;
 	const epoch = scope.epoch;
 	scope.unlocking = (async (): Promise<boolean> => {
-		const pass = await promptSecret(dialogs(ctx), "omp-vault · 解锁", "本地库主密码", signal);
-		if (!pass) {
-			if (!signal?.aborted) note(ctx, "没有输入主密码（窗口已取消，或没有桌面/界面）", "warning");
-			return false;
+		if (scope.token) {
+			try {
+				const status = await cli.json<StatusResult>(["status", "--token", scope.token], { signal });
+				scope.items = status.items;
+				return true;
+			} catch (error) {
+				if (!(error instanceof CliError) || !error.auth) {
+					note(ctx, `ai-vault: ${describe(error)}`, "error");
+					return false;
+				}
+				scope.token = undefined;
+				if (/not initialized/i.test(error.message)) {
+					note(ctx, NOT_INITIALIZED, "warning");
+					return false;
+				}
+			}
 		}
-		// /vault lock or a session switch ran while the window was open.
-		if (epoch !== scope.epoch || signal?.aborted) return false;
-		let opened = false;
+		const attempt = async (password?: string): Promise<UnlockResult> => {
+			const args = ["unlock", "--requester", sessionLabel(ctx)];
+			if (password !== undefined) args.push("--password-stdin");
+			return cli.json<UnlockResult>(args, {
+				stdin: password === undefined ? undefined : `${password}\n`,
+				signal,
+			});
+		};
 		try {
-			opened = vault.unlock(pass);
-		} catch (e) {
-			appendAudit({ session: sessionLabel(ctx), event: "unlock_error" });
-			note(ctx, `omp-vault: 本地库读不出来（${e instanceof Error ? e.message : String(e)}）`, "error");
+			let result: UnlockResult;
+			try {
+				result = await attempt();
+			} catch (error) {
+				if (!(error instanceof CliError) || !error.needsUi) throw error;
+				const password = await promptSecret(dialogs(ctx), "ai-vault · 解锁", "本地库主密码", signal);
+				if (!password) {
+					if (!signal?.aborted) note(ctx, "没有输入主密码（窗口已取消，或没有桌面/界面）", "warning");
+					return false;
+				}
+				result = await attempt(password);
+			}
+			// /vault lock or a session switch ran while the window was open.
+			if (epoch !== scope.epoch || signal?.aborted) {
+				await cli.run(["lock", "--token", result.token]).catch(() => undefined);
+				return false;
+			}
+			scope.token = result.token;
+			scope.items = result.items;
+			return true;
+		} catch (error) {
+			if (error instanceof CliError && error.auth) {
+				note(ctx, "ai-vault: 主密码错误", "error");
+				return false;
+			}
+			if (error instanceof CliError && /not initialized/i.test(error.message)) {
+				note(ctx, NOT_INITIALIZED, "warning");
+				return false;
+			}
+			note(ctx, `ai-vault: ${describe(error)}`, "error");
 			return false;
 		}
-		if (!opened) {
-			appendAudit({ session: sessionLabel(ctx), event: "unlock_failed" });
-			note(ctx, "omp-vault: 主密码错误", "error");
-			return false;
-		}
-		scope.authed = true;
-		appendAudit({ session: sessionLabel(ctx), event: "unlock" });
-		return true;
 	})().finally(() => {
 		scope.unlocking = undefined;
 	});
 	return scope.unlocking;
 }
 
-const setStatus = (ctx: Ctx, scope: Scope, suffix = ""): void => {
-	const base = unlocked(scope) ? `vault:open(${vault.count})` : "vault:locked";
-	ctx.ui.setStatus("omp-vault", `${base}${suffix}`);
-};
-
-const itemSummary = (i: VaultItem): Record<string, unknown> => ({
-	name: i.name,
-	username: i.username,
-	uris: i.uris ?? [],
-	updatedAt: i.updatedAt,
-});
+// ---------------------------------------------------------------- local vault
 
 const vaultListParams = Type.Object({});
 function vaultListTool(scope: Scope): ToolDefinition<typeof vaultListParams, { ok?: boolean; count?: number }> {
@@ -158,24 +208,24 @@ function vaultListTool(scope: Scope): ToolDefinition<typeof vaultListParams, { o
 		name: "vault_list",
 		label: "Vault: list local entries",
 		description:
-			"List entries in the local omp-vault store (metadata only: name, username, uris). " +
+			"List entries in the machine-wide ai-vault store (metadata only: name, username, uris). " +
 			"This is NOT Bitwarden — use bw_list to query Bitwarden live, and vault_import to copy Bitwarden logins into this store. " +
 			"Use vault_get to read a secret; that opens a confirm window and the grant expires.",
 		promptSnippet: "List local vault metadata; secrets need vault_get plus a user grant.",
 		parameters: vaultListParams,
 		async execute(_id, _params, signal, _onUpdate, ctx) {
-			track(scope);
-			expire();
-			if (!(await ensureUnlocked(scope, ctx, signal))) {
-				return { content: [{ type: "text" as const, text: LOCKED }], details: { ok: false }, isError: true };
+			if (!(await ensureUnlocked(scope, ctx, signal))) return fail(LOCKED);
+			try {
+				const result = await cli.json<ListResult>(["list", "--token", scope.token!], { signal });
+				scope.items = result.count;
+				setStatus(ctx, scope);
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify(result.items, null, 1) }],
+					details: { count: result.count },
+				};
+			} catch (error) {
+				return failure(scope, error);
 			}
-			appendAudit({ session: sessionLabel(ctx), event: "list" });
-			const items = vault.list().map(itemSummary);
-			setStatus(ctx, scope);
-			return {
-				content: [{ type: "text" as const, text: JSON.stringify(items, null, 1) }],
-				details: { count: items.length },
-			};
 		},
 	};
 	return withTier(tool, "read");
@@ -191,77 +241,53 @@ function vaultGetTool(scope: Scope): ToolDefinition<typeof vaultGetParams, Vault
 		name: "vault_get",
 		label: "Vault: read a local secret",
 		description:
-			"Read one secret from the local omp-vault (not Bitwarden). " +
+			"Read one secret from the machine-wide ai-vault store (not Bitwarden). " +
 			"The user must approve a desktop confirm window; the grant then lasts 5 minutes for the session or subagent that asked. " +
 			"If the user denies, do not retry. Prefer bw_run when the secret should stay out of the chat.",
 		parameters: vaultGetParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
-			track(scope);
-			expire();
-			if (!(await ensureUnlocked(scope, ctx, signal))) {
-				return { content: [{ type: "text" as const, text: LOCKED }], details: { ok: false }, isError: true };
-			}
-			const item = vault.find(params.name);
-			if (!item) {
-				const names = vault.list().map((i) => i.name);
-				return {
-					content: [{ type: "text" as const, text: `no such entry. available: ${names.join(", ") || "(empty)"}` }],
-					details: { ok: false },
-					isError: true,
+			if (!(await ensureUnlocked(scope, ctx, signal))) return fail(LOCKED);
+			const args = ["get", params.name, "--token", scope.token!];
+			if (params.reason) args.push("--reason", params.reason);
+			try {
+				const viaOf = (stdout: string): string => {
+					try {
+						return (JSON.parse(stdout) as { via?: string }).via ?? "grant";
+					} catch {
+						return "grant";
+					}
 				};
+				try {
+					const run = await cli.run([...args, "--json"], { signal });
+					setStatus(ctx, scope, "·granted");
+					return {
+						content: [{ type: "text" as const, text: run.stdout.trim() }],
+						details: { item: params.name, via: viaOf(run.stdout) },
+					};
+				} catch (error) {
+					if (!(error instanceof CliError) || error.needsUi !== "confirm") throw error;
+					const sub = subagentId(ctx);
+					const allowed = await confirmWindow(
+						dialogs(ctx),
+						"ai-vault · 读取本地密码",
+						`条目: ${params.name}\n请求方: ${sub ? `子代理 ${sub}` : "主会话"}\n原因: ${params.reason ?? "(未说明)"}\n\n` +
+							"允许后 5 分钟内同一请求方可再次读取。密码会进入对话。",
+						signal,
+					);
+					const run = await cli.run([...args, "--json", "--answer-stdin"], {
+						stdin: allowed ? "y\n" : "n\n",
+						signal,
+					});
+					setStatus(ctx, scope, "·granted");
+					return {
+						content: [{ type: "text" as const, text: run.stdout.trim() }],
+						details: { item: params.name, via: viaOf(run.stdout) },
+					};
+				}
+			} catch (error) {
+				if (error instanceof CliError && error.denied) setStatus(ctx, scope, "·denied");
+				return failure(scope, error);
 			}
-			const key = item.name.toLowerCase();
-			const label = sessionLabel(ctx);
-			if ((scope.grants.get(key) ?? 0) > Date.now()) {
-				appendAudit({ session: label, event: "read_allow", item: item.name, reason: params.reason });
-				setStatus(ctx, scope);
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify(item, null, 1) }],
-					details: { item: item.name, via: "existing-grant" },
-				};
-			}
-			const sub = subagentId(ctx);
-			const epoch = scope.epoch;
-			const allowed = await confirmWindow(
-				dialogs(ctx),
-				"omp-vault · 读取本地密码",
-				`条目: ${item.name}\n请求方: ${sub ? `子代理 ${sub}` : "主会话"}\n原因: ${params.reason ?? "(未说明)"}\n\n` +
-					"允许后 5 分钟内同一请求方可再次读取。密码会进入对话。",
-				signal,
-			);
-			if (!allowed) {
-				appendAudit({ session: label, event: "read_deny", item: item.name, reason: params.reason ?? "denied" });
-				setStatus(ctx, scope, "·denied");
-				return {
-					content: [{ type: "text" as const, text: `user denied access to "${item.name}" — do not retry, ask the user instead` }],
-					details: { ok: false, denied: true },
-					isError: true,
-				};
-			}
-			// /vault lock (or the idle sweeper, or a session switch) ran while the
-			// window was open: the approval belonged to the old, unlocked state.
-			if (scope.epoch !== epoch || !unlocked(scope)) {
-				appendAudit({ session: label, event: "read_deny", item: item.name, reason: "locked-during-confirm" });
-				setStatus(ctx, scope, "·locked");
-				return { content: [{ type: "text" as const, text: LOCKED }], details: { ok: false }, isError: true };
-			}
-			// Read again after the approval, from the state the user actually approved.
-			const approvedItem = vault.find(params.name);
-			if (!approvedItem) {
-				return {
-					content: [{ type: "text" as const, text: `"${item.name}" was removed while the window was open` }],
-					details: { ok: false },
-					isError: true,
-				};
-			}
-			scope.grants.set(key, Date.now() + GRANT_MS_DEFAULT);
-			appendAudit({ session: label, event: "grant", item: approvedItem.name });
-			appendAudit({ session: label, event: "read_allow", item: approvedItem.name, reason: params.reason });
-			setStatus(ctx, scope, "·granted");
-			return {
-				content: [{ type: "text" as const, text: JSON.stringify(approvedItem, null, 1) }],
-				details: { item: approvedItem.name, via: "interactive-grant" },
-			};
 		},
 	};
 	return tool;
@@ -278,23 +304,22 @@ function vaultAddTool(scope: Scope): ToolDefinition<typeof vaultAddParams, { ok?
 		name: "vault_add",
 		label: "Vault: store a secret via dialog",
 		description:
-			"Create or update an entry in the local omp-vault. You supply the name and optional username, URI, and notes. " +
+			"Create or update an entry in the machine-wide ai-vault store. You supply the name and optional username, URI, and notes. " +
 			"The password is typed by the user in a desktop window and is NEVER accepted from you and NEVER returned. " +
 			"Do not ask the user to paste a password into the chat.",
 		promptSnippet: "Save a local vault entry; the user types the password in a window.",
 		parameters: vaultAddParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
-			const text = await saveLocalEntry(scope, ctx, {
+			const result = await saveLocalEntry(scope, ctx, {
 				name: params.name,
 				username: params.username,
 				uri: params.uri,
 				notes: params.notes,
 				signal,
-				confirm: true,
 			});
-			const ok = text.startsWith("saved ");
+			const ok = result.startsWith("saved ");
 			return {
-				content: [{ type: "text" as const, text }],
+				content: [{ type: "text" as const, text: result }],
 				details: ok ? { item: params.name } : { ok: false },
 				isError: ok ? undefined : true,
 			};
@@ -313,7 +338,7 @@ function vaultImportTool(scope: Scope, bw: BwState): ToolDefinition<typeof vault
 		name: "vault_import",
 		label: "Vault: import from Bitwarden",
 		description:
-			"Copy Bitwarden login items into the local encrypted omp-vault. " +
+			"Copy Bitwarden login items into the machine-wide encrypted ai-vault store. " +
 			"Asks the user to approve in a window, then stores passwords locally. Does not return secret values. " +
 			"Use bw_list to query Bitwarden without copying it. Same-name local entries are updated.",
 		promptSnippet: "Import Bitwarden logins into the local vault after the user confirms.",
@@ -336,68 +361,66 @@ interface SaveRequest {
 	uri?: string;
 	notes?: string;
 	signal?: AbortSignal;
-	/** Ask before opening the password window (model-initiated saves). */
-	confirm: boolean;
 }
 
+/** Save one entry, following the CLI's dialog windows through the host UI. */
 async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise<string> {
-	track(scope);
-	expire();
 	if (!(await ensureUnlocked(scope, ctx, req.signal))) return LOCKED;
 	let name = req.name?.trim() ?? "";
 	if (!name) {
-		const entered = await promptText(dialogs(ctx), "omp-vault · 新条目", "名称", req.signal);
+		const entered = await promptText(dialogs(ctx), "ai-vault · 新条目", "名称", req.signal);
 		name = entered?.trim() ?? "";
 	}
 	if (!name) return "cancelled: no entry name";
-	const existing = vault.find(name);
-	if (req.confirm) {
-		// Show the metadata the model supplied: the user is approving these
-		// values too, not just the name.
-		const meta = [
-			req.username?.trim() ? `用户名: ${req.username.trim()}` : "",
-			req.uri?.trim() ? `URI: ${req.uri.trim()}` : "",
-			req.notes?.trim() ? `备注: ${req.notes.trim()}` : "",
-		]
-			.filter(Boolean)
-			.join("\n");
-		const action = existing ? `更新已有条目「${name}」。` : `新建条目「${name}」。`;
-		const ok = await confirmWindow(
-			dialogs(ctx),
-			"omp-vault · 保存到本地库",
-			`${action}${meta ? `\n${meta}` : ""}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`,
-			req.signal,
-		);
-		if (!ok) return `user denied saving "${name}"`;
+
+	const args = ["add", "--name", name, "--token", scope.token!];
+	if (req.username !== undefined) args.push("--username", req.username);
+	if (req.uri?.trim()) args.push("--uri", req.uri.trim());
+	if (req.notes?.trim()) args.push("--notes", req.notes.trim());
+	let stdin: string | undefined;
+	for (let attempt = 0; attempt < 5; attempt++) {
+		try {
+			const run = await cli.run([...args, "--json"], { stdin, signal: req.signal });
+			const saved = JSON.parse(run.stdout) as { item?: string; created?: boolean };
+			if (saved.created) scope.items += 1;
+			setStatus(ctx, scope);
+			return `saved "${saved.item ?? name}" (password entered in the dialog, not shown)`;
+		} catch (error) {
+			if (!(error instanceof CliError) || !error.needsUi) {
+				if (error instanceof CliError && error.auth) scope.token = undefined;
+				return error instanceof CliError && error.denied ? error.message : `ai-vault: ${describe(error)}`;
+			}
+			if (error.needsUi === "confirm") {
+				const meta = [
+					req.username?.trim() ? `用户名: ${req.username.trim()}` : "",
+					req.uri?.trim() ? `URI: ${req.uri.trim()}` : "",
+					req.notes?.trim() ? `备注: ${req.notes.trim()}` : "",
+				]
+					.filter(Boolean)
+					.join("\n");
+				const ok = await confirmWindow(
+					dialogs(ctx),
+					"ai-vault · 保存到本地库",
+					`保存条目「${name}」。${meta ? `\n${meta}` : ""}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`,
+					req.signal,
+				);
+				if (!ok) return `user denied saving "${name}"`;
+				args.push("--yes");
+				continue;
+			}
+			if (error.needsUi === "text") {
+				const entered = await promptText(dialogs(ctx), `ai-vault · ${name}`, "用户名（可留空）", req.signal);
+				if (entered === undefined) return "cancelled";
+				args.push("--username", entered);
+				continue;
+			}
+			const password = await promptSecret(dialogs(ctx), "ai-vault · 密码", name, req.signal);
+			if (!password) return "cancelled: no password entered";
+			args.push("--password-stdin");
+			stdin = `${password}\n`;
+		}
 	}
-	let username = req.username;
-	if (username === undefined) {
-		const entered = await promptText(
-			dialogs(ctx),
-			`omp-vault · ${name}`,
-			existing?.username ? "用户名（留空保持不变）" : "用户名（可留空）",
-			req.signal,
-		);
-		if (entered === undefined) return "cancelled";
-		username = entered;
-	}
-	const password = await promptSecret(dialogs(ctx), "omp-vault · 密码", name, req.signal);
-	if (!password) return "cancelled: no password entered";
-	// A dialog can stay open past the idle auto-lock. Unlock again (usually a
-	// no-op) so the entry is not lost to "vault is locked" after the user typed it.
-	if (!(await ensureUnlocked(scope, ctx, req.signal))) return LOCKED;
-	// A blank username keeps the stored one; there is no way to clear it short of removing the entry.
-	const user = username.trim() || existing?.username;
-	vault.upsert({
-		name,
-		...(user ? { username: user } : {}),
-		password,
-		uris: req.uri?.trim() ? [req.uri.trim()] : existing?.uris,
-		notes: req.notes?.trim() || existing?.notes,
-	});
-	appendAudit({ session: sessionLabel(ctx), event: "add", item: name });
-	setStatus(ctx, scope);
-	return `saved "${name}" (password entered in the dialog, not shown)`;
+	return "cancelled: the save dialog did not settle";
 }
 
 async function importBitwarden(
@@ -407,14 +430,12 @@ async function importBitwarden(
 	search: string | undefined,
 	signal?: AbortSignal,
 ): Promise<{ text: string; ok: boolean; count: number }> {
-	track(scope);
-	expire();
 	if (!(await ensureUnlocked(scope, ctx, signal))) return { text: LOCKED, ok: false, count: 0 };
 	let meta: BitwardenMeta[];
 	try {
 		meta = await queryBitwarden(bw, ctx, search, signal);
-	} catch (e) {
-		return { text: `Bitwarden: ${e instanceof Error ? e.message : String(e)}`, ok: false, count: 0 };
+	} catch (error) {
+		return { text: `Bitwarden: ${describe(error)}`, ok: false, count: 0 };
 	}
 	if (meta.length === 0) {
 		return { text: search ? `no Bitwarden items match "${search}"` : "Bitwarden vault has no items", ok: false, count: 0 };
@@ -426,40 +447,43 @@ async function importBitwarden(
 	const more = meta.length > 15 ? `\n… 还有 ${meta.length - 15} 条` : "";
 	const allowed = await confirmWindow(
 		dialogs(ctx),
-		"omp-vault · 从 Bitwarden 导入",
+		"ai-vault · 从 Bitwarden 导入",
 		`匹配 ${meta.length} 条。其中带密码的登录项会写入本地加密库，同名条目会被更新。\n\n${shown}${more}\n\n允许导入？`,
 		signal,
 	);
 	if (!allowed) return { text: "user denied the Bitwarden import", ok: false, count: 0 };
-	// The confirmation (and the Bitwarden password prompt before it) may have
-	// outlasted the local vault's idle lock.
-	if (!(await ensureUnlocked(scope, ctx, signal))) return { text: LOCKED, ok: false, count: 0 };
-	let drafts: LoginDraft[];
+	let drafts;
 	try {
 		drafts = await pullBitwardenLogins(bw, ctx, search, signal);
-	} catch (e) {
-		return { text: `Bitwarden: ${e instanceof Error ? e.message : String(e)}`, ok: false, count: 0 };
+	} catch (error) {
+		return { text: `Bitwarden: ${describe(error)}`, ok: false, count: 0 };
 	}
 	if (drafts.length === 0) {
 		return { text: "matched items have no login password; nothing imported", ok: false, count: 0 };
 	}
-	// Reading Bitwarden can prompt for its master password, another long dialog.
-	if (!(await ensureUnlocked(scope, ctx, signal))) return { text: LOCKED, ok: false, count: 0 };
-	vault.upsertMany(drafts);
-	appendAudit({ session: sessionLabel(ctx), event: "import", item: `bitwarden:${drafts.length}` });
-	setStatus(ctx, scope);
-	const names = drafts.map((item) => item.name);
-	const listed = names.slice(0, 40).join(", ");
-	const extra = names.length > 40 ? ` … +${names.length - 40}` : "";
-	return {
-		text: `imported ${drafts.length} login item(s) into the local vault: ${listed}${extra}`,
-		ok: true,
-		count: drafts.length,
-	};
+	try {
+		const saved = await cli.json<SaveResult>(["save", "--yes", "--token", scope.token!], {
+			stdin: JSON.stringify(drafts),
+			signal,
+		});
+		scope.items += saved.count;
+		setStatus(ctx, scope);
+		const listed = saved.names.slice(0, 40).join(", ");
+		const extra = saved.names.length > 40 ? ` … +${saved.names.length - 40}` : "";
+		return {
+			text: `imported ${saved.count} login item(s) into the local vault: ${listed}${extra}`,
+			ok: true,
+			count: saved.count,
+		};
+	} catch (error) {
+		return { text: `ai-vault: ${describe(error)}`, ok: false, count: 0 };
+	}
 }
 
+// ---------------------------------------------------------------- commands
+
 const HELP = [
-	"/vault init                        创建本地加密库（弹出窗口设置主密码）",
+	"/vault init                        创建全机共享的本地加密库（弹出窗口设置主密码）",
 	"/vault unlock | lock               解锁 / 锁定（清空本会话的授权）",
 	"/vault status                      状态与授权剩余时间",
 	"/vault list                        本地条目元数据",
@@ -480,18 +504,51 @@ function words(args: string): string[] {
 	return out;
 }
 
-/** A Bitwarden JSON export -> vault entries. A leading `~` is expanded. */
-function readBitwardenExport(path: string): LoginDraft[] {
-	const file = path.replace(/^~(?=$|\/)/, homedir());
-	return bitwardenLogins(JSON.parse(readFileSync(file, "utf8")));
+async function initStore(scope: Scope, ctx: Ctx, label: string): Promise<void> {
+	if (!cli.available) {
+		note(ctx, CLI_MISSING, "error");
+		return;
+	}
+	const finish = (result: UnlockResult): void => {
+		scope.token = result.token;
+		scope.items = 0;
+		setStatus(ctx, scope);
+		note(ctx, `ai-vault 已创建: ${cli.dir}/store.json`);
+	};
+	try {
+		finish(await cli.json<UnlockResult>(["init", "--requester", label]));
+		return;
+	} catch (error) {
+		if (!(error instanceof CliError)) {
+			note(ctx, `ai-vault: ${describe(error)}`, "error");
+			return;
+		}
+		if (!error.needsUi) {
+			note(ctx, `ai-vault: ${error.message}`, "warning");
+			return;
+		}
+	}
+	const pass = await promptSecret(dialogs(ctx), "ai-vault · 创建主密码", "至少 8 位");
+	if (!pass || pass.length < 8) {
+		note(ctx, "已取消，或密码短于 8 位", "warning");
+		return;
+	}
+	const again = await promptSecret(dialogs(ctx), "ai-vault · 确认主密码", "再输入一次");
+	if (again !== pass) {
+		note(ctx, "两次主密码不一致，已取消", "warning");
+		return;
+	}
+	try {
+		finish(await cli.json<UnlockResult>(["init", "--requester", label, "--password-stdin"], { stdin: `${pass}\n` }));
+	} catch (error) {
+		note(ctx, `ai-vault: ${error instanceof CliError ? error.message : describe(error)}`, "error");
+	}
 }
 
 function commandHandler(scope: Scope, bw: BwState) {
 	return async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
 		const [sub = "status", ...rest] = words(args);
 		const label = sessionLabel(ctx);
-		track(scope);
-		expire();
 
 		switch (sub) {
 			case "help": {
@@ -499,25 +556,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 				return;
 			}
 			case "init": {
-				if (vault.initialized) {
-					note(ctx, "本地库已经初始化过了", "warning");
-					return;
-				}
-				const pass = await promptSecret(dialogs(ctx), "omp-vault · 创建主密码", "至少 8 位");
-				if (!pass || pass.length < 8) {
-					note(ctx, "已取消，或密码短于 8 位", "warning");
-					return;
-				}
-				const again = await promptSecret(dialogs(ctx), "omp-vault · 确认主密码", "再输入一次");
-				if (again !== pass) {
-					note(ctx, "两次主密码不一致，已取消", "warning");
-					return;
-				}
-				vault.init(pass);
-				scope.authed = true;
-				appendAudit({ session: label, event: "init" });
-				setStatus(ctx, scope);
-				note(ctx, `omp-vault 已创建: ${vault.path}`);
+				await initStore(scope, ctx, label);
 				return;
 			}
 			case "unlock": {
@@ -525,93 +564,139 @@ function commandHandler(scope: Scope, bw: BwState) {
 				return;
 			}
 			case "lock": {
-				const was = unlocked(scope);
-				release(scope);
-				if (was) appendAudit({ session: label, event: "lock" });
+				await lockNow(scope);
 				setStatus(ctx, scope);
 				note(ctx, "本地库已锁定，授权已清空");
 				return;
 			}
 			case "status": {
-				const lines = [`store: ${vault.path}`, `session: ${label}`, `state: ${unlocked(scope) ? "unlocked" : "locked"}`];
-				if (unlocked(scope)) {
-					lines.push(`items: ${vault.count}`, `idle: ${Math.round(vault.idleMs / 1000)}s / ${AUTO_LOCK_MS / 1000}s`);
+				if (!scope.token) {
+					note(ctx, [`store: ${cli.dir}/store.json`, `session: ${label}`, "state: locked"].join("\n"));
+					setStatus(ctx, scope);
+					return;
 				}
-				for (const [name, until] of scope.grants) {
-					const left = until - Date.now();
-					if (left > 0) lines.push(`grant: ${name} (${Math.ceil(left / 1000)}s left)`);
+				try {
+					const status = await cli.json<StatusResult>(["status", "--token", scope.token]);
+					scope.items = status.items;
+					const lines = [
+						`store: ${cli.dir}/store.json`,
+						`session: ${status.requester}`,
+						"state: unlocked",
+						`items: ${status.items}`,
+						`expires: ${Math.max(0, Math.round((status.expiresAt - Date.now()) / 1000))}s (idle lock ${Math.round(status.idleMs / 1000)}s)`,
+					];
+					for (const [name, grant] of Object.entries(status.grants)) {
+						lines.push(`grant: ${name} (${Math.ceil(grant.leftMs / 1000)}s left)`);
+					}
+					note(ctx, lines.join("\n"));
+					setStatus(ctx, scope);
+				} catch (error) {
+					scope.token = undefined;
+					note(ctx, `ai-vault: ${describe(error)}`, "warning");
+					setStatus(ctx, scope);
 				}
-				note(ctx, lines.join("\n"));
-				setStatus(ctx, scope);
 				return;
 			}
 			case "list": {
 				if (!(await ensureUnlocked(scope, ctx))) return;
-				const items = vault.list().map((i) => `${i.name}\t${i.username ?? ""}\t${(i.uris ?? [])[0] ?? ""}`);
-				note(ctx, items.join("\n") || "(empty)");
+				try {
+					const result = await cli.json<ListResult>(["list", "--token", scope.token!]);
+					scope.items = result.count;
+					const rows = result.items.map((i) => `${i.name}\t${i.username ?? ""}\t${i.uris[0] ?? ""}`);
+					note(ctx, rows.join("\n") || "(empty)");
+				} catch (error) {
+					note(ctx, `ai-vault: ${describe(error)}`, "warning");
+				}
 				return;
 			}
 			case "add": {
-				const text = await saveLocalEntry(scope, ctx, { name: rest.join(" ") || undefined, confirm: false });
+				const text = await saveLocalEntry(scope, ctx, { name: rest.join(" ") || undefined });
 				note(ctx, text, text.startsWith("saved ") ? "info" : "warning");
 				return;
 			}
 			case "remove": {
 				const name = rest.join(" ");
-				if (!(await ensureUnlocked(scope, ctx)) || !name) return;
-				if (!vault.find(name)) {
-					note(ctx, `没有叫「${name}」的条目`, "warning");
-					return;
-				}
-				const sure = await confirmWindow(dialogs(ctx), "omp-vault · 删除条目", `删除「${name}」？删除后无法恢复。`);
-				if (!sure) return;
-				// The confirm may have outlasted the idle lock; unlock again and
-				// re-check the entry instead of throwing "vault is locked".
 				if (!(await ensureUnlocked(scope, ctx))) return;
-				if (!vault.find(name)) {
-					note(ctx, `没有叫「${name}」的条目`, "warning");
+				if (!name) {
+					note(ctx, "用法: /vault remove <名称>", "warning");
 					return;
 				}
-				const removed = vault.remove(name);
-				scope.grants.delete(name.toLowerCase());
-				appendAudit({ session: label, event: "remove", item: name });
-				setStatus(ctx, scope);
-				note(ctx, removed ? "removed" : "not found", removed ? "info" : "warning");
+				const args = ["remove", name, "--token", scope.token!];
+				try {
+					const result = await cli.json<RemovingResult>(args);
+					if (result.removed) scope.items = Math.max(0, scope.items - 1);
+					setStatus(ctx, scope);
+					note(ctx, result.removed ? "removed" : "not found", result.removed ? "info" : "warning");
+				} catch (error) {
+					if (!(error instanceof CliError) || error.needsUi !== "confirm") {
+						note(ctx, `ai-vault: ${describe(error)}`, error instanceof CliError && error.denied ? "warning" : "error");
+						return;
+					}
+					const sure = await confirmWindow(dialogs(ctx), "ai-vault · 删除条目", `删除「${name}」？删除后无法恢复。`);
+					if (!sure) return;
+					try {
+						const result = await cli.json<RemovingResult>([...args, "--yes"]);
+						if (result.removed) scope.items = Math.max(0, scope.items - 1);
+						setStatus(ctx, scope);
+						note(ctx, result.removed ? "removed" : "not found", result.removed ? "info" : "warning");
+					} catch (inner) {
+						note(ctx, `ai-vault: ${describe(inner)}`, "error");
+					}
+				}
 				return;
 			}
 			case "grant": {
 				const last = rest.at(-1) ?? "";
 				// A single numeric token is the entry name ("/vault grant 123");
 				// minutes are only read when a name comes before them.
-				const minutes = rest.length > 1 && /^\d+$/.test(last) ? Number(rest.pop()) : GRANT_MS_DEFAULT / 60_000;
+				const minutes = rest.length > 1 && /^\d+$/.test(last) ? rest.pop() : undefined;
 				const name = rest.join(" ");
-				if (!name || !unlocked(scope) || !vault.find(name)) {
+				if (!(await ensureUnlocked(scope, ctx)) || !name) {
 					note(ctx, "先解锁；用法: /vault grant <名称> [分钟]（带空格的名称加引号）", "warning");
 					return;
 				}
-				const span = Math.min(Math.max(1, minutes), GRANT_MS_MAX / 60_000);
-				scope.grants.set(name.toLowerCase(), Date.now() + span * 60_000);
-				appendAudit({ session: label, event: "grant", item: name });
-				setStatus(ctx, scope, "·granted");
-				note(ctx, `granted "${name}" for ${span}m`);
+				const args = ["grant", name, "--token", scope.token!];
+				if (minutes) args.push("--minutes", minutes);
+				try {
+					const result = await cli.json<{ name: string; minutes: number }>(args);
+					setStatus(ctx, scope, "·granted");
+					note(ctx, `granted "${result.name}" for ${result.minutes}m`);
+				} catch (error) {
+					note(ctx, `ai-vault: ${describe(error)}`, "warning");
+				}
 				return;
 			}
 			case "revoke": {
+				if (!(await ensureUnlocked(scope, ctx))) return;
 				const target = rest[0] === "all" ? "all" : rest.join(" ").trim();
-				if (rest[0] === "all") scope.grants.clear();
-				else if (rest[0]) scope.grants.delete(rest.join(" ").toLowerCase());
-				if (target) appendAudit({ session: label, event: "revoke", item: target });
-				setStatus(ctx, scope);
-				note(ctx, "revoked");
+				const args = ["revoke", "--token", scope.token!];
+				if (target === "all") args.push("--all");
+				else if (target) args.push(target);
+				else {
+					note(ctx, "用法: /vault revoke <名称|all>", "warning");
+					return;
+				}
+				try {
+					await cli.json(args);
+					setStatus(ctx, scope);
+					note(ctx, "revoked");
+				} catch (error) {
+					note(ctx, `ai-vault: ${describe(error)}`, "warning");
+				}
 				return;
 			}
 			case "audit": {
 				const asked = Number(rest[0] ?? 30);
 				const n = Number.isFinite(asked) && asked > 0 ? Math.min(Math.trunc(asked), 1000) : 30;
-				const rows = readAudit(undefined, n).map(
-					(e) => `${e.ts} ${e.session} ${e.event}${e.item ? ` ${e.item}` : ""}${e.reason ? ` (${e.reason})` : ""}`,
-				);
-				note(ctx, rows.join("\n") || "(no entries)");
+				try {
+					const result = await cli.json<AuditResult>(["audit", String(n)]);
+					const rows = result.entries.map(
+						(e) => `${e.ts} ${e.session} ${e.event}${e.item ? ` ${e.item}` : ""}${e.reason ? ` (${e.reason})` : ""}`,
+					);
+					note(ctx, rows.join("\n") || "(no entries)");
+				} catch (error) {
+					note(ctx, `ai-vault: ${describe(error)}`, "error");
+				}
 				return;
 			}
 			case "import": {
@@ -621,16 +706,32 @@ function commandHandler(scope: Scope, bw: BwState) {
 					return;
 				}
 				if (!(await ensureUnlocked(scope, ctx))) return;
-				let imported: number;
+				const args = ["import", path, "--token", scope.token!];
 				try {
-					imported = vault.upsertMany(readBitwardenExport(path));
-				} catch (e) {
-					note(ctx, `导入失败：${e instanceof Error ? e.message : String(e)}`, "error");
-					return;
+					const result = await cli.json<SaveResult>(args);
+					scope.items += result.count;
+					setStatus(ctx, scope);
+					note(ctx, `imported ${result.count} login items`);
+				} catch (error) {
+					if (!(error instanceof CliError) || error.needsUi !== "confirm") {
+						note(ctx, `ai-vault: ${describe(error)}`, error instanceof CliError && error.denied ? "warning" : "error");
+						return;
+					}
+					const sure = await confirmWindow(
+						dialogs(ctx),
+						"ai-vault · 从 Bitwarden 导入",
+						`导入 ${path} 里的 Bitwarden 登录项？同名条目会被更新。`,
+					);
+					if (!sure) return;
+					try {
+						const result = await cli.json<SaveResult>([...args, "--yes"]);
+						scope.items += result.count;
+						setStatus(ctx, scope);
+						note(ctx, `imported ${result.count} login items`);
+					} catch (inner) {
+						note(ctx, `ai-vault: ${describe(inner)}`, "error");
+					}
 				}
-				appendAudit({ session: label, event: "import", item: `json:${imported}` });
-				setStatus(ctx, scope);
-				note(ctx, `imported ${imported} login items`);
 				return;
 			}
 			case "import-bw": {
@@ -646,11 +747,10 @@ function commandHandler(scope: Scope, bw: BwState) {
 	};
 }
 
-export default function ompVault(pi: ExtensionAPI): void {
+export default function aiVault(pi: ExtensionAPI): void {
 	const omp = isOmpHost(pi);
-	const scope: Scope = { authed: false, grants: new Map(), epoch: 0, unlocking: undefined };
+	const scope: Scope = { token: undefined, epoch: 0, items: 0, unlocking: undefined };
 	const bw = newBwState();
-	track(scope);
 	pi.registerTool(vaultListTool(scope));
 	pi.registerTool(vaultGetTool(scope));
 	pi.registerTool(vaultAddTool(scope));
@@ -662,13 +762,11 @@ export default function ompVault(pi: ExtensionAPI): void {
 	});
 	// A transcript that starts fresh (/new, /fork) must not inherit this unlock
 	// or its grants. A /resume keeps them: same process, same user.
-	onSessionLeave(pi, omp, (reason, ctx) => {
+	onSessionLeave(pi, omp, (reason) => {
 		if (reason === "resume") return;
-		const was = unlocked(scope);
-		release(scope);
-		if (was) appendAudit({ session: sessionLabel(ctx), event: "lock", reason: `session-${reason}` });
-		// /new, /fork, quit and reload all end this binding. Any later use of the
-		// same scope (pi reuses it) re-registers it through track().
-		scopes.delete(scope);
+		void lockNow(scope);
 	});
 }
+
+/** Exported for tests: the shared grant window. */
+export const grantMs = GRANT_MS_DEFAULT;

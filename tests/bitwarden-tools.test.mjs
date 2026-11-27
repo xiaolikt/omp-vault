@@ -105,7 +105,7 @@ test("only bash's own temp output artifact can be scrubbed or removed", async ()
 	}
 
 	// A non-bash result, or a bash result pointing outside the temp dir, is ignored.
-	const outside = mkdtempSync(join(tmpdir(), "omp-vault-artifact-"));
+	const outside = mkdtempSync(join(tmpdir(), "ai-vault-artifact-"));
 	const big = join(outside, "big.log");
 	writeFileSync(big, "x".repeat(9 * 1024 * 1024));
 	try {
@@ -126,7 +126,7 @@ test("only bash's own temp output artifact can be scrubbed or removed", async ()
 	}
 
 	// A symlink with an artifact name is not followed.
-	const targetDir = mkdtempSync(join(tmpdir(), "omp-vault-artifact-"));
+	const targetDir = mkdtempSync(join(tmpdir(), "ai-vault-artifact-"));
 	const target = join(targetDir, "target");
 	writeFileSync(target, `target ${SECRET}`);
 	const link = join(tmpdir(), `pi-bash-${randomBytes(8).toString("hex")}.log`);

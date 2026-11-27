@@ -25,7 +25,7 @@ function restore() {
 }
 
 function mockZenity() {
-	const dir = mkdtempSync(join(tmpdir(), "omp-vault-zenity-"));
+	const dir = mkdtempSync(join(tmpdir(), "ai-vault-zenity-"));
 	const log = join(dir, "log");
 	writeFileSync(
 		join(dir, "zenity"),
@@ -74,7 +74,7 @@ test("promptSecret reads the zenity window and does not ask the TUI", async () =
 	delete process.env.ZENITY_CODE;
 	const calls = [];
 	try {
-		const value = await promptSecret(tui(calls), "omp-vault", "主密码");
+		const value = await promptSecret(tui(calls), "ai-vault", "主密码");
 		assert.equal(value, "window-secret");
 		assert.equal(calls.length, 0);
 		assert.match(readFileSync(log, "utf8"), /--password/);
@@ -89,7 +89,7 @@ test("cancelling the window does not fall through to the TUI", async () => {
 	process.env.ZENITY_CODE = "1";
 	const calls = [];
 	try {
-		assert.equal(await promptSecret(tui(calls), "omp-vault", "主密码"), undefined);
+		assert.equal(await promptSecret(tui(calls), "ai-vault", "主密码"), undefined);
 		assert.equal(await confirmWindow(tui(calls), "导入", "允许？"), false);
 		assert.equal(calls.length, 0);
 	} finally {
@@ -105,7 +105,7 @@ test("a silent zenity failure on an unreachable display falls back to the TUI", 
 	delete process.env.ZENITY_STDERR;
 	const calls = [];
 	try {
-		assert.equal(await promptSecret(tui(calls), "omp-vault", "主密码"), "from-tui");
+		assert.equal(await promptSecret(tui(calls), "ai-vault", "主密码"), "from-tui");
 		assert.equal(calls[0][0], "input");
 	} finally {
 		restore();
@@ -134,7 +134,7 @@ test("exit 1 with only GTK diagnostics is a cancel, not a failed window", async 
 		"(zenity:4242): Gtk-WARNING **: 10:00:00.000: Trying to measure GtkLabel 0x1 for height of 9";
 	const calls = [];
 	try {
-		assert.equal(await promptSecret(tui(calls), "omp-vault", "主密码"), undefined);
+		assert.equal(await promptSecret(tui(calls), "ai-vault", "主密码"), undefined);
 		assert.equal(await confirmWindow(tui(calls), "确认", "允许？"), false);
 		assert.equal(calls.length, 0, "a cancel was re-asked in the terminal");
 	} finally {
@@ -149,7 +149,7 @@ test("exit 1 with a startup error means no window opened: fall back to the TUI",
 	process.env.ZENITY_STDERR = "This option is not available. Please see --help for all possible usages.";
 	const calls = [];
 	try {
-		assert.equal(await promptSecret(tui(calls), "omp-vault", "主密码"), "from-tui");
+		assert.equal(await promptSecret(tui(calls), "ai-vault", "主密码"), "from-tui");
 		assert.equal(calls[0][0], "input");
 	} finally {
 		restore();
@@ -172,7 +172,7 @@ test("exit 1 with 'cannot open display' falls back even behind a GTK prefix", as
 });
 
 test("missing zenity falls back to the TUI", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "omp-vault-empty-"));
+	const dir = mkdtempSync(join(tmpdir(), "ai-vault-empty-"));
 	process.env.PATH = dir;
 	process.env.DISPLAY = ":99";
 	delete process.env.WAYLAND_DISPLAY;

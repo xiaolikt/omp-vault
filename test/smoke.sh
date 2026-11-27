@@ -11,12 +11,13 @@
 # instead, so nothing touches your real vault or logs.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export AI_VAULT_BIN="${AI_VAULT_BIN:-$ROOT/target/release/ai-vault}"
 HOST="${1:-omp}"
-STATE="$(mktemp -d "/tmp/omp-vault-$HOST.XXXXXX")"
+STATE="$(mktemp -d "/tmp/ai-vault-$HOST.XXXXXX")"
 mkdir -p "$STATE/cwd" "$STATE/sessions" "$STATE/bw"
 export OMP_VAULT_BW_MOCK_DIR="$STATE"
 export OMP_VAULT_MOCK="$STATE"
-export OMP_VAULT_DIR="$STATE/vault"
+export AI_VAULT_DIR="$STATE/vault"
 export OMP_VAULT_BW_DIR="$STATE/bw"
 export PATH="$ROOT/tests/mocks/bin:$PATH"
 # The mock zenity still needs a display to be asked at all; it never opens a window.

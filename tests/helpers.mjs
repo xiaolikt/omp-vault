@@ -1,11 +1,26 @@
-// Shared setup for the omp-vault tests: a throwaway HOME and vault, a mock
+// Shared setup for the ai-vault tests: a throwaway HOME and vault, a mock
 // `bw` CLI, and a mock `zenity` that answers from queue files.
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const MOCKS = join(dirname(fileURLToPath(import.meta.url)), "mocks", "bin");
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** The Rust binary the extension calls: $AI_VAULT_BIN, else a local build. */
+export function cliBinary() {
+	const explicit = process.env.AI_VAULT_BIN;
+	if (explicit) return explicit;
+	for (const profile of ["release", "debug"]) {
+		const candidate = join(ROOT, "target", profile, "ai-vault");
+		if (existsSync(candidate)) return candidate;
+	}
+	const built = spawnSync("cargo", ["build", "--release"], { cwd: ROOT, stdio: "inherit" });
+	if (built.status !== 0) throw new Error("cannot build the ai-vault CLI; run `cargo build --release`");
+	return join(ROOT, "target", "release", "ai-vault");
+}
 
 /**
  * Point the process at the mocks and at a private HOME, so nothing touches the
@@ -13,7 +28,7 @@ export const MOCKS = join(dirname(fileURLToPath(import.meta.url)), "mocks", "bin
  * anything under src/: module state is created at import time.
  */
 export function useMocks() {
-	const dir = mkdtempSync(join(tmpdir(), "omp-vault-test-"));
+	const dir = mkdtempSync(join(tmpdir(), "ai-vault-test-"));
 	mkdirSync(join(dir, "home"), { recursive: true });
 	process.env.HOME = join(dir, "home");
 	process.env.DISPLAY = ":99";
@@ -21,7 +36,8 @@ export function useMocks() {
 	process.env.PATH = `${MOCKS}:${process.env.PATH}`;
 	process.env.OMP_VAULT_BW_MOCK_DIR = dir;
 	process.env.OMP_VAULT_MOCK = dir;
-	process.env.OMP_VAULT_DIR = join(dir, "vault");
+	process.env.AI_VAULT_DIR = join(dir, "vault");
+	process.env.AI_VAULT_BIN = cliBinary();
 	return dir;
 }
 

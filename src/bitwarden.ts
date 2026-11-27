@@ -1,5 +1,5 @@
 /**
- * Bitwarden half of omp-vault — deliver vault secrets to processes, not to the LLM.
+ * Bitwarden half of ai-vault — deliver vault secrets to processes, not to the LLM.
  *
  * Security model
  * ==============
@@ -1076,7 +1076,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 			"List Bitwarden vault items: name, username, URI, id. NEVER returns passwords, TOTP, notes or field values. " +
 			"Search matches item name, username, or URI. Paginated with offset/limit. " +
 			`First use in a session prompts for the Bitwarden master password (unlock). Use it to find item names/ids before ${delivery} or vault_import. ` +
-			"This reads Bitwarden live; vault_list is the separate local omp-vault store.",
+			"This reads Bitwarden live; vault_list is the separate local ai-vault store.",
 		promptSnippet: "List Bitwarden items (no secrets)",
 		promptGuidelines: [
 			`Use bw_list to find Bitwarden item names/ids, then ${delivery} to pass a credential to a command.`,
