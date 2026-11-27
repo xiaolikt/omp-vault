@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bitwardenLogins, filterLogins } from "../src/import-map.ts";
+import { bitwardenLogins, filterLogins } from "../packages/pi-ai-vault/src/import-map.ts";
 
 const item = (name, extra = {}) => ({
 	id: extra.id,

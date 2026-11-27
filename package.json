@@ -1,7 +1,7 @@
 {
 	"name": "@xiaolikt/ai-vault",
 	"version": "0.4.1",
-	"description": "One machine-wide encrypted secret store for AI coding agents: the ai-vault Rust CLI (npm-installable) plus a thin pi/omp extension that calls it.",
+	"description": "One machine-wide encrypted secret store for AI coding agents: the ai-vault Rust CLI (npm-installable) plus the pi-ai-vault extension for pi and omp.",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/xiaolikt/ai-vault.git"
@@ -37,8 +37,8 @@
 	},
 	"files": [
 		"bin",
-		"src",
 		"crates",
+		"packages",
 		"Cargo.toml",
 		"Cargo.lock",
 		"install.sh",
@@ -71,7 +71,7 @@
 	},
 	"pi": {
 		"extensions": [
-			"./src/index.ts"
+			"./packages/pi-ai-vault/src/index.ts"
 		]
 	}
 }

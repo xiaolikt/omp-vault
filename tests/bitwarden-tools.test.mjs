@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, passwordPrompts, subCtx, textOf, useMocks } from "./helpers.mjs";
 
 const dir = useMocks();
-const { default: ompVault } = await import("../src/index.ts");
+const { default: ompVault } = await import("../packages/pi-ai-vault/src/index.ts");
 cleanUpOnExit(dir);
 
 const SECRET = "supersecret-value-123";

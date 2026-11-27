@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { confirmWindow, promptSecret, promptText } from "../src/prompt.ts";
+import { confirmWindow, promptSecret, promptText } from "../packages/pi-ai-vault/src/prompt.ts";
 
 const saved = {
 	PATH: process.env.PATH,

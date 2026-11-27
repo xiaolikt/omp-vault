@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { bind, cleanUpOnExit, useMocks } from "./helpers.mjs";
 
 const dir = useMocks();
-const { default: ompVault } = await import("../src/index.ts");
+const { default: ompVault } = await import("../packages/pi-ai-vault/src/index.ts");
 cleanUpOnExit(dir);
 
 test("omp: one extension registers the local vault and live Bitwarden, without bw_inject", () => {

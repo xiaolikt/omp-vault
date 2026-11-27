@@ -20,14 +20,25 @@ $XDG_RUNTIME_DIR/ai-vault/sessions/<token>.json   解锁令牌（0600，tmpfs）
 
 ## 安装
 
-### npm（CLI）
+### npm
+
+三个包：
+
+| 包 | 内容 | 谁装 |
+|---|---|---|
+| `@xiaolikt/ai-vault` | `bin/ai-vault.cjs` 转发器 + Rust 源码 | 想只要 CLI 的人 |
+| `@xiaolikt/ai-vault-linux-x64` | 预编译二进制，`os/cpu` 限定 | 被上一条自动拉下来 |
+| **`pi-ai-vault`** | pi/omp 插件（`vault_*` + `bw_*` 工具） | pi 或 omp，依赖上一条 |
 
 ```bash
-npm i -g @xiaolikt/ai-vault     # 主包 + 本平台的二进制包
-ai-vault --version
+npm i -g @xiaolikt/ai-vault      # 只要 CLI
+pi install npm:pi-ai-vault       # 插件（自动带上 CLI）
+omp plugin install npm:pi-ai-vault
 ```
 
-npm 上的裸名 `ai-vault` 已被别人占用（3.5.1），所以用 scope。主包 `@xiaolikt/ai-vault` 里的 `bin/ai-vault.cjs` 只是个转发器：找到 `@xiaolikt/ai-vault-<os>-<arch>` 里的真二进制，把 argv、stdio 和**退出码**（3/4/5 是宿主契约，不能改）原样交出去。
+插件本身就是 pi 的扩展清单，omp 是 pi 的兼容分支，**同一个包在两个宿主里都能用**：omp 上会自动注册 `bw_run`、pi 上还会多一个 `bw_inject`，差别只在 `src/host.ts` 的运行时探测里。
+
+npm 上的裸名 `ai-vault` 已被别人占用（3.5.1），所以 CLI 用 scope。主包里的 `bin/ai-vault.cjs` 只是个转发器：找到 `@xiaolikt/ai-vault-<os>-<arch>` 里的真二进制，把 argv、stdio 和**退出码**（3/4/5 是宿主契约，不能改）原样交出去。
 
 发布（需要 `npm login`）：
 
@@ -53,9 +64,8 @@ printf '//registry.npmjs.org/:_authToken=%s\n' "<token>" > ~/.npmrc && chmod 600
 # 1. 编译 CLI 并放进 PATH（~/.local/bin/ai-vault）
 ./install.sh
 
-# 2. 插件：pi
-pi install git:github.com/xiaolikt/ai-vault     # 或 npm:@xiaolikt/ai-vault
-#    omp
+# 2. 插件（仓库根也有 pi 清单，指向 packages/pi-ai-vault，所以 git 装法依旧可用）
+pi install git:github.com/xiaolikt/ai-vault
 omp plugin install git+ssh://git@github.com/xiaolikt/ai-vault.git
 
 # 3. 建库（弹窗设主密码，两次）
@@ -187,7 +197,8 @@ bash test/smoke.sh pi       # 真宿主冒烟（需要模型凭据）
 crates/ai-vault/src/   main.rs cli.rs crypto.rs store.rs session.rs dialog.rs import.rs audit.rs paths.rs
 bin/ai-vault.cjs       npm 入口：找平台包、转发 argv/stdio/退出码
 scripts/stage-npm.sh   把 release 二进制 stage 成 npm 平台包
-src/                   index.ts（工具/命令） cli.ts（CLI 客户端） bitwarden.ts prompt.ts host.ts import-map.ts scrub.ts
+packages/pi-ai-vault/  npm 包 pi-ai-vault：src/ = index.ts（工具/命令） cli.ts（CLI 客户端）
+                       bitwarden.ts prompt.ts host.ts import-map.ts scrub.ts
 test/cli.sh            二进制级集成测试
 test/npm.sh            npm 打包/安装/转发测试
 ```

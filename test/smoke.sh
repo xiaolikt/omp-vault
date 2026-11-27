@@ -35,13 +35,13 @@ case "$HOST" in
 		MODEL_ARGS=()
 		[[ -n "${OMP_MODEL:-}" ]] && MODEL_ARGS=(--model "$OMP_MODEL")
 		(cd "$STATE/cwd" && timeout 300 omp --session-dir "$STATE/sessions" --no-extensions \
-			-e "$ROOT/src/index.ts" "${MODEL_ARGS[@]}" --auto-approve --mode json -p "$PROMPT" 2>&1) >"$STATE/events"
+			-e "$ROOT/packages/pi-ai-vault/src/index.ts" "${MODEL_ARGS[@]}" --auto-approve --mode json -p "$PROMPT" 2>&1) >"$STATE/events"
 		;;
 	pi)
 		MODEL_ARGS=()
 		[[ -n "${PI_MODEL:-}" ]] && MODEL_ARGS=(--model "$PI_MODEL")
 		(cd "$STATE/cwd" && timeout 300 pi --no-session --no-extensions \
-			-e "$ROOT/src/index.ts" "${MODEL_ARGS[@]}" --mode json -p "$PROMPT" 2>&1) >"$STATE/events"
+			-e "$ROOT/packages/pi-ai-vault/src/index.ts" "${MODEL_ARGS[@]}" --mode json -p "$PROMPT" 2>&1) >"$STATE/events"
 		;;
 	*)
 		echo "usage: $0 [omp|pi]" >&2

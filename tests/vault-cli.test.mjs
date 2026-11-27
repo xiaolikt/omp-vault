@@ -7,7 +7,7 @@ import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, subCtx, textOf, use
 // The extension is only a client: these drive the real ai-vault binary (built
 // by `npm test`) plus the mock zenity, with a throwaway store.
 const dir = useMocks();
-const { default: aiVault } = await import("../src/index.ts");
+const { default: aiVault } = await import("../packages/pi-ai-vault/src/index.ts");
 cleanUpOnExit(dir);
 
 const PW = "correct horse battery";

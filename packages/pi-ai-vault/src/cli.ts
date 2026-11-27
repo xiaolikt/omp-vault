@@ -10,7 +10,8 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const EXIT = {
 	error: 1,
@@ -50,13 +51,28 @@ export class CliError extends Error {
 	}
 }
 
-/** `AI_VAULT_BIN`, then PATH, then the usual install spots. */
+/**
+ * `AI_VAULT_BIN`, then the copy this package depends on (npm puts the shim in
+ * a node_modules/.bin next to or above the plugin), then PATH, then the usual
+ * install spots.
+ */
 export function resolveBinary(): string | undefined {
 	const explicit = process.env.AI_VAULT_BIN;
 	if (explicit) return existsSync(explicit) ? explicit : undefined;
-	for (const dir of (process.env.PATH ?? "").split(delimiter)) {
-		if (!dir) continue;
-		const candidate = join(dir, "ai-vault");
+
+	// pip/npm layouts hoist differently: walk up from packages/pi-ai-vault/src.
+	let dir = dirname(fileURLToPath(import.meta.url));
+	for (let depth = 0; depth < 5; depth++) {
+		const bundled = join(dir, "node_modules", ".bin", "ai-vault");
+		if (existsSync(bundled)) return bundled;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+
+	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
+		if (!entry) continue;
+		const candidate = join(entry, "ai-vault");
 		if (existsSync(candidate)) return candidate;
 	}
 	for (const candidate of [join(homedir(), ".local", "bin", "ai-vault"), join(homedir(), ".cargo", "bin", "ai-vault")]) {

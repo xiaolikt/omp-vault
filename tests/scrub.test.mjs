@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { scrubDeep, scrubText } from "../src/scrub.ts";
+import { scrubDeep, scrubText } from "../packages/pi-ai-vault/src/scrub.ts";
 
 const SECRET = "supersecret-value-123";
 const values = [{ env: "T1", value: SECRET }];
