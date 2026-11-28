@@ -7,7 +7,7 @@
 // Windows.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -325,4 +325,89 @@ test("Windows: a command that is killed takes what it started with it", windowsO
 		{ encoding: "utf8", timeout: 20_000, windowsHide: true },
 	);
 	assert.equal(left.stdout.trim(), "0", "the sleep it started is gone as well");
+});
+
+// ---------------------------------------------------------------- the CLI's own windows
+
+// The scripts are taken verbatim from dialog.rs and answered by a WinForms
+// timer inside the window, so the real ShowDialog() and the real stdout path
+// are covered without anyone at the keyboard. They need a desktop; a locked
+// screen is fine, a service session is not.
+const canShowWindows = () =>
+	WIN32 &&
+	spawnSync(PS, [...PS_ARGS, "-Command", "[Environment]::UserInteractive"], { encoding: "utf8", windowsHide: true, timeout: 20_000 }).stdout.trim() === "True";
+const onDesktop = { skip: WIN32 ? (canShowWindows() ? false : "no interactive session") : "Windows only" };
+
+/** A dialog script exactly as the Rust source holds it. */
+function dialogScript(name) {
+	const source = readFileSync(join(ROOT, "crates", "ai-vault", "src", "dialog.rs"), "utf8");
+	const match = new RegExp(`const ${name}: &str = r#"(.*?)"#;`, "s").exec(source);
+	assert.ok(match, `${name} is in dialog.rs`);
+	return match[1];
+}
+
+/** Answers the window in place of the user, 600 ms after it is shown. */
+const autoAnswer = (action) =>
+	["    $t = New-Object System.Windows.Forms.Timer", "    $t.Interval = 600", `    $t.Add_Tick({ $t.Stop(); ${action} })`, "    $t.Start()"].join("\n");
+
+function showWindow(script) {
+	return spawnSync(PS, [...PS_ARGS, "-Command", script], {
+		encoding: "buffer",
+		timeout: 60_000,
+		windowsHide: true,
+		env: {
+			...process.env,
+			AI_VAULT_DLG_TITLE: "ai-vault · test window",
+			AI_VAULT_DLG_TEXT: "master password / 主密码",
+			AI_VAULT_DLG_SECRET: "1",
+			AI_VAULT_DLG_CANCEL: "取消",
+		},
+	});
+}
+
+const SHOWN = "    if ($f.ShowDialog() -eq 'OK') {";
+const passwordWindow = (action) => {
+	const script = dialogScript("PREAMBLE");
+	assert.ok(script.includes(SHOWN), "the password window still calls ShowDialog()");
+	return script.replace(SHOWN, `${autoAnswer(action)}\n${SHOWN}`);
+};
+
+test("Windows: the password window answers in UTF-8, whatever the console's code page", onDesktop, () => {
+	const value = "密码测试-Pässw0rd";
+	const r = showWindow(passwordWindow(`$box.Text = '${value}'; $f.DialogResult = 'OK'`));
+	assert.equal(r.status, 0, r.stderr.toString());
+	assert.equal(new TextDecoder().decode(r.stdout), value);
+});
+
+test("Windows: cancel and an empty field end the prompt cleanly (exit 1 / empty, nothing on stderr)", onDesktop, () => {
+	const cancel = showWindow(passwordWindow("$f.DialogResult = 'Cancel'"));
+	assert.equal(cancel.status, 1);
+	assert.equal(cancel.stdout.length, 0);
+	assert.equal(cancel.stderr.length, 0);
+	const empty = showWindow(passwordWindow("$box.Text = ''; $f.DialogResult = 'OK'"));
+	assert.equal(empty.status, 0);
+	assert.equal(empty.stdout.length, 0);
+});
+
+test("Windows: a window that cannot open exits 2; a script that will not parse exits 1 with the error on stderr", onDesktop, () => {
+	const script = dialogScript("PREAMBLE");
+	// A policy that forbids Add-Type, simulated by shadowing the cmdlet.
+	const forbidden = showWindow("function Add-Type { throw 'Add-Type is blocked by policy (simulated)' }\n" + script);
+	assert.equal(forbidden.status, 2, "reported as no window, which is needs-ui to the host");
+	assert.match(forbidden.stderr.toString(), /blocked by policy/);
+	// WinForms that will not load.
+	const missing = showWindow(script.replace("System.Windows.Forms, System.Drawing", "System.Windows.Forms.NoSuchAssembly"));
+	assert.equal(missing.status, 2);
+	// PowerShell's own parse error is exit 1: only the text on stderr tells it from a cancel.
+	const unparsable = showWindow(script + "\nif ( { not powershell\n");
+	assert.equal(unparsable.status, 1);
+	assert.notEqual(unparsable.stderr.toString().trim(), "");
+});
+
+test("Windows: the confirm window is owned by a top-most form, and losing that owner is not a Yes", onDesktop, () => {
+	const script = dialogScript("CONFIRM");
+	const shown = "    $r = [System.Windows.Forms.MessageBox]::Show(";
+	assert.ok(script.includes(shown), "the confirm window still asks through a MessageBox owned by $owner");
+	const closed = showWindow(script.replace(shown, `${autoAnswer("$owner.Close()")}\n${shown}`));
+	assert.notEqual(closed.status, 0, "a closed window must never read as approval");
 });
