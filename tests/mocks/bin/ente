@@ -1,0 +1,61 @@
+#!/bin/bash
+# Mock `ente` CLI for the ai-vault tests.
+#
+# Contract under test (ente.com/help/cli/auth):
+#   ente --json --no-input auth code list        -> [{id,name,issuer,accountName,type}]
+#   ente --json --no-input auth code view <ref>  -> the same object + {otp,validUntil}
+#
+# Every call is one line in $ENTE_MOCK_DIR/ente.log, so a test can assert that
+# the list path never asked for a code.
+DIR="${ENTE_MOCK_DIR:-/tmp/ente-mock}"
+mkdir -p "$DIR"
+printf '%s\n' "$*" >>"$DIR/ente.log"
+if [[ -f "$DIR/unauthenticated" ]]; then
+	echo "no account logged in; run ente account login --app auth" >&2
+	exit 3
+fi
+# --offline still needs a synced database: same failure when nothing was ever
+# logged in, which is what the tool must report to the user.
+if [[ -f "$DIR/no-cache" ]]; then
+	echo "nothing has been synced yet" >&2
+	exit 4
+fi
+
+# Drop the global flags we do not care about, keep the subcommand path.
+args=()
+for a in "$@"; do
+	case "$a" in
+		--json|--no-input|--offline) ;;
+		*) args+=("$a") ;;
+	esac
+done
+joined="${args[*]}"
+
+case "$joined" in
+	"auth code list")
+		if [[ -f "$DIR/list-fails-once" ]]; then
+			rm -f "$DIR/list-fails-once"
+			echo "sync needed" >&2
+			exit 1
+		fi
+		cat <<'JSON'
+[{"id":"c1","name":"GitHub","issuer":"github.com","accountName":"octo@example.com","type":"totp"},
+ {"id":"c2","name":"Cloudflare","issuer":"Cloudflare","accountName":"ops@example.com","type":"totp"},
+ {"id":"c3","name":"Steam","issuer":"Steam","accountName":"gamer","type":"steam"}]
+JSON
+		;;
+	"auth code view GitHub")
+		echo '{"id":"c1","name":"GitHub","issuer":"github.com","accountName":"octo@example.com","type":"totp","otp":"00420731","validUntil":"2030-01-01T00:00:30Z"}'
+		;;
+	"auth code view "*)
+		echo "no saved code matches that entry" >&2
+		exit 1
+		;;
+	"account list")
+		echo '[{"name":"default","email":"t@example.com","apps":["auth"]}]'
+		;;
+	*)
+		echo "mock ente: unhandled: $joined" >&2
+		exit 2
+		;;
+esac

@@ -146,6 +146,8 @@ ai-vault get <条目> --token <T> --answer-stdin --approval <hex> <<< 'y'
 | `bw_inject` | 注入 bash 环境（**仅 pi**） | exec | 否 |
 | `bw_clipboard` | 复制到剪贴板，到时清除 | write | 否 |
 | `bw_reveal` | 明文返回（默认关闭，每次确认） | exec | 是，用户当场允许 |
+| `ente_list` | Ente Auth 条目元数据（名称/签发方/账号/类型） | read | 否 |
+| `ente_code` | 读一条当前 TOTP/Steam 验证码，每次弹窗确认 | write | 是，用户当场允许 |
 
 字段选择：`password`（默认）· `totp`（种子）· `code`（动态验证码）· `notes` · `field:<自定义字段名>`。
 
@@ -243,6 +245,35 @@ ai-vault settings bitwarden.hours 24
 - 确认窗口里显示的是**实际命中的条目**（名称+用户名），不是模型给的引用。
 - `/bw lock` 只丢弃当前绑定的会话密钥；同一进程里还有别的绑定持有时不会执行全局 `bw lock`，最后一个绑定释放时才真正作废 CLI 会话。
 - Bitwarden 会话密钥只在 agent 进程内存里，不落盘、不进 bash 环境。
+
+## Ente（Auth 验证码）
+
+`ente` 是 Ente 官方的终端客户端（0.4+）。它**自己登录一次**：
+
+```bash
+ente account login --app auth        # 邮箱 + 密码（+ 2FA 验证码）
+ente auth code list                  # 之后每次都不再问密码
+```
+
+会话存在 `$XDG_DATA_HOME/ente-cli`（Linux 默认 `~/.local/share/ente-cli`），数据库密钥默认放系统钥匙串；无桌面/无人值守时用
+
+```bash
+ente vault key generate              # 打印一个 key
+export ENTE_CLI_VAULT_KEY=<那个 key> # 之后连钥匙串都不用
+```
+
+所以在 `session` 这种日常形态下，**每次查看不会再要你的密码**，最多要一次系统钥匙串解锁。
+
+pi-ai-vault 只是这套 CLI 的客户端，本身不保存 Ente 的任何密钥：
+
+| 工具 | 作用 |
+|---|---|
+| `ente_list` | 列出条目（name / issuer / accountName / type），**不含验证码** |
+| `ente_code <名字>` | 弹窗显示实际命中的条目，允许后返回当前验证码和过期时间 |
+
+安全上和 `bw_*` 一套规则：列表只给元数据；读码每次确认；拒绝后不重试；允许/拒绝都写审计（`~/.bw/pi-extension/audit.log`，`ente.code` 事件，不含码本身）；条目名/签发方进窗口前会被压成一行，防伪造。
+
+插件启动的 bash 会剔除 `ENTE_CLI_VAULT_KEY` / `ENTE_CLI_PASSWORD`，避免你 shell 里导出的免密 key 漏进模型自己的命令环境。**注意**：`ente` 二进制本身也在 PATH 上，模型直接跑 `ente auth code view` 仍能绕过这个扩展的确认窗——要收紧要靠 `ENTE_CLI_VAULT_KEY` + 把模型的 `ENTE_CLI_HOME` 指到别处，或者干脆不让 agent 有 shell。
 
 ## 安全
 

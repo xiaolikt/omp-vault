@@ -31,6 +31,8 @@ omp plugin install npm:pi-ai-vault  # omp，同一个包
 | `vault_import` | 把 Bitwarden 登录项抄进本地库（先确认） | 否 |
 | `bw_list` / `bw_run` / `bw_clipboard` / `bw_reveal` | 在线 Bitwarden（`bw` CLI） | 否，`bw_reveal` 除外 |
 | `bw_inject` | 注入 bash 环境（**仅 pi**，omp 不注册） | 否 |
+| `ente_list` | Ente Auth 条目元数据 | 否 |
+| `ente_code` | 当前 TOTP/Steam 验证码（每次确认） | 是，用户当场允许 |
 
 ## 命令
 
@@ -60,6 +62,10 @@ omp plugin install npm:pi-ai-vault  # omp，同一个包
 | `never` | 只读一次，永不写入本地库 |
 
 所以默认情况下 **只有你同意导入的密码才会进 ai-vault**。Bitwarden 自己的主密码请求频率也有单独设置（`bitwarden.unlock`：`never` / `time` / `session`），用 `/vault settings` 查看和修改。
+
+## Ente
+
+`ente` CLI 自己登录一次（`ente account login --app auth`），插件只是它的客户端：`ente_list` 只给元数据，`ente_code` 每次弹窗确认。详见仓库 README。
 
 ## 安全边界（一句话版）
 

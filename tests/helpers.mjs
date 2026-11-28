@@ -36,6 +36,8 @@ export function useMocks() {
 	process.env.PATH = `${MOCKS}:${process.env.PATH}`;
 	process.env.OMP_VAULT_BW_MOCK_DIR = dir;
 	process.env.OMP_VAULT_MOCK = dir;
+	// The ente mock keeps its own state directory, like the bw one.
+	process.env.ENTE_MOCK_DIR = dir;
 	process.env.AI_VAULT_DIR = join(dir, "vault");
 	process.env.AI_VAULT_BIN = cliBinary();
 	return dir;

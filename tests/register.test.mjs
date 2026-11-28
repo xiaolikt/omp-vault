@@ -6,7 +6,7 @@ const dir = useMocks();
 const { default: ompVault } = await import("../packages/pi-ai-vault/src/index.ts");
 cleanUpOnExit(dir);
 
-test("omp: one extension registers the local vault and live Bitwarden, without bw_inject", () => {
+test("omp: one extension registers the local vault, Bitwarden and Ente, without bw_inject", () => {
 	const b = bind(ompVault, true);
 	assert.deepEqual([...b.tools.keys()], [
 		"vault_list",
@@ -17,6 +17,8 @@ test("omp: one extension registers the local vault and live Bitwarden, without b
 		"bw_run",
 		"bw_clipboard",
 		"bw_reveal",
+		"ente_list",
+		"ente_code",
 	]);
 	assert.deepEqual([...b.commands.keys()].sort(), ["bw", "vault"]);
 	// omp reads the reason from session_switch; its session_start has none.
@@ -42,6 +44,8 @@ test("tools declare the approval tier omp prompts by: reads read, writes write",
 	assert.equal(b.tools.get("vault_import").approval, "write");
 	assert.equal(b.tools.get("bw_clipboard").approval, "write");
 	assert.equal(b.tools.get("bw_run").approval, "exec");
+	assert.equal(b.tools.get("ente_list").approval, "read");
+	assert.equal(b.tools.get("ente_code").approval, "write");
 	// A secret handed to the model keeps the strictest tier.
 	assert.equal(b.tools.get("vault_get").approval, undefined);
 	assert.equal(b.tools.get("bw_reveal").approval, undefined);

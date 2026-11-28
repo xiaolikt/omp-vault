@@ -23,6 +23,7 @@ import {
 	type BwState,
 } from "./bitwarden.js";
 import { CliError, VaultCli } from "./cli.js";
+import { registerEnte } from "./ente.js";
 import { isOmpHost, onSessionLeave, sessionLabel, subagentId, withTier } from "./host.js";
 import { confirmWindow, forDialog, promptSecret, promptText, type PromptHost } from "./prompt.js";
 import { forgetSettings, getSettingsSafe, type Settings } from "./settings.js";
@@ -1017,6 +1018,8 @@ export default function aiVault(pi: ExtensionAPI): void {
 	pi.registerTool(vaultAddTool(scope));
 	pi.registerTool(vaultImportTool(scope, bw));
 	registerBitwarden(pi, bw, omp);
+	// Ente Auth: the `ente` CLI keeps its own login; these tools only read codes.
+	registerEnte(pi);
 	pi.registerCommand("vault", {
 		description: "本地密码库 + Bitwarden 导入（/vault help）",
 		handler: commandHandler(scope, bw),

@@ -354,7 +354,7 @@ const AUDIT_MAX_BYTES = 1024 * 1024;
 let auditModeFixed = false;
 
 /** One audit line per event. `session` is the binding's label, so a subagent's `bw_run` can be told from its parent's. */
-async function audit(event: string, detail: string, session?: string): Promise<void> {
+export async function auditEvent(event: string, detail: string, session?: string): Promise<void> {
 	try {
 		await fs.mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
 		const log = path.join(STATE_DIR, "audit.log");
@@ -513,7 +513,7 @@ async function lock(st: BwState, reason: string): Promise<void> {
 		st.lockTimer = undefined;
 	}
 	if (hadSession) {
-		await audit("lock", `reason=${reason}`, st.sessionLabel);
+		await auditEvent("lock", `reason=${reason}`, st.sessionLabel);
 		if (!releaseSessionKey()) return; // another binding still uses its own key
 		try {
 			const bin = await resolveBw();
@@ -581,7 +581,7 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 			signal,
 		});
 		if (r.code !== 0) {
-			await audit("unlock", "deny=bad-password", st.sessionLabel);
+			await auditEvent("unlock", "deny=bad-password", st.sessionLabel);
 			throw new Error(`Unlock failed (wrong master password or CLI error). ${tail(r.stderr, 120)}`);
 		}
 		const key = r.stdout.replace(/[\r\n]+$/, "");
@@ -599,7 +599,7 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 			// from the bitwarden.hours policy.
 			await settingsCli().run(["bw-session", "put"], { stdin: key }).catch(() => undefined);
 		}
-		await audit("unlock", "ok", st.sessionLabel);
+		await auditEvent("unlock", "ok", st.sessionLabel);
 		// Refresh in the background: a full sync can take seconds on large vaults.
 		const lastSync = Date.parse(status?.lastSync ?? "");
 		if (!Number.isFinite(lastSync) || Date.now() - lastSync > 15 * 60_000) {
@@ -750,7 +750,7 @@ async function approveItem(
 	const user = item.username ? ` (user: ${item.username})` : "";
 	const ok = await confirmAction(ctx, title, `Item:   ${name}${user}\nField:  ${field}\n${detail}\n\nAllow?`, signal);
 	if (!ok) {
-		await audit(event, `deny item="${name}" field=${field}`, st.sessionLabel);
+		await auditEvent(event, `deny item="${name}" field=${field}`, st.sessionLabel);
 		return undefined;
 	}
 	return { session, item };
@@ -1116,6 +1116,9 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 			spawnHook: ({ command, cwd, env }) => {
 				// A BW_SESSION exported in the user's shell must not reach bash.
 				for (const name of Object.keys(env)) if (name.startsWith("BW_")) delete env[name];
+				// Same for Ente's unattended vault key / export password: the model's
+				// shell must not be able to open Ente Auth with what the user exported.
+				for (const name of ["ENTE_CLI_VAULT_KEY", "ENTE_CLI_PASSWORD"]) delete env[name];
 				for (const [name, rec] of st.injected) env[name] = rec.value;
 				return { command, cwd, env };
 			},
@@ -1230,7 +1233,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 				const { value, itemId, itemName } = await secretOf(approved.session, approved.item, field, signal);
 				st.injected.set(envName, { value, item: itemName, field, at: Date.now() });
 				rememberScrubValue(envName, value);
-				await audit("inject", `allow env=${envName} item="${itemName}" (${itemId}) field=${field}`, st.sessionLabel);
+				await auditEvent("inject", `allow env=${envName} item="${itemName}" (${itemId}) field=${field}`, st.sessionLabel);
 				safeStatus(ctx, `🔓 bw: ${st.injected.size} env var(s)`);
 				const weak =
 					value.length < 6
@@ -1303,7 +1306,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 				signal,
 				group: true,
 			});
-			await audit("run", `allow env=${envName} item="${itemName}" field=${field} exit=${r.code}`, st.sessionLabel);
+			await auditEvent("run", `allow env=${envName} item="${itemName}" field=${field} exit=${r.code}`, st.sessionLabel);
 			const raw = [r.stdout, r.stderr].filter((s) => s.length > 0).join("\n");
 			const scrubbed = scrubText(raw, scrubValues.values()).text;
 			const output =
@@ -1356,7 +1359,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 			// so tool output carrying it must be scrubbed like an injected var.
 			rememberScrubValue("CLIPBOARD", value);
 			await copyToClipboard(value);
-			await audit("clipboard", `allow item="${itemName}" field=${field}`, st.sessionLabel);
+			await auditEvent("clipboard", `allow item="${itemName}" field=${field}`, st.sessionLabel);
 			const clears =
 				CONFIG.clipboardClearSeconds > 0 ? `Clears in ${CONFIG.clipboardClearSeconds}s.` : "Auto-clear disabled.";
 			return {
@@ -1401,7 +1404,7 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 			);
 			if (!approved) throw new Error("User declined the reveal.");
 			const { value, itemName } = await secretOf(approved.session, approved.item, field, signal);
-			await audit("reveal", `allow item="${itemName}" field=${field}`, st.sessionLabel);
+			await auditEvent("reveal", `allow item="${itemName}" field=${field}`, st.sessionLabel);
 			return {
 				content: [{ type: "text", text: `${itemName} (${field}):\n<secret>${value}</secret>` }],
 				details: { item: itemName, field },
