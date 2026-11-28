@@ -319,6 +319,9 @@ try {
     $caret.BackColor = $ink; $caret.Width = [Math]::Max(1, (Px 1)); $caret.Height = Px 18
     $caret.Visible = $false
     if ($secret) { $field.Controls.Add($mask); $field.Controls.Add($caret) }
+    # Controls.Add puts a control at the BACK: the mask and the caret have to be
+    # brought in front of the box, or the box paints over them.
+    $mask.BringToFront(); $caret.BringToFront()
 
     $show = [System.Windows.Forms.CheckBox]::new()
     $show.Text = $env:AI_VAULT_DLG_SHOW
