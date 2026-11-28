@@ -313,3 +313,59 @@ test("a relayed read approval is signed by the host: the raw CLI refuses a bare 
 	assert.match(tampered.stderr, /modified outside ai-vault/);
 	assert.equal(readdirSync(dir).includes(`${token}.json`), false, "the tampered file is deleted");
 });
+
+test("vault_add stores a card: non-secret fields from the model, the CVV typed in a dialog", async () => {
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	answers.master(dir, PW);
+	answers.questions(dir, "y");
+	answers.entryPassword(dir, "000");
+	const result = await b.tool(
+		"vault_add",
+		{
+			name: "MyCard",
+			type: "card",
+			fields: { brand: "Mastercard", cardholderName: "Li Jun", expMonth: "01", expYear: "2030", code: undefined },
+		},
+		ctx,
+	);
+	assert.equal(result.isError, undefined, textOf(result));
+	assert.match(textOf(result), /as a card/);
+	// The list shows the type and the non-secret fields, never the code.
+	answers.master(dir, PW);
+	const listed = JSON.parse(textOf(await b.tool("vault_list", {}, ctx)));
+	const card = listed.find((i) => i.name === "MyCard");
+	assert.equal(card.type, "card");
+	assert.equal(card.fields.brand, "Mastercard");
+	assert.equal(JSON.stringify(listed).includes("000"), false);
+});
+
+test("vault_add refuses a secret the model tried to supply itself", async () => {
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	answers.master(dir, PW);
+	const result = await b.tool("vault_add", { name: "Leaky", type: "card", fields: { code: "123" } }, ctx);
+	assert.equal(result.isError, true);
+	assert.match(textOf(result), /secret field/);
+});
+
+test("vault_get falls back to Bitwarden for a non-login hit and imports it with its fields", async () => {
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	answers.master(dir, PW);
+	await b.cmd("unlock", ctx);
+	answers.master(dir, "testmaster");
+	answers.questions(dir, "y", "y");
+	const result = await b.tool("vault_get", { name: "CorpCard" }, ctx);
+	assert.equal(result.details.via, "imported-from-bitwarden");
+	const body = JSON.parse(textOf(result));
+	assert.equal(body.type, "card");
+	assert.equal(body.data.number, "4111111111111111");
+	assert.equal(body.data.code, "123");
+	answers.master(dir, PW);
+	const listed = JSON.parse(textOf(await b.tool("vault_list", {}, ctx)));
+	const card = listed.find((i) => i.name === "CorpCard");
+	assert.equal(card.type, "card");
+	assert.equal(card.fields.cardholderName, "Li Jun");
+	assert.equal(JSON.stringify(listed).includes("4111111111111111"), false, "list must mask the card number");
+});

@@ -168,6 +168,50 @@ grep -q 'ENTE_KEY_PLAINTEXT' "$AI_VAULT_DIR/ente.session.json" && bad "the ente 
 "$BIN" settings ente.unlock session --json >/dev/null
 check "switching back to session clears the ente key" 5 "$BIN" ente-session get
 
+echo "== item types =="
+# The tamper block consumed the earlier host token; open a fresh host session.
+HOST_JSON=$(printf 'correct horse' | "$BIN" unlock --password-stdin --json)
+TOKEN=$(printf '%s' "$HOST_JSON" | json token)
+cat >"$TMP/all-types.json" <<'JSON'
+{"items":[
+ {"id":"t1","type":1,"name":"Login","login":{"username":"u","password":"gh-pw","totp":"JBSWY3DP"},"fields":[{"name":"API_KEY","value":"hf_sk_abc987xyz456","type":1},{"name":"Plan","value":"Team","type":0}]},
+ {"id":"t2","type":2,"name":"Note","secureNote":{},"notes":"body: hunter2"},
+ {"id":"t3","type":3,"name":"Card","card":{"cardholderName":"Li","brand":"Visa","number":"4111111111111111","expMonth":"12","expYear":"2029","code":"123"}},
+ {"id":"t4","type":4,"name":"Identity","identity":{"firstName":"Jun","ssn":"123-45-6789","licenseNumber":"DL-99"}},
+ {"id":"t5","type":5,"name":"Key","sshKey":{"privateKey":"PEM-PRIVATE","publicKey":"ssh-ed25519 PUB"}},
+ {"id":"t6","type":6,"name":"Bank","bankAccount":{"bankName":"ICBC","accountNumber":"6222000011112222","pin":"9080"}},
+ {"id":"t7","type":7,"name":"Licence","driversLicense":{"licenseNumber":"110101"}},
+ {"id":"t8","type":8,"name":"Passport","passport":{"passportNumber":"E1234567","nationality":"CN"}}
+]}
+JSON
+check "import every item type" 0 "$BIN" import "$TMP/all-types.json" --yes --token "$TOKEN" --json
+"$BIN" list --token "$TOKEN" --json >"$TMP/typed-list"
+python3 - "$TMP/typed-list" <<'PY' && ok "list carries the type of each entry" || bad "list does not carry types"
+import json,sys
+items = json.load(open(sys.argv[1]))["items"]
+types = {i["name"]: i["type"] for i in items}
+for name, kind in {"Login":"login","Note":"secureNote","Card":"card","Identity":"identity","Key":"sshKey","Bank":"bankAccount","Licence":"driversLicense","Passport":"passport"}.items():
+    assert types.get(name) == kind, (name, types.get(name))
+PY
+for secret in gh-pw hunter2 4111111111111111 123-45-6789 DL-99 hf_sk_abc987xyz456 PEM-PRIVATE 6222000011112222 110101 E1234567 JBSWY3DP; do
+	grep -q "$secret" "$TMP/typed-list" && bad "list leaked $secret"
+done
+ok "list masks passwords, card number and code, keys, PIN, account and document numbers, hidden fields, TOTP seeds"
+grep -q '"hasNotes":true' "$TMP/typed-list" && ok "list flags which entries carry notes" || bad "hasNotes missing"
+# a manual entry of a non-login type, secret typed (stdin here for the primary field)
+check "add a card by hand with --type and --field" 0 bash -c "printf '999\n' | '$BIN' add --name HandCard --type card --field brand=Amex --field cardholderName='Li Jun' --field expYear=2031 --field number=378282246310005 --password-stdin --yes --token '$TOKEN' --json"
+check "a wrong field name is refused" 2 "$BIN" add --name X --type card --field cvv=1 --yes --token "$TOKEN"
+check "a wrong type name is refused" 2 "$BIN" add --name X --type wifi --yes --token "$TOKEN"
+check "--secret rejects a non-secret field" 2 bash -c "'$BIN' add --name X --type card --field brand=Visa --secret brand=Visa --secret code=1 --yes --token '$TOKEN'"
+relay Card y >"$TMP/card" 2>&1; [[ $? -eq 0 ]] && ok "get returns a card with its data block" || bad "get of a card failed"
+python3 - "$TMP/card" <<'PY' && ok "get shows the type's fields by Bitwarden's names" || bad "get output is wrong"
+import json,sys
+d = json.load(open(sys.argv[1]))
+assert d["type"] == "card" and d["data"]["code"] == "123" and d["data"]["number"] == "4111111111111111", d
+PY
+relay Note y >"$TMP/note" 2>&1; [[ $? -eq 0 ]] && ok "get returns a secure note's body" || bad "get of a note failed"
+grep -q 'body: hunter2' "$TMP/note" && ok "the note body is in notes" || bad "note body missing"
+
 echo "== rekey (L2) =="
 OLD_N=$(python3 -c "import json;print(json.load(open('$AI_VAULT_DIR/store.json'))['kdf']['N'])")
 check "rekey with the password" 0 bash -c "printf 'correct horse' | '$BIN' rekey --password-stdin --json"

@@ -29,7 +29,7 @@ omp plugin install npm:pi-ai-vault  # omp，同一个包
 |---|---|---|
 | `vault_list` | 本地库条目元数据 | 否 |
 | `vault_get` | 读一条：**先本地库，再 Bitwarden**；Bitwarden 命中会问「读一次 / 导入 ai-vault」 | 是，用户当场允许 |
-| `vault_add` | 存一条；密码由用户在弹出的窗口里输入 | 否 |
+| `vault_add` | 存一条，Bitwarden 的全部类型（登录、笔记、银行卡、身份、SSH 密钥、银行账户、驾照、护照）；秘密字段在弹窗里输 | 否 |
 | `vault_import` | 把 Bitwarden 登录项抄进本地库（先确认） | 否 |
 | `bw_list` / `bw_run` / `bw_clipboard` / `bw_reveal` | 在线 Bitwarden（`bw` CLI） | 否，`bw_reveal` 除外 |
 | `bw_inject` | 注入 bash 环境（**仅 pi**，omp 不注册） | 否 |

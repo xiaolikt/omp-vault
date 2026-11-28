@@ -16,7 +16,7 @@ use crate::i18n::{tr, tr_owned};
 use crate::import;
 use crate::paths::{Paths, GRANT_MS_DEFAULT, GRANT_MS_MAX, IDLE_MS_DEFAULT};
 use crate::session::{self, Session, StoreLock};
-use crate::store::{self, Draft, Item};
+use crate::store::{Draft, Item, ItemType, self};
 use crate::{audit, store::ItemSummary};
 
 #[derive(Parser, Debug)]
@@ -137,17 +137,29 @@ enum Cmd {
         #[arg(long, value_name = "HEX")]
         approval: Option<String>,
     },
-    /// Create or update an entry; the password is typed in a dialog
+    /// Create or update an entry of any type; the secret is typed in a dialog
     Add {
         #[arg(long)]
         name: String,
+        /// login (default) | note | card | identity | sshkey | bankaccount | driverslicense | passport
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
         #[arg(long)]
         username: Option<String>,
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
         notes: Option<String>,
-        /// Read the password from stdin instead of a dialog
+        /// A field of the type, NAME=VALUE; repeatable. A field given as NAME
+        /// alone, or any hidden field left out, is typed in a dialog (or sent
+        /// on stdin for the primary one with --password-stdin).
+        #[arg(long = "field", value_name = "NAME[=VALUE]")]
+        fields: Vec<String>,
+        /// A hidden field supplied by a host that already asked the user for
+        /// it, NAME=VALUE; repeatable. Never printed, never in a window.
+        #[arg(long = "secret", value_name = "NAME=VALUE")]
+        secrets: Vec<String>,
+        /// Read the secret from stdin instead of a dialog
         #[arg(long)]
         password_stdin: bool,
         /// Skip the "save this?" confirm window (the user already approved)
@@ -218,6 +230,8 @@ enum Fault {
     Usage(String),
     /// No desktop window could be opened; the host must supply the value.
     NeedsUi(&'static str),
+    /// The same, for one named hidden field of a typed entry.
+    NeedsUiField(String),
     Denied(String),
     Auth(String),
 }
@@ -227,7 +241,7 @@ impl Fault {
         match self {
             Fault::Error(_) => 1,
             Fault::Usage(_) => 2,
-            Fault::NeedsUi(_) => 3,
+            Fault::NeedsUi(_) | Fault::NeedsUiField(_) => 3,
             Fault::Denied(_) => 4,
             Fault::Auth(_) => 5,
         }
@@ -266,6 +280,11 @@ pub fn run() -> i32 {
                     eprintln!("needs-ui: {step}");
                     eprintln!("no desktop window is available; the host must supply this value");
                 }
+                Fault::NeedsUiField(field) => {
+                    eprintln!("needs-ui: password field={field}");
+                    eprintln!("no desktop window is available; the host must supply this value");
+                }
+                // (NeedsUi with a detail is printed by `needs_ui` below)
                 Fault::Usage(message) => eprintln!("ai-vault: {message}"),
                 Fault::Error(message) | Fault::Denied(message) | Fault::Auth(message) => {
                     eprintln!("ai-vault: {message}")
@@ -337,8 +356,8 @@ fn dispatch(cmd: Cmd, paths: &Paths, json: bool) -> Outcome {
         Cmd::Get { name, token, reason, answer_stdin, approval } => {
             get(paths, &out, token, &name, reason.as_deref(), answer_stdin, approval)
         }
-        Cmd::Add { name, username, uri, notes, password_stdin, yes, token } => {
-            add(paths, &out, token, AddRequest { name, username, uri, notes, password_stdin, yes })
+        Cmd::Add { name, r#type, username, uri, notes, fields, secrets, password_stdin, yes, token } => {
+            add(paths, &out, token, AddRequest { name, r#type, username, uri, notes, fields, secrets, password_stdin, yes })
         }
         Cmd::Save { token, file, yes } => save(paths, &out, token, file, yes),
         Cmd::Remove { name, yes, token } => remove(paths, &out, token, &name, yes),
@@ -455,6 +474,20 @@ fn ask_password(title: &str, label: &str) -> Result<String, Fault> {
     }
 }
 
+/// The same, naming the field on the `needs-ui` line so a host can title its
+/// own dialog and send the value back as `--secret NAME=VALUE`.
+/// The same, but when no window can open the `needs-ui` line names the field,
+/// so a host can title its own dialog and send the answer back as `--secret`.
+/// The field is reported in the error's text, which the host reads after the
+/// `needs-ui: password` line.
+fn ask_field_password(field: &str, title: &str, label: &str) -> Result<String, Fault> {
+    match dialog::prompt_secret(title, label) {
+        Answer::Value(value) => Ok(value),
+        Answer::Cancelled => Err(Fault::Denied("cancelled: no password entered".into())),
+        Answer::NoUi => Err(Fault::NeedsUiField(field.to_string())),
+    }
+}
+
 fn ask_text(title: &str, label: &str) -> Result<String, Fault> {
     match dialog::prompt_text(title, label) {
         Answer::Value(value) => Ok(value),
@@ -502,7 +535,7 @@ fn signing_key(paths: &Paths) -> Result<Option<String>, String> {
 /// and is treated like a human caller until it has a secret to sign with.
 /// This keeps a half-configured host from getting a session it can neither
 /// verify nor relay for.
-fn kind_label(kind: Kind) -> &'static str {
+fn secret_kind_label(kind: Kind) -> &'static str {
     match kind {
         Kind::Bitwarden => "bitwarden",
         Kind::Ente => "ente",
@@ -964,9 +997,9 @@ fn sealed_session(paths: &Paths, out: &Out, kind: Kind, action: &str) -> Outcome
     match action.trim() {
         "" | "get" => {
             let stored = sealed::load(paths, kind)?
-                .ok_or_else(|| Fault::Auth(format!("no persisted {} secret — save one first", kind_label(kind))))?;
+                .ok_or_else(|| Fault::Auth(format!("no persisted {} secret — save one first", secret_kind_label(kind))))?;
             let key = sealed::key(paths, kind)?
-                .ok_or_else(|| Fault::Auth(format!("no persisted {} secret", kind_label(kind))))?;
+                .ok_or_else(|| Fault::Auth(format!("no persisted {} secret", secret_kind_label(kind))))?;
             out.value(
                 json!({ "ok": true, "key": key, "savedAt": stored.saved_at, "expiresAt": stored.expires_at }),
                 || key,
@@ -979,7 +1012,7 @@ fn sealed_session(paths: &Paths, out: &Out, kind: Kind, action: &str) -> Outcome
                 return Err(Fault::Usage("bw-session put expects the session key on stdin".into()));
             }
             let expires_at = sealed::save(paths, kind, &key)?;
-            audit::append(&paths.audit(), "cli", "sealed", None, Some(kind_label(kind)));
+            audit::append(&paths.audit(), "cli", "sealed", None, Some(secret_kind_label(kind)));
             out.value(json!({ "ok": true, "expiresAt": expires_at }), || {
                 match expires_at {
                     Some(at) => format!("saved (expires in {} min)", ((at - session::now_ms()) / 60_000).max(0)),
@@ -990,7 +1023,7 @@ fn sealed_session(paths: &Paths, out: &Out, kind: Kind, action: &str) -> Outcome
         }
         "clear" | "delete" => {
             let removed = sealed::clear(paths, kind);
-            audit::append(&paths.audit(), "cli", "sealed", None, Some(kind_label(kind)));
+            audit::append(&paths.audit(), "cli", "sealed", None, Some(secret_kind_label(kind)));
             out.value(json!({ "ok": true, "removed": removed }), || {
                 if removed { "cleared".to_string() } else { "nothing stored".to_string() }
             });
@@ -1090,7 +1123,15 @@ fn list(paths: &Paths, out: &Out, token: Option<String>) -> Outcome {
         }
         items
             .iter()
-            .map(|i| format!("{}\t{}\t{}", i.name, i.username.clone().unwrap_or_default(), i.uris.as_ref().and_then(|u| u.first()).cloned().unwrap_or_default()))
+            .map(|i| {
+                format!(
+                    "{}\t{}\t{}\t{}",
+                    i.name,
+                    kind_label(i.r#type),
+                    i.username.clone().unwrap_or_default(),
+                    i.uris.as_ref().and_then(|u| u.first()).cloned().unwrap_or_default()
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     });
@@ -1128,7 +1169,7 @@ fn get(
         let message = format!(
             "{} {}\n{} {}\n{} {}\n\n{}",
             tr("Entry:", "条目:"),
-            dialog::for_dialog(&item.name, 80),
+            format!("{} ({})", dialog::for_dialog(&item.name, 80), kind_label(item.r#type)),
             tr("Requester:", "请求方:"),
             dialog::for_dialog(&session.requester, 40),
             tr("Reason:", "原因:"),
@@ -1196,11 +1237,31 @@ fn get(
 
 struct AddRequest {
     name: String,
+    r#type: Option<String>,
     username: Option<String>,
     uri: Option<String>,
     notes: Option<String>,
+    fields: Vec<String>,
+    secrets: Vec<String>,
     password_stdin: bool,
     yes: bool,
+}
+
+/// Parse a type name the way a human writes it: login, note, secure-note,
+/// ssh key, "SSH key", drivers licence …
+fn parse_item_type(raw: &str) -> Option<ItemType> {
+    let key: String = raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+    Some(match key.as_str() {
+        "login" | "password" | "" => ItemType::Login,
+        "note" | "securenote" => ItemType::SecureNote,
+        "card" | "creditcard" => ItemType::Card,
+        "identity" | "person" => ItemType::Identity,
+        "sshkey" | "ssh" | "key" => ItemType::SshKey,
+        "bankaccount" | "bank" => ItemType::BankAccount,
+        "driverslicense" | "driverlicense" | "license" | "drivinglicence" => ItemType::DriversLicense,
+        "passport" => ItemType::Passport,
+        _ => return None,
+    })
 }
 
 fn add(paths: &Paths, out: &Out, token: Option<String>, req: AddRequest) -> Outcome {
@@ -1209,33 +1270,94 @@ fn add(paths: &Paths, out: &Out, token: Option<String>, req: AddRequest) -> Outc
     if name.is_empty() {
         return Err(Fault::Usage("an entry needs a name".into()));
     }
+    let kind = match req.r#type.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        None => ItemType::Login,
+        Some(raw) => parse_item_type(raw).ok_or_else(|| {
+            Fault::Usage(format!(
+                "unknown type \"{raw}\" — login, note, card, identity, sshkey, bankaccount, driverslicense, passport"
+            ))
+        })?,
+    };
     let store = open_store(paths)?;
     let items = items_with(&session, &store)?;
     let existing = store::find(&items, &name).cloned();
+    // Updating an entry of another type replaces its data block: say so in the window.
+    let type_changes = existing.as_ref().is_some_and(|item| item.r#type != kind);
+
+    // --field NAME=VALUE pairs, by the type's own field names.
+    let mut data: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut to_type: Vec<String> = Vec::new();
+    for raw in &req.fields {
+        let (field, value) = match raw.split_once('=') {
+            Some((f, v)) => (f.trim().to_string(), Some(v.to_string())),
+            None => (raw.trim().to_string(), None),
+        };
+        let field = resolve_field_name(kind, &field)
+            .ok_or_else(|| Fault::Usage(format!("\"{field}\" is not a field of a {}", kind_label(kind))))?;
+        match value {
+            Some(v) => {
+                data.insert(field, serde_json::Value::String(v));
+            }
+            None => to_type.push(field),
+        }
+    }
+    // Host-supplied hidden fields (the host asked the user in its own UI).
+    for raw in &req.secrets {
+        let (field, value) = raw.split_once('=').ok_or_else(|| Fault::Usage("--secret expects NAME=VALUE".into()))?;
+        let field = resolve_field_name(kind, field.trim())
+            .ok_or_else(|| Fault::Usage(format!("\"{}\" is not a field of a {}", field.trim(), kind_label(kind))))?;
+        if !is_secret_field(kind, &field) {
+            return Err(Fault::Usage(format!("--secret is for hidden fields; \"{field}\" can go in --field")));
+        }
+        data.insert(field, serde_json::Value::String(value.to_string()));
+    }
+    // The conventional flags feed the login fields and the shared notes.
+    if kind == ItemType::Login {
+        if let Some(user) = req.username.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            data.insert("username".into(), serde_json::Value::String(user.to_string()));
+        }
+    }
+    let notes = req.notes.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
 
     if !req.yes {
         let mut meta = Vec::new();
+        let shown = dialog::for_dialog(&name, 80);
+        let action = match &existing {
+            Some(_) if type_changes => tr_owned(
+                format!("Replace \"{shown}\" with a {} entry.", kind_label(kind)),
+                format!("把「{shown}」改成{}条目。", kind_label(kind)),
+            ),
+            Some(_) => tr_owned(format!("Update the existing entry \"{shown}\"."), format!("更新已有条目「{shown}」。")),
+            None => tr_owned(format!("Create a {} entry \"{shown}\".", kind_label(kind)), format!("新建{}条目「{shown}」。", kind_label(kind))),
+        };
+        for (field, value) in &data {
+            let secret = is_secret_field(kind, field);
+            meta.push(format!(
+                "{} {}",
+                field,
+                if secret { "••••".to_string() } else { dialog::for_dialog(value.as_str().unwrap_or(""), 120) }
+            ));
+        }
+        for field in &to_type {
+            meta.push(format!("{field} ••••"));
+        }
         if let Some(user) = req.username.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-            meta.push(format!("{} {}", tr("Username:", "用户名:"), dialog::for_dialog(user, 60)));
+            if kind != ItemType::Login {
+                meta.push(format!("{} {}", tr("Username:", "用户名:"), dialog::for_dialog(user, 60)));
+            }
         }
         if let Some(uri) = req.uri.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
             meta.push(format!("URI: {}", dialog::for_dialog(uri, 120)));
         }
-        if let Some(notes) = req.notes.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        if let Some(notes) = notes.as_deref() {
             meta.push(format!("{} {}", tr("Notes:", "备注:"), dialog::for_dialog(notes, 120)));
         }
-        let shown = dialog::for_dialog(&name, 80);
-        let action = if existing.is_some() {
-            tr_owned(format!("Update the existing entry \"{shown}\"."), format!("更新已有条目「{shown}」。"))
-        } else {
-            tr_owned(format!("Create the entry \"{shown}\"."), format!("新建条目「{shown}」。"))
-        };
         let message = format!(
             "{action}{}\n{}",
             if meta.is_empty() { String::new() } else { format!("\n{}", meta.join("\n")) },
             tr(
-                "A window opens next for you to type the password. It never enters the conversation.",
-                "下一步会弹出窗口，由你输入密码。密码不会进入对话。"
+                "A window opens next for each hidden field. Nothing enters the conversation.",
+                "接下来每个隐藏字段弹一个窗口。密码不会进入对话。"
             )
         );
         match dialog::confirm(tr("ai-vault · save to local store", "ai-vault · 保存到本地库"), &message) {
@@ -1245,50 +1367,132 @@ fn add(paths: &Paths, out: &Out, token: Option<String>, req: AddRequest) -> Outc
         }
     }
 
-    let username = match req.username {
-        Some(user) => user,
-        None => {
-            let hint = if existing.as_ref().and_then(|i| i.username.as_ref()).is_some() {
-                tr("username (leave blank to keep)", "用户名（留空保持不变）")
-            } else {
-                tr("username (optional)", "用户名（可留空）")
-            };
-            ask_text(&format!("ai-vault · {name}"), hint)?
+    // Hidden fields: typed in a dialog (or read from stdin for the primary one).
+    // On an update, a secret the caller did not mention is left as stored; only
+    // a new entry (or a type change) needs every secret typed.
+    let primary = kind.primary_field();
+    let fresh = existing.as_ref().map_or(true, |item| item.r#type != kind);
+    let mut secret_fields: Vec<String> = to_type;
+    if fresh {
+        if let Some(field) = primary {
+            if !data.contains_key(field) {
+                secret_fields.push(field.to_string());
+            }
         }
-    };
-    let password = if req.password_stdin {
-        read_password()?
-    } else {
-        ask_password(tr("ai-vault · password", "ai-vault · 密码"), &name)?
-    };
-    if password.is_empty() {
-        return Err(Fault::Denied("cancelled: no password entered".into()));
+    } else if let Some(item) = &existing {
+        // Carry over the stored data block so `apply` does not read the absent
+        // fields as "clear"; the draft's own values still win.
+        for (field, value) in item.data.clone().unwrap_or_default() {
+            data.entry(field).or_insert(value);
+        }
+    }
+    for field in secret_fields {
+        let password = if req.password_stdin && Some(field.as_str()) == primary {
+            read_password()?
+        } else {
+            ask_field_password(&field, tr("ai-vault · password", "ai-vault · 密码"), &format!("{name} · {field}"))?
+        };
+        if password.is_empty() {
+            return Err(Fault::Denied("cancelled: no password entered".into()));
+        }
+        data.insert(field, serde_json::Value::String(password));
+    }
+    if kind == ItemType::SecureNote && notes.is_none() && data.is_empty() {
+        // A secure note is its notes; a dialog for the body when none was given.
+        let body = match dialog::prompt_text(tr("ai-vault · note", "ai-vault · 备注"), tr("the note's contents", "备注内容")) {
+            Answer::Value(text) => text,
+            Answer::Cancelled => return Err(Fault::Denied("cancelled".into())),
+            Answer::NoUi => return Err(Fault::NeedsUi("text")),
+        };
+        if body.trim().is_empty() {
+            return Err(Fault::Usage("a note needs contents (--notes)".into()));
+        }
+        let notes = Some(body);
+        return finish_add(paths, out, &mut session, Draft {
+            name: name.clone(),
+            r#type: kind,
+            notes,
+            data: None,
+            ..Default::default()
+        }, &name);
     }
 
-    let user = username.trim().to_string();
-    let uri = req.uri.map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
-    let notes = req.notes.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    let uris = req.uri.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).map(|u| vec![u]);
     let draft = Draft {
-        id: None,
         name: name.clone(),
-        username: if user.is_empty() { None } else { Some(user) },
-        password,
-        uris: uri.map(|u| vec![u]),
+        r#type: kind,
+        username: if kind == ItemType::Login { req.username.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()) } else { None },
+        password: String::new(),
+        uris,
+        data: if data.is_empty() { None } else { Some(data) },
         notes,
-        source: None,
+        ..Default::default()
     };
+    finish_add(paths, out, &mut session, draft, &name)
+}
+
+fn finish_add(paths: &Paths, out: &Out, session: &mut Session, draft: Draft, name: &str) -> Outcome {
     let mut inserted = false;
-    mutate(paths, &session, |items, now| {
+    let kind = draft.r#type;
+    mutate(paths, session, |items, now| {
         inserted = store::apply(items, draft, now);
         Ok(())
     })?;
     session.last_active = session::now_ms();
-    persist(paths, &session);
-    audit::append(&paths.audit(), &session.requester, "add", Some(&name), None);
-    out.value(json!({ "ok": true, "item": name, "created": inserted }), || {
-        format!("saved \"{name}\" (password entered in the dialog, not shown)")
+    persist(paths, session);
+    audit::append(&paths.audit(), &session.requester, "add", Some(name), Some(kind_label(kind)));
+    let mut value = json!({ "ok": true, "item": name, "type": kind_label(kind), "created": inserted });
+    if let Some(record) = value.as_object_mut() {
+        record.insert("fields".into(), json!(kind.fields()));
+    }
+    out.value(value, || {
+        format!(
+            "saved \"{name}\" as a {} (hidden fields typed in the dialog, not shown)",
+            kind_label(kind)
+        )
     });
     Ok(())
+}
+
+/// A type's field by the name a human typed (case- and separator-insensitive).
+fn resolve_field_name(kind: ItemType, raw: &str) -> Option<String> {
+    let key: String = raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+    kind.fields()
+        .iter()
+        .find(|f| f.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase() == key)
+        .map(|f| f.to_string())
+}
+
+/// Fields whose value must never be printed in a window or in `list`.
+pub(crate) fn is_secret_field(kind: ItemType, field: &str) -> bool {
+    matches!(
+        (kind, field),
+        (_, "password")
+            | (_, "privateKey")
+            | (ItemType::Card, "code")
+            | (ItemType::Card, "number")
+            | (ItemType::BankAccount, "pin")
+            | (ItemType::BankAccount, "accountNumber")
+            | (ItemType::BankAccount, "routingNumber")
+            | (_, "ssn")
+            | (_, "licenseNumber")
+            | (_, "passportNumber")
+            | (ItemType::Passport, "nationalIdentificationNumber")
+            | (_, "totp")
+    )
+}
+
+fn kind_label(kind: ItemType) -> &'static str {
+    match kind {
+        ItemType::Login => "login",
+        ItemType::SecureNote => "note",
+        ItemType::Card => "card",
+        ItemType::Identity => "identity",
+        ItemType::SshKey => "SSH key",
+        ItemType::BankAccount => "bank account",
+        ItemType::DriversLicense => "driver's licence",
+        ItemType::Passport => "passport",
+    }
 }
 
 fn save(paths: &Paths, out: &Out, token: Option<String>, file: Option<PathBuf>, yes: bool) -> Outcome {

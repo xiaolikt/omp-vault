@@ -175,8 +175,8 @@ test("a denied confirmation never fetches the entry; an approved one fetches it 
 
 	// An id is looked up in the listing, so a wrong one fails before any window.
 	await assert.rejects(
-		b.tool("bw_run", { item: "cccc3333-3333-4333-8333-333333333333", command: "true" }),
-		/No Bitwarden item with id cccc3333/,
+		b.tool("bw_run", { item: "ffff9999-9999-4999-8999-999999999999", command: "true" }),
+		/No Bitwarden item with id ffff9999/,
 	);
 });
 

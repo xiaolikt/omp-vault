@@ -152,12 +152,12 @@ ai-vault [--dir DIR] [--json] <command>
 | `lock --token T \| --all` | drop a token (`--all` ends every session on the machine) |
 | `list --token T` | entry metadata (name/username/URI); no passwords |
 | `get <name> [--reason R] [--answer-stdin]` | read one entry; a confirm window opens unless a grant is live |
-| `add --name N [--username U] [--uri U] [--notes N] [--password-stdin] [--yes]` | create/update; the password is typed in a dialog |
+| `add --name N [--type TYPE] [--field NAME[=VALUE]]… [--secret NAME=VALUE]… [--username U] [--uri U] [--notes N] [--password-stdin] [--yes]` | create/update any type; a hidden field left out is typed in a dialog (`--secret` is for a host that already asked) |
 | `save --yes [--file F]` | read an array of entries as JSON and write them (the import path) |
 | `remove <name> [--yes]` | delete (quote names with spaces) |
 | `grant <name> [--minutes N]` / `revoke <name\|--all>` | a standing read grant (default 5 min, max 60); `grant` costs the master password |
 | `audit [n]` | the last n audit lines (default 30) |
-| `import <bitwarden.json> [--yes]` | import an unencrypted Bitwarden export |
+| `import <bitwarden.json> [--yes]` | import an unencrypted Bitwarden export, every item type |
 
 The token can also come from `AI_VAULT_TOKEN`. The store directory is `--dir`,
 then `AI_VAULT_DIR`, then `~/.ai-vault`.
@@ -196,9 +196,9 @@ cannot sign an "allow".
 | Tool | What it does | Tier | Model sees the secret? |
 |---|---|---|---|
 | `vault_list` | local store metadata | read | no |
-| `vault_get` | read one: **local store first, Bitwarden second**; a Bitwarden hit follows `bitwarden.import` (ask / import / read once) | exec | yes, user-approved on the spot |
-| `vault_add` | store one; the password is typed in a dialog | write | no |
-| `vault_import` | copy Bitwarden logins into the local store (asks first) | write | no |
+| `vault_get` | read one, any type: **local store first, Bitwarden second**; a Bitwarden hit follows `bitwarden.import` (ask / import / read once) | exec | yes, user-approved on the spot |
+| `vault_add` | store one, any type; secret fields are typed in a dialog | write | no |
+| `vault_import` | copy Bitwarden items of every type into the local store, field for field (asks first) | write | no |
 | `bw_list` | live Bitwarden metadata | read | no |
 | `bw_run` | run one command with `$VAULT_SECRET` in its env; output scrubbed | exec | no |
 | `bw_inject` | inject into the bash env (**pi only**) | exec | no |
@@ -212,6 +212,43 @@ whether ai-vault keeps `ENTE_CLI_VAULT_KEY` sealed for it.
 
 Field selector: `password` (default) · `totp` (seed) · `code` (rotating code) ·
 `notes` · `field:<custom field name>`.
+
+### Item types
+
+ai-vault stores the same item types Bitwarden does, with the same field names,
+so an import is a copy and a manual entry is the same shape:
+
+| Type | `--type` | Its own fields (`data`) | Secret field |
+|---|---|---|---|
+| Login | `login` (default) | `username`, `password`, `totp` + `uris` | `password` |
+| Secure note | `note` | none — the content is `notes` | — |
+| Card | `card` | `cardholderName`, `brand`, `number`, `expMonth`, `expYear`, `code` | `number`, `code` |
+| Identity | `identity` | `title`, `firstName`, `middleName`, `lastName`, `address1–3`, `city`, `state`, `postalCode`, `country`, `company`, `email`, `phone`, `ssn`, `username`, `passportNumber`, `licenseNumber` | `ssn`, document numbers |
+| SSH key | `sshkey` | `privateKey`, `publicKey`, `keyFingerprint` | `privateKey` |
+| Bank account | `bankaccount` | `bankName`, `nameOnAccount`, `accountType`, `accountNumber`, `routingNumber`, `branchNumber`, `pin`, `swiftCode`, `iban`, `bankContactPhone` | `accountNumber`, `routingNumber`, `pin` |
+| Driver's licence | `driverslicense` | `firstName`, `middleName`, `lastName`, `dateOfBirth`, `licenseNumber`, `issuingCountry`, `issuingState`, `issueDate`, `expirationDate`, `issuingAuthority`, `licenseClass` | `licenseNumber` |
+| Passport | `passport` | `surname`, `givenName`, `dateOfBirth`, `sex`, `birthPlace`, `nationality`, `issuingCountry`, `passportNumber`, `passportType`, `nationalIdentificationNumber`, `issuingAuthority`, `issueDate`, `expirationDate` | `passportNumber`, `nationalIdentificationNumber` |
+
+The last three are behind Bitwarden's "new item types" flag; the CLI stores
+them the same way. Every type also carries `notes` and custom `fields[]`
+(`type`: 0 text · 1 hidden · 2 boolean · 3 linked, as in Bitwarden). A hidden
+custom field is treated as a secret everywhere.
+
+```bash
+# by hand: non-secret fields on the line, the secret typed in a window
+ai-vault add --name Visa --type card --field cardholderName="Li Jun" --field brand=Visa --field expYear=2029
+ai-vault add --name "Wifi" --type note --notes "guest network: …"
+ai-vault add --name server --type sshkey --field publicKey="ssh-ed25519 AAAA"   # private key typed
+```
+
+`list` shows the type and the non-secret fields (cardholder, brand, expiry,
+a person's name, the key's fingerprint…); it never shows a password, card
+number or code, private key, PIN, account or document number, a hidden custom
+field, a TOTP seed, or a secure note's body. `get` returns the whole entry.
+
+The `vault_add` tool takes `type` and `fields` the same way. A secret field the
+model fills in itself is refused: those are typed by the user in a dialog, one
+window per field.
 
 ### Lookup order: local first, Bitwarden as fallback
 
@@ -287,13 +324,14 @@ policy goes back to `session`, and `/bw lock` clears it too.
 
 ```
 /vault init                        create the local store (dialog sets the master password)
+/vault add card:Visa brand=Visa code   type:name, fields on the line, a bare field typed in a dialog
 /vault unlock | lock               unlock / lock this session
 /vault mode [never|time|session]   show / switch the unlock policy (switching needs the password)
 /vault settings [key value]        show / change settings (bitwarden.*, ente.*)
 /vault ente-key                    save Ente's ENTE_CLI_VAULT_KEY (no keychain, no login)
 /vault status                      state, expiry, grants left
 /vault list                        entry metadata
-/vault add [name]                  add (username and password typed in a dialog)
+/vault add [type:]name [field=value|field]…   add any type; a bare field is typed in a dialog
 /vault remove <name>               delete (quote names like "GitHub (2)")
 /vault grant <name> [minutes]      a standing read grant (needs the master password)
 /vault revoke <name|all>           revoke grants

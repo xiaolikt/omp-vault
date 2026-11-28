@@ -3,7 +3,7 @@
 
 use serde_json::Value;
 
-use crate::store::{Draft, Source};
+use crate::store::{Draft, Field, ItemType, Source};
 
 const MAX_NAME: usize = 200;
 
@@ -28,8 +28,10 @@ fn sanitized_name(raw: &str) -> String {
     cleaned.chars().take(MAX_NAME).collect()
 }
 
-/// Bitwarden export (array or `{ "items": [...] }`) -> drafts. Login items
-/// without a password are skipped; names are sorted, then made unique with
+/// Bitwarden export (array or `{ "items": [...] }`) -> drafts, for every
+/// item type, field for field. Login items without a password are still
+/// imported (a PIN-only or passkey-only login is a login); a `name` is the
+/// only thing an item must have. Names are sorted, then made unique with
 /// `Name (2)`, `Name (3)`, … Each draft keeps its Bitwarden id so a re-import
 /// updates the same row after a rename.
 pub fn from_bitwarden(raw: &Value) -> Result<Vec<Draft>, String> {
@@ -50,34 +52,77 @@ pub fn from_bitwarden(raw: &Value) -> Result<Vec<Draft>, String> {
     let mut drafts: Vec<Draft> = Vec::new();
     for item in items {
         let Some(rec) = item.as_object() else { continue };
-        let Some(login) = rec.get("login").and_then(Value::as_object) else { continue };
-        let password = login.get("password").and_then(Value::as_str).unwrap_or("");
-        if password.is_empty() {
-            continue;
-        }
-        let username = rec
-            .get("login")
-            .and_then(|l| l.get("username"))
-            .and_then(Value::as_str)
-            .filter(|u| !u.is_empty())
-            .map(str::to_string);
-        let notes = rec
-            .get("notes")
-            .and_then(Value::as_str)
-            .filter(|n| !n.is_empty())
-            .map(str::to_string);
+        let kind = ItemType::from_code(rec.get("type").and_then(Value::as_u64).unwrap_or(1) as u8)
+            .ok_or_else(|| format!("unsupported item type {}", rec.get("type").and_then(Value::as_u64).unwrap_or(0)))?;
         let source = rec
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .map(|id| Source { kind: "bitwarden".into(), id: id.to_string() });
+
+        // The type's own block, by Bitwarden's key and field names; unknown
+        // keys are kept rather than dropped, so a newer CLI loses nothing.
+        let mut data = serde_json::Map::new();
+        if let Some(block) = rec.get(kind.data_key()).and_then(Value::as_object) {
+            for (field, value) in block {
+                if field == "uris" || field == "totp" && value.is_null() {
+                    continue;
+                }
+                match value {
+                    Value::String(text) if !text.is_empty() => {
+                        data.insert(field.clone(), Value::String(text.clone()));
+                    }
+                    Value::Null => {}
+                    other => {
+                        data.insert(field.clone(), other.clone());
+                    }
+                }
+            }
+        }
+        let uris = rec
+            .get(kind.data_key())
+            .and_then(|b| b.get("uris"))
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|entry| entry.get("uri").and_then(Value::as_str))
+                    .filter(|uri| !uri.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|list: &Vec<String>| !list.is_empty());
+
+        let fields = rec.get("fields").and_then(Value::as_array).map(|list| {
+            list.iter()
+                .filter_map(|f| f.as_object())
+                .map(|f| Field {
+                    name: f.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    value: f.get("value").and_then(Value::as_str).unwrap_or("").to_string(),
+                    r#type: f.get("type").and_then(Value::as_u64).unwrap_or(0) as u8,
+                    linked_id: f.get("linkedId").and_then(Value::as_u64).map(|n| n.to_string()),
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let (username, password) = if kind == ItemType::Login {
+            (
+                data.get("username").and_then(Value::as_str).map(str::to_string),
+                data.get("password").and_then(Value::as_str).unwrap_or("").to_string(),
+            )
+        } else {
+            (None, String::new())
+        };
+
         drafts.push(Draft {
             id: None,
             name: sanitized_name(rec.get("name").and_then(Value::as_str).unwrap_or("")),
+            r#type: kind,
             username,
-            password: password.to_string(),
-            uris: Some(as_uris(login)),
-            notes,
+            password,
+            uris,
+            data: if data.is_empty() { None } else { Some(data) },
+            notes: rec.get("notes").and_then(Value::as_str).filter(|n| !n.is_empty()).map(str::to_string),
+            fields: fields.filter(|f: &Vec<Field>| !f.is_empty()),
             source,
         });
     }
@@ -86,16 +131,12 @@ pub fn from_bitwarden(raw: &Value) -> Result<Vec<Draft>, String> {
         a.name
             .to_lowercase()
             .cmp(&b.name.to_lowercase())
+            .then_with(|| a.r#type.cmp(&b.r#type))
             .then_with(|| a.username.clone().unwrap_or_default().to_lowercase().cmp(&b.username.clone().unwrap_or_default().to_lowercase()))
-            .then_with(|| {
-                let ax = a.uris.as_ref().and_then(|u| u.first()).cloned().unwrap_or_default().to_lowercase();
-                let bx = b.uris.as_ref().and_then(|u| u.first()).cloned().unwrap_or_default().to_lowercase();
-                ax.cmp(&bx)
-            })
     });
-    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<(String, ItemType), usize> = std::collections::HashMap::new();
     for item in &mut drafts {
-        let count = seen.entry(item.name.to_lowercase()).or_insert(0);
+        let count = seen.entry((item.name.to_lowercase(), item.r#type)).or_insert(0);
         *count += 1;
         if *count > 1 {
             item.name = format!("{} ({count})", item.name);
@@ -136,17 +177,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skips_logins_without_a_password() {
+    fn imports_every_item_including_passwordless_logins() {
         let raw = serde_json::json!([
             { "id": "1", "name": "Good", "login": { "username": "u", "password": "p", "uris": [{ "uri": "https://a" }] } },
-            { "id": "2", "name": "NoPw", "login": { "username": "u" } },
-            { "id": "3", "name": "Note only", "notes": "x" }
+            { "id": "2", "name": "PasskeyOnly", "type": 1, "login": { "username": "u" } },
+            { "id": "3", "name": "Just a note", "type": 2, "secureNote": {}, "notes": "x" }
         ]);
-        let drafts = from_bitwarden(&raw).unwrap();
-        assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].name, "Good");
-        assert_eq!(drafts[0].uris.as_ref().unwrap()[0], "https://a");
-        assert_eq!(drafts[0].source.as_ref().unwrap().id, "1");
+        let mut drafts = from_bitwarden(&raw).unwrap();
+        drafts.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(drafts.len(), 3, "a login without a password is still a login");
+        let good = drafts.iter().find(|d| d.name == "Good").unwrap();
+        assert_eq!(good.uris.as_ref().unwrap()[0], "https://a");
+        assert_eq!(good.source.as_ref().unwrap().id, "1");
+        let passkey = drafts.iter().find(|d| d.name == "PasskeyOnly").unwrap();
+        assert_eq!(passkey.r#type, ItemType::Login);
+        assert!(passkey.password.is_empty());
+        let note = drafts.iter().find(|d| d.name == "Just a note").unwrap();
+        assert_eq!(note.r#type, ItemType::SecureNote);
+        assert_eq!(note.notes.as_deref(), Some("x"));
     }
 
     #[test]

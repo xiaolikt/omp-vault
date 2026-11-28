@@ -34,14 +34,19 @@ export interface CliRun {
 
 /** Non-zero exit from the CLI, with the meaning of the code preserved. */
 export class CliError extends Error {
+	/** For `needsUi === "password"`: the hidden field the CLI wants next. */
+	readonly field: string | undefined;
+
 	constructor(
 		readonly code: number,
 		readonly needsUi: UiStep | undefined,
 		message: string,
 		readonly stderr: string,
+		field?: string,
 	) {
 		super(message);
 		this.name = "CliError";
+		this.field = field;
 	}
 
 	get denied(): boolean {
@@ -92,7 +97,7 @@ export function resolveBinary(): string | undefined {
 	return undefined;
 }
 
-const NEEDS_UI = /^needs-ui:\s*(\w+)/m;
+const NEEDS_UI = /^needs-ui:\s*(\w+)(?:\s+field=(\S+))?/m;
 
 function message(stderr: string, fallback: string): string {
 	const lines = stderr
@@ -194,8 +199,9 @@ export class VaultCli {
 			else child.stdin?.end();
 		});
 		if (run.code !== 0) {
-			const step = NEEDS_UI.exec(run.stderr)?.[1] as UiStep | undefined;
-			throw new CliError(run.code, step, message(run.stderr, `ai-vault exited with ${run.code}`), run.stderr);
+			const match = NEEDS_UI.exec(run.stderr);
+			const step = match?.[1] as UiStep | undefined;
+			throw new CliError(run.code, step, message(run.stderr, `ai-vault exited with ${run.code}`), run.stderr, match?.[2]);
 		}
 		return run;
 	}

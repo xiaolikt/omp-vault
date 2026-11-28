@@ -15,15 +15,17 @@ import { tr } from "./i18n.js";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-	lookupBitwardenLogin,
+	lookupBitwardenItem,
 	newBwState,
-	pullBitwardenLogins,
+	pullBitwardenItems,
 	queryBitwarden,
 	registerBitwarden,
 	type BitwardenMeta,
 	type BwState,
 } from "./bitwarden.js";
 import { CliError, VaultCli } from "./cli.js";
+import { ITEM_TYPES, isSecretField, parseItemType } from "./import-map.js";
+import type { Draft, ItemType } from "./types.js";
 import { registerEnte } from "./ente.js";
 import { isOmpHost, onSessionLeave, sessionLabel, subagentId, withTier } from "./host.js";
 import { confirmWindow, forDialog, promptSecret, promptText, type PromptHost } from "./prompt.js";
@@ -308,44 +310,34 @@ async function bitwardenFallback(
 	const missing = localMiss;
 	let hit;
 	try {
-		hit = await lookupBitwardenLogin(bw, ctx, name, signal);
+		hit = await lookupBitwardenItem(bw, ctx, name, signal);
 	} catch (error) {
 		return fail(`${missing} — the Bitwarden lookup failed: ${describe(error)}`);
 	}
 	if (!hit) return fail(`${missing} — not in Bitwarden either${reason ? ` (reason: ${reason})` : ""}`);
+	const draft = hit.draft;
+	const secret = draft.type === "login" ? draft.password : (draft.data?.[ITEM_TYPES[draft.type].primary ?? ""] ?? "");
 
 	const asValue = (via: string): ToolOutcome => ({
 		content: [
 			{
 				type: "text" as const,
-				text: JSON.stringify(
-					{ name: hit.name, username: hit.username || undefined, password: hit.password, uris: hit.uris, via },
-					null,
-					1,
-				),
+				text: JSON.stringify({ ...draft, password: secret ?? draft.password, via }, null, 1),
 			},
 		],
-		details: { item: hit.name, via },
+		details: { item: draft.name, via },
 	});
 
 	const importIt = async (): Promise<ToolOutcome> => {
 		try {
 			const saved = await cli.json<SaveResult>(["save", "--yes", ...tokenArgs(scope)], {
-				stdin: JSON.stringify([
-					{
-						name: hit.name,
-						username: hit.username || undefined,
-						password: hit.password,
-						uris: hit.uris,
-						source: { kind: "bitwarden", id: hit.id },
-					},
-				]),
+				stdin: JSON.stringify([draft]),
 				signal,
 			});
 			scope.items += saved.count;
 			setStatus(ctx, scope);
 		} catch (error) {
-			return fail(`found "${hit.name}" in Bitwarden but could not import it: ${describe(error)}`);
+			return fail(`found "${draft.name}" in Bitwarden but could not import it: ${describe(error)}`);
 		}
 		return asValue("imported-from-bitwarden");
 	};
@@ -356,20 +348,25 @@ async function bitwardenFallback(
 		return importIt();
 	}
 
-	const label = `${hit.name}${hit.username ? `  user:${hit.username}` : ""}`;
 	const allow = await confirmWindow(
 		dialogs(ctx),
 		tr("pi-ai-vault · found in Bitwarden", "pi-ai-vault · Bitwarden 里找到"),
-		tr(`Not in the local store as "${forDialog(name)}」，Bitwarden 里yes：\n${forDialog(label)}\n\n读取这一次吗？`, `本地库没有「${forDialog(name)}」，Bitwarden 里有：\n${forDialog(label)}\n\n读取这一次吗？`),
+		tr(
+			`Not in the local store as "${forDialog(name)}", but Bitwarden has:\n${forDialog(hit.label)}\n\nRead it this once?`,
+			`本地库没有「${forDialog(name)}」，Bitwarden 里有：\n${forDialog(hit.label)}\n\n读取这一次吗？`,
+		),
 		signal,
 	);
-	if (!allow) return fail(`user denied reading "${hit.name}" from Bitwarden — do not retry`, true);
+	if (!allow) return fail(`user denied reading "${draft.name}" from Bitwarden — do not retry`, true);
 	if (policy === "never") return asValue("bitwarden-once");
 
 	const confirmed = await confirmWindow(
 		dialogs(ctx),
 		tr("pi-ai-vault · import into ai-vault", "pi-ai-vault · 导入到 ai-vault"),
-		tr(`Write "${forDialog(hit.name)}」写进 ai-vault 吗？\n\nAllow → read from the local store from now on (no password under the current unlock policy)\nDeny → use it once only; nothing is written to the local store`, `把「${forDialog(hit.name)}」写进 ai-vault 吗？\n\n允许 → 以后直接读本地库（按当前解锁模式，可能免密）\n拒绝 → 只用这一次，不写入本地库`),
+		tr(
+			`Write "${forDialog(draft.name)}" into ai-vault?\n\nAllow → read from the local store from now on (no password under the current unlock policy)\nDeny → use it once only; nothing is written to the local store`,
+			`把「${forDialog(draft.name)}」写进 ai-vault 吗？\n\n允许 → 以后直接读本地库（按当前解锁模式，可能免密）\n拒绝 → 只用这一次，不写入本地库`,
+		),
 		signal,
 	);
 	return confirmed ? importIt() : asValue("bitwarden-once");
@@ -446,26 +443,62 @@ function vaultGetTool(scope: Scope, bw: BwState): ToolDefinition<typeof vaultGet
 
 const vaultAddParams = Type.Object({
 	name: Type.String({ description: "Entry name to create or update, e.g. 'github'" }),
-	username: Type.Optional(Type.String({ description: "Account username. Omit to let the user type it in a dialog." })),
-	uri: Type.Optional(Type.String({ description: "Optional site or host URI" })),
-	notes: Type.Optional(Type.String({ description: "Optional non-secret note. Do NOT put the password here." })),
+	type: Type.Optional(
+		Type.String({
+			description:
+				"Item type, as in Bitwarden: login (default), note, card, identity, sshkey, bankaccount, driverslicense, passport. " +
+				"A note's content goes in `notes`.",
+		}),
+	),
+	username: Type.Optional(Type.String({ description: "Login: account username. Omit to let the user type it in a dialog." })),
+	uri: Type.Optional(Type.String({ description: "Login: site or host URI" })),
+	notes: Type.Optional(Type.String({ description: "Notes shared by every type. For a `note` entry this is its content." })),
+	fields: Type.Optional(
+		Type.Record(
+			Type.String(),
+			Type.Optional(Type.String()),
+			{
+				description:
+					"The type's own fields by Bitwarden's names (card: cardholderName, brand, number, expMonth, expYear, code; " +
+					"sshkey: publicKey, privateKey, keyFingerprint; identity: firstName, lastName, email, …). " +
+					"Give a non-secret field as text; give a secret field (password, code, number, privateKey, pin, ssn…) " +
+					"as null/undefined so the user types it in a dialog. NEVER put a secret value here.",
+			},
+		),
+	),
 });
 function vaultAddTool(scope: Scope): ToolDefinition<typeof vaultAddParams, { ok?: boolean; item?: string }> {
 	const tool: ToolDefinition<typeof vaultAddParams, { ok?: boolean; item?: string }> = {
 		name: "vault_add",
 		label: "Vault: store a secret via dialog",
 		description:
-			"Create or update an entry in the machine-wide ai-vault store. You supply the name and optional username, URI, and notes. " +
-			"The password is typed by the user in a desktop window and is NEVER accepted from you and NEVER returned. " +
-			"Do not ask the user to paste a password into the chat.",
+			"Create or update an entry of any Bitwarden type in the machine-wide ai-vault store (login, note, card, identity, sshkey, " +
+			"bankaccount, driverslicense, passport). You supply the name, the type and its non-secret fields. " +
+			"Secret fields (password, card number and code, private key, PIN, SSN…) are typed by the user in a desktop window: " +
+			"leave them empty, they are NEVER accepted from you and NEVER returned. Do not ask the user to paste a secret into the chat.",
 		promptSnippet: "Save a local vault entry; the user types the password in a window.",
 		parameters: vaultAddParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
+			const kind = parseItemType(params.type);
+			if (!kind) {
+				return fail(`unknown type "${params.type}" — login, note, card, identity, sshkey, bankaccount, driverslicense, passport`);
+			}
+			// A secret field the model filled in is refused rather than stored:
+			// only the user types secrets, in a dialog.
+			const fields: Record<string, string | undefined> = {};
+			for (const [field, value] of Object.entries(params.fields ?? {})) {
+				if (value !== undefined && value !== "" && isSecretField(kind, field)) {
+					return fail(`"${field}" is a secret field: leave it empty so the user types it in a dialog`);
+				}
+				fields[field] = value === "" ? undefined : value;
+			}
 			const result = await saveLocalEntry(scope, ctx, {
 				name: params.name,
+				type: kind,
 				username: params.username,
 				uri: params.uri,
 				notes: params.notes,
+				fields,
 				signal,
 			});
 			const ok = result.startsWith("saved ");
@@ -508,9 +541,12 @@ function vaultImportTool(scope: Scope, bw: BwState): ToolDefinition<typeof vault
 
 interface SaveRequest {
 	name?: string;
+	type?: ItemType;
 	username?: string;
 	uri?: string;
 	notes?: string;
+	/** The type's own fields, NAME=VALUE; a value of `undefined` means "typed in a dialog". */
+	fields?: Record<string, string | undefined>;
 	signal?: AbortSignal;
 }
 
@@ -524,18 +560,33 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 	}
 	if (!name) return "cancelled: no entry name";
 
-	const args = ["add", "--name", name, "--token", scope.token!];
+	const kind = req.type ?? "login";
+	const args = ["add", "--name", name, "--type", kind, "--token", scope.token!];
 	if (req.username !== undefined) args.push("--username", req.username);
 	if (req.uri?.trim()) args.push("--uri", req.uri.trim());
 	if (req.notes?.trim()) args.push("--notes", req.notes.trim());
-	let stdin: string | undefined;
-	for (let attempt = 0; attempt < 5; attempt++) {
+	const secrets = new Map<string, string>();
+	const shown: string[] = [];
+	for (const [field, value] of Object.entries(req.fields ?? {})) {
+		if (value === undefined) shown.push(`${field} ••••`);
+		else {
+			args.push("--field", `${field}=${value}`);
+			shown.push(`${field} ${isSecretField(kind, field) ? "••••" : forDialog(value, 120)}`);
+		}
+	}
+	const flush = () => {
+		// --secret args are re-added on every attempt: the CLI is stateless.
+		for (let i = args.length - 1; i >= 0; i--) if (args[i] === "--secret") args.splice(i, 2);
+		for (const [field, value] of secrets) args.push("--secret", `${field}=${value}`);
+	};
+	for (let attempt = 0; attempt < 8; attempt++) {
+		flush();
 		try {
-			const run = await cli.run([...args, "--json"], { stdin, signal: req.signal });
-			const saved = JSON.parse(run.stdout) as { item?: string; created?: boolean };
+			const run = await cli.run([...args, "--json"], { signal: req.signal });
+			const saved = JSON.parse(run.stdout) as { item?: string; created?: boolean; type?: string };
 			if (saved.created) scope.items += 1;
 			setStatus(ctx, scope);
-			return `saved "${saved.item ?? name}" (password entered in the dialog, not shown)`;
+			return `saved "${saved.item ?? name}" as a ${saved.type ?? kind} (hidden fields entered in dialogs, not shown)`;
 		} catch (error) {
 			if (!(error instanceof CliError) || !error.needsUi) {
 				if (error instanceof CliError && error.auth) scope.token = undefined;
@@ -543,6 +594,7 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 			}
 			if (error.needsUi === "confirm") {
 				const meta = [
+					...shown,
 					req.username?.trim() ? tr(`Username: ${forDialog(req.username, 60)}`, `用户名: ${forDialog(req.username, 60)}`) : "",
 					req.uri?.trim() ? `URI: ${forDialog(req.uri, 120)}` : "",
 					req.notes?.trim() ? tr(`Notes: ${forDialog(req.notes, 120)}`, `备注: ${forDialog(req.notes, 120)}`) : "",
@@ -552,7 +604,10 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 				const ok = await confirmWindow(
 					dialogs(ctx),
 					tr("ai-vault · save to local store", "ai-vault · 保存到本地库"),
-					tr(`Save the entry "${forDialog(name)}".${meta ? `\n${meta}` : ""}\nA window opens next for you to type the password. It never enters the conversation.`, `保存条目「${forDialog(name)}」。${meta ? `\n${meta}` : ""}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`),
+					tr(
+						`Save the ${kind} entry "${forDialog(name)}".${meta ? `\n${meta}` : ""}\nA window opens next for each hidden field. Nothing enters the conversation.`,
+						`保存${kind}条目「${forDialog(name)}」。${meta ? `\n${meta}` : ""}\n接下来每个隐藏字段弹一个窗口。密码不会进入对话。`,
+					),
 					req.signal,
 				);
 				if (!ok) return `user denied saving "${name}"`;
@@ -565,10 +620,11 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 				args.push("--username", entered);
 				continue;
 			}
-			const password = await promptSecret(dialogs(ctx), tr("ai-vault · password", "ai-vault · 密码"), name, req.signal);
+			// needsUi === "password": one hidden field at a time, named by the CLI.
+			const field = error.field ?? ITEM_TYPES[kind].primary ?? "password";
+			const password = await promptSecret(dialogs(ctx), tr("ai-vault · password", "ai-vault · 密码"), `${name} · ${field}`, req.signal);
 			if (!password) return "cancelled: no password entered";
-			args.push("--password-stdin");
-			stdin = `${password}\n`;
+			secrets.set(field, password);
 		}
 	}
 	return "cancelled: the save dialog did not settle";
@@ -605,12 +661,12 @@ async function importBitwarden(
 	if (!allowed) return { text: "user denied the Bitwarden import", ok: false, count: 0 };
 	let drafts;
 	try {
-		drafts = await pullBitwardenLogins(bw, ctx, search, signal);
+		drafts = await pullBitwardenItems(bw, ctx, search, signal);
 	} catch (error) {
 		return { text: `Bitwarden: ${describe(error)}`, ok: false, count: 0 };
 	}
 	if (drafts.length === 0) {
-		return { text: "matched items have no login password; nothing imported", ok: false, count: 0 };
+		return { text: "nothing matched; nothing imported", ok: false, count: 0 };
 	}
 	try {
 		const saved = await cli.json<SaveResult>(["save", "--yes", "--token", scope.token!], {
@@ -891,7 +947,30 @@ function commandHandler(scope: Scope, bw: BwState) {
 				return;
 			}
 			case "add": {
-				const text = await saveLocalEntry(scope, ctx, { name: rest.join(" ") || undefined });
+				// /vault add [type:]name [field=value ...] [field] — a bare
+				// `field` is typed in a dialog. /vault add card:Visa brand=Visa code
+				const [first, ...pairs] = rest;
+				let type: ItemType | undefined;
+				let name = first ?? "";
+				const m = /^([a-z]+):(.+)$/.exec(first ?? "");
+				if (m) {
+					const parsed = parseItemType(m[1]);
+					if (parsed) {
+						type = parsed;
+						name = m[2] ?? name;
+					}
+				}
+				const fields: Record<string, string | undefined> = {};
+				let notes: string | undefined;
+				for (const pair of pairs) {
+					const eq = pair.indexOf("=");
+					const key = eq < 0 ? pair : pair.slice(0, eq);
+					const value = eq < 0 ? "" : pair.slice(eq + 1);
+					if (!key) continue;
+					if (key === "notes" || key === "note") notes = value;
+					else fields[key] = value === "" ? undefined : value;
+				}
+				const text = await saveLocalEntry(scope, ctx, { name: name.trim() || undefined, type, fields, notes });
 				note(ctx, text, text.startsWith("saved ") ? "info" : "warning");
 				return;
 			}

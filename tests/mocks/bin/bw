@@ -30,11 +30,15 @@ case "$args" in
 		fi ;;
 	"sync --nointeraction") exit 0 ;;
 	"list items --nointeraction")
-		echo '[{"id":"aaaa1111-1111-4111-8111-111111111111","name":"TestService","login":{"username":"alice","password":"supersecret-value-123","totp":null,"uris":[{"uri":"https://test.example.com"}]},"notes":"note-secret-abc","fields":[{"name":"API_KEY","value":"hf_sk-abc987xyz456","type":1}]},{"id":"bbbb2222-2222-4222-8222-222222222222","name":"OtherService","login":{"username":"bob","password":"other-pw-999","uris":[]},"fields":[]}]' ;;
+		echo '[{"id":"aaaa1111-1111-4111-8111-111111111111","name":"TestService","login":{"username":"alice","password":"supersecret-value-123","totp":null,"uris":[{"uri":"https://test.example.com"}]},"notes":"note-secret-abc","fields":[{"name":"API_KEY","value":"hf_sk-abc987xyz456","type":1}]},{"id":"bbbb2222-2222-4222-8222-222222222222","name":"OtherService","login":{"username":"bob","password":"other-pw-999","uris":[]},"fields":[]},{"id":"cccc3333-3333-4333-8333-333333333333","type":3,"name":"CorpCard","card":{"cardholderName":"Li Jun","brand":"Visa","number":"4111111111111111","expMonth":"12","expYear":"2029","code":"123"}},{"id":"dddd4444-4444-4444-8444-444444444444","type":2,"name":"WifiNote","secureNote":{},"notes":"guest network: hunter2"}]' ;;
 	"get item aaaa1111-1111-4111-8111-111111111111 --nointeraction")
 		echo '{"id":"aaaa1111-1111-4111-8111-111111111111","name":"TestService","login":{"username":"alice","password":"supersecret-value-123","uris":[]},"fields":[{"name":"API_KEY","value":"hf_sk-abc987xyz456","type":1}]}' ;;
 	"get item bbbb2222-2222-4222-8222-222222222222 --nointeraction")
 		echo '{"id":"bbbb2222-2222-4222-8222-222222222222","name":"OtherService","login":{"username":"bob","password":"other-pw-999","uris":[]},"fields":[]}' ;;
+	"get item cccc3333-3333-4333-8333-333333333333 --nointeraction")
+		echo '{"id":"cccc3333-3333-4333-8333-333333333333","type":3,"name":"CorpCard","card":{"cardholderName":"Li Jun","brand":"Visa","number":"4111111111111111","expMonth":"12","expYear":"2029","code":"123"}}' ;;
+	"get item dddd4444-4444-4444-8444-444444444444 --nointeraction")
+		echo '{"id":"dddd4444-4444-4444-8444-444444444444","type":2,"name":"WifiNote","secureNote":{},"notes":"guest network: hunter2"}' ;;
 	"lock --nointeraction") touch "$MOCK_DIR/locked"; exit 0 ;;
 	"get item "*" --nointeraction") echo "Not found." >&2; exit 1 ;;
 	*) echo "mock bw: unhandled: $args" >&2; exit 1 ;;

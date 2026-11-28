@@ -31,7 +31,7 @@ Do not install `pi-bitwarden` or `omp-vault` as well: they register the same `bw
 |---|---|---|
 | `vault_list` | local store metadata | no |
 | `vault_get` | read one: local store first, then Bitwarden; a Bitwarden hit follows `bitwarden.import` (ask / import / read once) | yes, user-approved on the spot |
-| `vault_add` | store one; the password is typed in a dialog | no |
+| `vault_add` | store one, any Bitwarden type (login, note, card, identity, sshkey, bankaccount, driverslicense, passport); secret fields are typed in a dialog | no |
 | `vault_import` | copy Bitwarden logins into the local store (asks first) | no |
 | `bw_list` / `bw_run` / `bw_clipboard` / `bw_reveal` | live Bitwarden through the `bw` CLI | no (`bw_reveal` excepted) |
 | `bw_inject` | inject into the bash env (**pi only**; omp does not register it) | no |

@@ -52,7 +52,8 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { bitwardenLogins, filterLogins, type LoginDraft } from "./import-map.js";
+import { bitwardenItems, filterItems } from "./import-map.js";
+import type { Draft } from "./types.js";
 import { onSessionLeave, sessionLabel, withTier } from "./host.js";
 import { confirmWindow, hasDisplay, promptSecret } from "./prompt.js";
 import { getSettingsSafe, settingsCli } from "./settings.js";
@@ -152,12 +153,16 @@ const BW_LOGIN_HINT =
 type BwItem = {
 	id?: string;
 	name?: string;
+	type?: number;
 	notes?: string;
 	login?: { username?: string; password?: string; totp?: string; uris?: { uri?: string }[] };
-	fields?: { name?: string; value?: string }[];
+	card?: { cardholderName?: string; brand?: string; number?: string; code?: string };
+	identity?: { title?: string; firstName?: string; lastName?: string; email?: string; phone?: string };
+	sshKey?: { publicKey?: string; keyFingerprint?: string };
+	fields?: { name?: string; value?: string; type?: number }[];
 };
 /** Only metadata is cached; secrets stay in the vault process until needed. */
-type LiteItem = { id: string; name: string; username: string; uri: string };
+type LiteItem = { id: string; name: string; username: string; uri: string; type: string };
 type InjectedSecret = { value: string; item: string; field: string; at: number };
 
 /**
@@ -624,12 +629,23 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 	return pending;
 }
 
+const BW_TYPE_NAMES: Record<number, string> = { 1: "login", 2: "note", 3: "card", 4: "identity", 5: "sshKey", 6: "bankAccount", 7: "driversLicense", 8: "passport" };
+
 function toLite(raw: BwItem): LiteItem {
+	const type = BW_TYPE_NAMES[raw.type ?? 1] ?? `type-${raw.type}`;
+	// The identifying, non-secret line of each type: username for a login,
+	// cardholder for a card, a person's name for an identity, and so on.
+	const who =
+		raw.login?.username ??
+		raw.card?.cardholderName ??
+		(raw.identity ? [raw.identity.title, raw.identity.firstName, raw.identity.lastName].filter(Boolean).join(" ") : "") ??
+		"";
 	return {
 		id: raw.id ?? "",
 		name: raw.name ?? "",
-		username: raw.login?.username ?? "",
+		username: who,
 		uri: raw.login?.uris?.[0]?.uri ?? "",
+		type,
 	};
 }
 
@@ -796,34 +812,35 @@ export async function queryBitwarden(
 }
 
 /**
- * Login items that have a password, ready to store in the local vault.
- * Call only after the user has agreed to the import — this reads secrets.
+ * Every item that matches `search`, ready to store in the local vault: all
+ * types, field for field. Call only after the user has agreed to the import —
+ * this reads secrets.
  */
-export async function pullBitwardenLogins(
+export async function pullBitwardenItems(
 	st: BwState,
 	ctx: ExtensionContext | undefined,
 	search: string | undefined,
 	signal?: AbortSignal,
-): Promise<LoginDraft[]> {
+): Promise<Draft[]> {
 	const session = await ensureUnlocked(st, ctx, signal);
 	const raw: unknown = await runBwJson(["list", "items"], session, signal);
-	return filterLogins(bitwardenLogins(raw), search);
+	return filterItems(bitwardenItems(raw), search);
 }
 
-export type BitwardenLoginHit = { id: string; name: string; username: string; password: string; uris: string[] };
+export type BitwardenHit = { draft: Draft; label: string };
 
 /**
- * Look one login up by name/URI and return its password, with no window of its
- * own: the caller shows the user what was found and asks whether to read it.
- * `undefined` means "no such item"; an ambiguous reference throws with the
- * candidates so the model can pick one.
+ * Look one item up, of any type, and return it as a draft with its secrets,
+ * with no window of its own: the caller shows the user what was found and asks
+ * whether to read it. `undefined` means "no such item"; an ambiguous reference
+ * throws with the candidates so the model can pick one.
  */
-export async function lookupBitwardenLogin(
+export async function lookupBitwardenItem(
 	st: BwState,
 	ctx: ExtensionContext | undefined,
 	ref: string,
 	signal?: AbortSignal,
-): Promise<BitwardenLoginHit | undefined> {
+): Promise<BitwardenHit | undefined> {
 	const session = await ensureUnlocked(st, ctx, signal);
 	let item: LiteItem;
 	try {
@@ -832,14 +849,12 @@ export async function lookupBitwardenLogin(
 		if (e instanceof Error && /^No Bitwarden item matches/.test(e.message)) return undefined;
 		throw e;
 	}
-	const secret = await secretOf(session, item, "password", signal);
-	return {
-		id: item.id ?? "",
-		name: item.name || "unnamed",
-		username: item.username,
-		password: secret.value,
-		uris: item.uri ? [item.uri] : [],
-	};
+	if (!item.id) throw new Error(`Bitwarden item "${item.name}" has no id, so it cannot be read.`);
+	const full = (await runBwJson(["get", "item", item.id], session, signal)) as unknown;
+	const [draft] = bitwardenItems([full]);
+	if (!draft) return undefined;
+	const who = item.username ? `  ${item.username}` : "";
+	return { draft, label: `${draft.name}${who}  (${item.type})` };
 }
 
 function normalizeEnvName(raw: string): string {

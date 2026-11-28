@@ -138,7 +138,7 @@ ai-vault [--dir DIR] [--json] <命令>
 | `lock --token T \| --all` | 丢掉令牌（`--all` 清空本机所有会话） |
 | `list --token T` | 条目元数据（名称/用户名/URI），没有密码 |
 | `get <名字> [--reason R] [--answer-stdin]` | 读一条；没有授权时先弹确认窗 |
-| `add --name N [--username U] [--uri U] [--notes N] [--password-stdin] [--yes]` | 新增/更新；密码由弹窗输入 |
+| `add --name N [--type TYPE] [--field NAME[=VALUE]]… [--secret NAME=VALUE]… [--username U] [--uri U] [--notes N] [--password-stdin] [--yes]` | 新增/更新任意类型；没给的隐藏字段弹窗输（`--secret` 给已经问过用户的宿主用） |
 | `save --yes [--file F]` | 从 stdin 读一组条目 JSON，批量写入（导入用） |
 | `remove <名字> [--yes]` | 删除（带空格的名称加引号） |
 | `grant <名字> [--minutes N]` / `revoke <名字\|--all>` | 手动给/撤读授权（默认 5 分钟，上限 60）；`grant` 要主密码 |
@@ -176,9 +176,9 @@ ai-vault get <条目> --token <T> --answer-stdin --approval <hex> <<< 'y'
 | 工具 | 作用 | 等级 | 模型看到密码？ |
 |---|---|---|---|
 | `vault_list` | 本地库元数据 | read | 否 |
-| `vault_get` | 读一条：**先本地库，再 Bitwarden**；命中后按 `bitwarden.import` 处理（问 / 直接导入 / 只读一次） | exec | 是，用户当场允许 |
-| `vault_add` | 存一条；密码在弹窗里输入 | write | 否 |
-| `vault_import` | 把 Bitwarden 登录项抄进本地库（先确认） | write | 否 |
+| `vault_get` | 读一条，任意类型：**先本地库，再 Bitwarden**；命中后按 `bitwarden.import` 处理 | exec | 是，用户当场允许 |
+| `vault_add` | 存一条，任意类型；秘密字段在弹窗里输 | write | 否 |
+| `vault_import` | 把 Bitwarden 每种类型的条目按字段抄进本地库（先确认） | write | 否 |
 | `bw_list` | 查在线 Bitwarden 元数据 | read | 否 |
 | `bw_run` | 用 `$VAULT_SECRET` 跑一条命令，输出擦洗 | exec | 否 |
 | `bw_inject` | 注入 bash 环境（**仅 pi**） | exec | 否 |
@@ -190,6 +190,34 @@ ai-vault get <条目> --token <T> --answer-stdin --approval <hex> <<< 'y'
 Ente 的会话由 `ente` 自己管（登录一次）；`ente.unlock` 只决定那把 `ENTE_CLI_VAULT_KEY` 要不要由 ai-vault 加密封存。
 
 字段选择：`password`（默认）· `totp`（种子）· `code`（动态验证码）· `notes` · `field:<自定义字段名>`。
+
+### 条目类型
+
+ai-vault 存的和 Bitwarden 一样的条目类型、一样的字段名，所以导入就是复制，手动录入也是同一个形状：
+
+| 类型 | `--type` | 自己的字段（`data`） | 秘密字段 |
+|---|---|---|---|
+| 登录 | `login`（默认） | `username`、`password`、`totp` + `uris` | `password` |
+| 安全笔记 | `note` | 没有——内容就是 `notes` | — |
+| 银行卡 | `card` | `cardholderName`、`brand`、`number`、`expMonth`、`expYear`、`code` | `number`、`code` |
+| 身份 | `identity` | `title`、`firstName`、`middleName`、`lastName`、`address1–3`、`city`、`state`、`postalCode`、`country`、`company`、`email`、`phone`、`ssn`、`username`、`passportNumber`、`licenseNumber` | `ssn`、证件号 |
+| SSH 密钥 | `sshkey` | `privateKey`、`publicKey`、`keyFingerprint` | `privateKey` |
+| 银行账户 | `bankaccount` | `bankName`、`nameOnAccount`、`accountType`、`accountNumber`、`routingNumber`、`branchNumber`、`pin`、`swiftCode`、`iban`、`bankContactPhone` | `accountNumber`、`routingNumber`、`pin` |
+| 驾照 | `driverslicense` | `firstName`、`middleName`、`lastName`、`dateOfBirth`、`licenseNumber`、`issuingCountry`、`issuingState`、`issueDate`、`expirationDate`、`issuingAuthority`、`licenseClass` | `licenseNumber` |
+| 护照 | `passport` | `surname`、`givenName`、`dateOfBirth`、`sex`、`birthPlace`、`nationality`、`issuingCountry`、`passportNumber`、`passportType`、`nationalIdentificationNumber`、`issuingAuthority`、`issueDate`、`expirationDate` | `passportNumber`、`nationalIdentificationNumber` |
+
+后三种在 Bitwarden 的「新条目类型」开关后面，CLI 一视同仁地存。每种类型都还带 `notes` 和自定义 `fields[]`（`type`：0 文本 · 1 隐藏 · 2 布尔 · 3 链接，和 Bitwarden 一致）。隐藏的自定义字段在所有地方都按秘密处理。
+
+```bash
+# 手动录入：非秘密字段写在命令行，秘密在弹窗里输
+ai-vault add --name Visa --type card --field cardholderName="李军" --field brand=Visa --field expYear=2029
+ai-vault add --name Wifi --type note --notes "访客网络：…"
+ai-vault add --name server --type sshkey --field publicKey="ssh-ed25519 AAAA"   # 私钥弹窗输
+```
+
+`list` 显示类型和非秘密字段（持卡人、品牌、有效期、人名、密钥指纹……）；绝不显示密码、卡号和 CVV、私钥、PIN、账号和证件号、隐藏的自定义字段、TOTP 种子、安全笔记的正文。`get` 返回整条。
+
+`vault_add` 工具同样接受 `type` 和 `fields`。模型自己填秘密字段会被拒绝：那些由用户在弹窗里输，一个字段一个窗口。
 
 ### 查询顺序：本地优先，Bitwarden 兜底
 
@@ -253,6 +281,7 @@ ai-vault settings bitwarden.hours 24
 
 ```
 /vault init                        创建本地库（弹窗设主密码）
+/vault add card:Visa brand=Visa code   类型:名称，字段写在行里，只写字段名的弹窗输
 /vault unlock | lock               解锁 / 锁定本会话
 /vault mode [never|time|session]   查看/切换解锁模式（切换要主密码）
 /vault settings [键 值]            查看/修改设置（bitwarden.* 也在这里）
