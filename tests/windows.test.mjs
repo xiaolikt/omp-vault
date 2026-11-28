@@ -384,7 +384,7 @@ test("Windows: the password window answers in UTF-8, whatever the console's code
 		"if ($box.ForeColor -ne $box.BackColor) { throw 'the typed text is visible' }",
 		`$box.Text = '${value}'`,
 		"if ($mask.Text -notmatch '●') { throw 'no bullets are drawn over the field' }",
-		"if ($field.Controls.GetChildIndex($mask) -ge $field.Controls.GetChildIndex($box)) { throw 'the bullets are behind the text box: Controls.Add puts a control at the back' }",
+		"if ($mask.Parent.Controls.GetChildIndex($mask) -ge $mask.Parent.Controls.GetChildIndex($box)) { throw 'the bullets are behind the text box: Controls.Add puts a control at the back' }",
 		"$f.DialogResult = 'OK'",
 	].join("; ");
 	const r = showWindow(passwordWindow(kept));

@@ -179,11 +179,11 @@ mod win {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    // WinForms from PowerShell: no extra dependency, and the windows can be
-    // laid out to match the display. Exit 0 = OK (value on stdout), 1 = cancel,
+    // WinForms from PowerShell: no extra dependency, and the windows can follow
+    // the display and the theme. Exit 0 = OK (value on stdout), 1 = cancel,
     // 2 = no window.
     //
-    // Three things matter on a real Windows desktop:
+    // Four things matter on a real Windows desktop:
     //   * `[Console]::Out.Write` encodes with the console's code page (936 on a
     //     Chinese Windows), so a password typed in Chinese arrived as mojibake
     //     and keyed a store no other machine could open. The value leaves as
@@ -195,24 +195,58 @@ mod win {
     //   * Windows turns the IME off in a password edit control (so that a
     //     candidate window cannot show what is typed), and a Chinese password
     //     could not be entered at all. The field is an ordinary text box whose
-    //     text is hidden by colour; a bullet per character shows underneath.
+    //     text is hidden by colour; a bullet per character is drawn over it.
+    //   * `Controls.Add` puts a control at the back, and the label with the
+    //     bullets sat under the box: what was typed looked like nothing. It is
+    //     brought to the front. (DrawToBitmap paints the other way round, so
+    //     only a capture from the screen showed it.)
     const PRELUDE: &str = r#"
 $ErrorActionPreference = 'Stop'
 try {
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
 
-    # Crisp text on a scaled display: a process that is not DPI-aware is
-    # stretched as a bitmap by the system. Once this one is, a point laid out
-    # for 96 DPI is AppliedDPI / 96 pixels here, which is what Px() scales.
+    # The window follows the display and the theme, the way a zenity window
+    # follows the GTK theme: DPI-aware when the display is scaled, a dark
+    # palette and a dark title bar when the user's apps are dark, and the
+    # user's accent colour on the one positive button.
     $scale = 1.0
+    $dark = $false
+    $accent = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    $native = $false
+    try {
+        Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class AiVaultWin { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr h, int a, ref int v, int s); }'
+        $native = $true
+    } catch { }
     try {
         $dpi = [int](Get-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name AppliedDPI -ErrorAction Stop).AppliedDPI
-        if ($dpi -gt 96) {
-            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class AiVaultDpi { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }'
-            if ([AiVaultDpi]::SetProcessDPIAware()) { $scale = $dpi / 96.0 }
-        }
+        if ($dpi -gt 96 -and $native -and [AiVaultWin]::SetProcessDPIAware()) { $scale = $dpi / 96.0 }
     } catch { }
+    try {
+        $dark = [int](Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name AppsUseLightTheme -ErrorAction Stop).AppsUseLightTheme -eq 0
+    } catch { }
+    try {
+        $palette = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent' -Name AccentPalette -ErrorAction Stop).AccentPalette
+        if ($palette -and $palette.Length -ge 4) { $accent = [System.Drawing.Color]::FromArgb($palette[2], $palette[1], $palette[0]) }
+    } catch { }
+    $accentHover = [System.Drawing.Color]::FromArgb([Math]::Min(255, $accent.R + 24), [Math]::Min(255, $accent.G + 24), [Math]::Min(255, $accent.B + 24))
+    $onAccent = if ((0.299 * $accent.R + 0.587 * $accent.G + 0.114 * $accent.B) -gt 150) { [System.Drawing.Color]::Black } else { [System.Drawing.Color]::White }
+    if ($dark) {
+        $paper = [System.Drawing.Color]::FromArgb(32, 32, 32)
+        $card = [System.Drawing.Color]::FromArgb(43, 43, 43)
+        $hover = [System.Drawing.Color]::FromArgb(54, 54, 54)
+        $line = [System.Drawing.Color]::FromArgb(66, 66, 66)
+        $ink = [System.Drawing.Color]::FromArgb(255, 255, 255)
+        $muted = [System.Drawing.Color]::FromArgb(170, 170, 170)
+    } else {
+        $paper = [System.Drawing.Color]::FromArgb(243, 243, 243)
+        $card = [System.Drawing.Color]::FromArgb(255, 255, 255)
+        $hover = [System.Drawing.Color]::FromArgb(234, 234, 234)
+        $line = [System.Drawing.Color]::FromArgb(173, 173, 173)
+        $ink = [System.Drawing.Color]::FromArgb(26, 26, 26)
+        $muted = [System.Drawing.Color]::FromArgb(96, 96, 96)
+    }
+
     function Px([double]$v) { [int][Math]::Round($v * $scale) }
 
     # One typeface for Latin and Chinese where there is one; the system's otherwise.
@@ -225,13 +259,16 @@ try {
         [System.Drawing.Font]::new($ui, [single]$size, $style, [System.Drawing.GraphicsUnit]::Point)
     }
 
-    $ink = [System.Drawing.Color]::FromArgb(26, 26, 26)
-    $muted = [System.Drawing.Color]::FromArgb(96, 96, 96)
-    $accent = [System.Drawing.Color]::FromArgb(0, 99, 192)
-    $accentHover = [System.Drawing.Color]::FromArgb(23, 118, 210)
-    $paper = [System.Drawing.Color]::FromArgb(249, 249, 249)
-    $line = [System.Drawing.Color]::FromArgb(209, 209, 209)
-    $white = [System.Drawing.Color]::White
+    # A control's shape with round corners. Call it once the control has its size.
+    function Round-Corners($control, [int]$radius) {
+        $w = $control.Width; $h = $control.Height; $d = [Math]::Min($radius * 2, [Math]::Min($w, $h))
+        if ($d -lt 2) { return }
+        $path = [System.Drawing.Drawing2D.GraphicsPath]::new()
+        $path.AddArc(0, 0, $d, $d, 180, 90); $path.AddArc($w - $d, 0, $d, $d, 270, 90)
+        $path.AddArc($w - $d, $h - $d, $d, $d, 0, 90); $path.AddArc(0, $h - $d, $d, $d, 90, 90)
+        $path.CloseFigure()
+        $control.Region = [System.Drawing.Region]::new($path)
+    }
 
     function New-Window([string]$title) {
         $w = [System.Windows.Forms.Form]::new()
@@ -239,124 +276,155 @@ try {
         $w.FormBorderStyle = 'FixedDialog'; $w.MaximizeBox = $false; $w.MinimizeBox = $false
         $w.AutoScaleMode = 'None'
         $w.StartPosition = 'CenterScreen'; $w.TopMost = $true
-        $w.BackColor = $paper
+        $w.BackColor = $paper; $w.Font = New-Font 10
         $w.Icon = [System.Drawing.Icon]::new([System.Drawing.SystemIcons]::Shield, (Px 16), (Px 16))
-        $w.ClientSize = [System.Drawing.Size]::new((Px 480), 0)
+        $w.ClientSize = [System.Drawing.Size]::new((Px 460), 0)
+        if ($dark -and $native) {
+            $on = 1   # DWMWA_USE_IMMERSIVE_DARK_MODE: the title bar follows the theme
+            [void][AiVaultWin]::DwmSetWindowAttribute($w.Handle, 20, [ref]$on, 4)
+        }
         return $w
     }
 
-    # The shield, the title in bold, and the line under it when there is one.
-    function Add-Heading($w, [string]$text) {
-        $icon = [System.Windows.Forms.PictureBox]::new()
-        $icon.Image = [System.Drawing.Icon]::new([System.Drawing.SystemIcons]::Shield, (Px 32), (Px 32)).ToBitmap()
-        $icon.SizeMode = 'CenterImage'
-        $icon.Bounds = [System.Drawing.Rectangle]::new((Px 20), (Px 18), (Px 32), (Px 32))
-        $head = [System.Windows.Forms.Label]::new()
-        $head.Text = $w.Text; $head.Font = New-Font 12 ([System.Drawing.FontStyle]::Bold); $head.ForeColor = $ink
-        $head.Bounds = [System.Drawing.Rectangle]::new((Px 62), (Px 18), (Px 398), (Px 28))
-        $w.Controls.Add($icon); $w.Controls.Add($head)
-        if ($text) {
-            $lbl = [System.Windows.Forms.Label]::new()
-            $lbl.Text = $text; $lbl.Font = New-Font 10; $lbl.ForeColor = $muted
-            $lbl.Bounds = [System.Drawing.Rectangle]::new((Px 62), (Px 50), (Px 398), (Px 40))
-            $w.Controls.Add($lbl)
-        }
+    # A label that wraps, as tall as its text needs.
+    function Add-Text($w, [string]$text, [int]$top) {
+        $lbl = [System.Windows.Forms.Label]::new()
+        $lbl.Text = $text; $lbl.Font = New-Font 10.5; $lbl.ForeColor = $ink
+        $lbl.Left = Px 24; $lbl.Top = $top; $lbl.Width = (Px 460) - (Px 48)
+        $g = $lbl.CreateGraphics()
+        $lbl.Height = [int]($g.MeasureString($text, $lbl.Font, $lbl.Width).Height) + (Px 2)
+        $g.Dispose()
+        $w.Controls.Add($lbl)
+        return $lbl
     }
 
-    function New-Button($w, [string]$text, [string]$result, [bool]$primary) {
+    # kind: accent (the one positive action), outline (an equal partner), quiet
+    # (text only, like the Cancel of a GNOME dialog).
+    function New-Button($w, [string]$text, [string]$result, [string]$kind) {
         $b = [System.Windows.Forms.Button]::new()
-        $b.Text = $text; $b.DialogResult = $result; $b.FlatStyle = 'Flat'
-        $b.Size = [System.Drawing.Size]::new((Px 100), (Px 34))
-        if ($primary) {
-            $b.FlatAppearance.BorderColor = $accent; $b.BackColor = $accent; $b.ForeColor = $white
-            $b.Font = New-Font 10 ([System.Drawing.FontStyle]::Bold)
+        $b.Text = $text; $b.DialogResult = $result; $b.FlatStyle = 'Flat'; $b.Tag = $kind
+        $b.Size = [System.Drawing.Size]::new((Px 96), (Px 34))
+        $b.Font = New-Font 10 ([System.Drawing.FontStyle]::Bold)
+        if ($kind -eq 'accent') {
+            $b.FlatAppearance.BorderSize = 0; $b.BackColor = $accent; $b.ForeColor = $onAccent
+            Round-Corners $b (Px 6)
+        } elseif ($kind -eq 'outline') {
+            $b.FlatAppearance.BorderSize = 1; $b.FlatAppearance.BorderColor = $line
+            $b.BackColor = $card; $b.ForeColor = $ink
+            Round-Corners $b (Px 6)
         } else {
-            $b.FlatAppearance.BorderColor = $line; $b.BackColor = $white; $b.ForeColor = $ink
+            $b.FlatAppearance.BorderSize = 0; $b.BackColor = $paper; $b.ForeColor = $ink
             $b.Font = New-Font 10
         }
+        $b.Add_MouseEnter({ if ($this.Tag -eq 'accent') { $this.BackColor = $accentHover } else { $this.BackColor = $hover } })
+        $b.Add_MouseLeave({ if ($this.Tag -eq 'accent') { $this.BackColor = $accent } elseif ($this.Tag -eq 'quiet') { $this.BackColor = $paper } else { $this.BackColor = $card } })
         $w.Controls.Add($b)
         return $b
     }
 
-    # A row at the bottom, flush right; the last button is the rightmost one.
-    function Add-Buttons($w, $buttons) {
-        $x = $w.ClientSize.Width - (Px 20)
-        foreach ($b in $buttons) {
-            $b.Left = $x - $b.Width
-            $b.Top = $w.ClientSize.Height - (Px 20) - $b.Height
+    # A row at the bottom, flush right, in the order given (left to right): as
+    # in a GNOME dialog, the affirmative button is the rightmost one.
+    function Add-Buttons($w, $buttons, [int]$top) {
+        $x = $w.ClientSize.Width - (Px 24)
+        for ($i = $buttons.Count - 1; $i -ge 0; $i--) {
+            $b = $buttons[$i]
+            $b.Left = $x - $b.Width; $b.Top = $top
             $x = $b.Left - (Px 8)
         }
+        $w.ClientSize = [System.Drawing.Size]::new((Px 460), $top + (Px 34) + (Px 24))
     }
 "#;
 
     const PREAMBLE: &str = r#"
     $f = New-Window $env:AI_VAULT_DLG_TITLE
-    Add-Heading $f $env:AI_VAULT_DLG_TEXT
     $secret = $env:AI_VAULT_DLG_SECRET -eq '1'
 
-    # The field: the panel draws a border that scales with the display and
-    # turns blue while the field has the focus; the text box fills it.
-    $box = [System.Windows.Forms.TextBox]::new()
-    $box.Font = New-Font 11
-    $box.BorderStyle = 'None'; $box.AutoSize = $false; $box.Dock = 'Fill'
-    if ($secret) { $box.ForeColor = $box.BackColor }
+    $lbl = Add-Text $f $env:AI_VAULT_DLG_TEXT (Px 22)
+
+    # The field: a panel draws a border that scales with the display and turns
+    # to the accent colour while the field has the focus; the text box fills it.
     $field = [System.Windows.Forms.Panel]::new()
     $field.BackColor = $line
+    $field.Left = Px 24; $field.Top = $lbl.Bottom + (Px 12); $field.Width = (Px 460) - (Px 48); $field.Height = Px 40
+    Round-Corners $field (Px 6)
+    $inner = [System.Windows.Forms.Panel]::new()
+    $inner.BackColor = $card; $inner.Dock = 'Fill'
     $field.Padding = [System.Windows.Forms.Padding]::new((Px 1))
-    $field.Left = Px 62; $field.Top = Px 94; $field.Width = Px 398
-    $field.Height = $box.PreferredHeight + 2 * (Px 1)
-    $field.Controls.Add($box)
+    $inner.Add_SizeChanged({ Round-Corners $inner (Px 5) })
+    $field.Controls.Add($inner)
     $f.Controls.Add($field)
+
+    $box = [System.Windows.Forms.TextBox]::new()
+    $box.Font = New-Font 11
+    $box.BorderStyle = 'None'; $box.AutoSize = $false
+    $box.BackColor = $card
+    if ($secret) { $box.ForeColor = $card }
+    $box.Height = $box.PreferredHeight
+    $inner.Padding = [System.Windows.Forms.Padding]::new((Px 12), 0, (Px 12), 0)
+    $inner.Controls.Add($box)
 
     # Over the box, a label with one bullet per typed character and a caret of
     # its own: the box keeps its text (and the IME), and shows none of it.
     $mask = [System.Windows.Forms.Label]::new()
-    $mask.BackColor = $white; $mask.Font = New-Font 11; $mask.ForeColor = $muted
-    $mask.Dock = 'Fill'; $mask.TextAlign = 'MiddleLeft'
-    $mask.Padding = [System.Windows.Forms.Padding]::new((Px 10), 0, 0, 0)
+    $mask.BackColor = $card; $mask.Font = New-Font 12; $mask.ForeColor = $ink
+    $mask.TextAlign = 'MiddleLeft'
+    $mask.Padding = [System.Windows.Forms.Padding]::new((Px 12), 0, 0, 0)
     $mask.Visible = $secret
     $caret = [System.Windows.Forms.Label]::new()
     $caret.BackColor = $ink; $caret.Width = [Math]::Max(1, (Px 1)); $caret.Height = Px 18
     $caret.Visible = $false
-    if ($secret) { $field.Controls.Add($mask); $field.Controls.Add($caret) }
+    if ($secret) { $inner.Controls.Add($mask); $inner.Controls.Add($caret) }
     # Controls.Add puts a control at the BACK: the mask and the caret have to be
-    # brought in front of the box, or the box paints over them.
+    # in front of the box, or the box paints over them.
     $mask.BringToFront(); $caret.BringToFront()
+    function Layout-Field {
+        $box.Left = $inner.Padding.Left
+        $box.Top = [int](($inner.ClientSize.Height - $box.Height) / 2)
+        $box.Width = $inner.ClientSize.Width - $inner.Padding.Horizontal
+        $mask.Bounds = $inner.ClientRectangle
+        Update-Mask
+    }
+    $inner.Add_SizeChanged({ Round-Corners $inner (Px 5); Layout-Field })
 
-    $show = [System.Windows.Forms.CheckBox]::new()
+    $show = [System.Windows.Forms.LinkLabel]::new()
     $show.Text = $env:AI_VAULT_DLG_SHOW
-    $show.Font = New-Font 9; $show.ForeColor = $muted
-    $show.Left = Px 366; $show.Top = $field.Bottom + (Px 8); $show.Width = Px 94
+    $show.Font = New-Font 9.5
+    $show.LinkColor = $accent; $show.ActiveLinkColor = $accentHover; $show.VisitedLinkColor = $accent
+    $show.LinkBehavior = [System.Windows.Forms.LinkBehavior]::HoverUnderline
     $show.Visible = $secret
     $f.Controls.Add($show)
-    $f.ClientSize = [System.Drawing.Size]::new((Px 480), $field.Bottom + (Px 92))
+    $show.Width = $show.PreferredWidth + (Px 4); $show.Height = $show.PreferredHeight
+    $show.Left = $field.Right - $show.Width; $show.Top = $field.Bottom + (Px 10)
 
+    $shown = $false
+    function Set-Field-Look {
+        if ($shown -or -not $secret) { $box.ForeColor = $ink; $mask.Visible = $false }
+        else { $box.ForeColor = $card; $mask.Visible = $true }
+        $caret.Visible = ($box.Focused -and -not $shown -and $secret)
+        Update-Mask
+    }
     function Update-Mask {
         $mask.Text = ('● ' * $box.TextLength).TrimEnd()
         $typed = if ($mask.Text) { $mask.Text + ' ' } else { '' }
         $width = [System.Windows.Forms.TextRenderer]::MeasureText($typed, $mask.Font).Width
-        $caret.Left = [Math]::Min($mask.Padding.Left + $width, $mask.Width - $caret.Width)
-        $caret.Top = [int](($mask.Height - $caret.Height) / 2)
+        $caret.Left = $mask.Left + [Math]::Min($mask.Padding.Left + $width, $mask.Width - $caret.Width)
+        $caret.Top = $mask.Top + [int](($mask.Height - $caret.Height) / 2)
     }
     $box.Add_TextChanged({ Update-Mask })
-    $box.Add_GotFocus({ $caret.Visible = $secret; $field.BackColor = $accent })
+    $box.Add_GotFocus({ $caret.Visible = (-not $shown -and $secret); $field.BackColor = $accent })
     $box.Add_LostFocus({ $caret.Visible = $false; $field.BackColor = $line })
     $mask.Add_Click({ $box.Focus() })
-    $show.Add_CheckedChanged({
-        if ($show.Checked) { $box.ForeColor = $ink; $mask.Visible = $false }
-        else { $box.ForeColor = $box.BackColor; $mask.Visible = $true; $caret.Visible = $box.Focused }
-    })
+    $show.Add_LinkClicked({ $shown = -not $shown; Set-Field-Look; [void]$box.Focus() })
     $blink = [System.Windows.Forms.Timer]::new(); $blink.Interval = 530
-    $blink.Add_Tick({ if ($box.Focused -and $secret -and -not $show.Checked) { $caret.Visible = -not $caret.Visible } })
+    $blink.Add_Tick({ if ($box.Focused -and $secret -and -not $shown) { $caret.Visible = -not $caret.Visible } })
     $blink.Start()
-    Update-Mask
-    $f.Add_Shown({ $box.Focus() })
 
-    $cancel = New-Button $f $env:AI_VAULT_DLG_CANCEL 'Cancel' $false
-    $ok = New-Button $f $env:AI_VAULT_DLG_OK 'OK' $true
-    Add-Buttons $f @($cancel, $ok)
+    $cancel = New-Button $f $env:AI_VAULT_DLG_CANCEL 'Cancel' 'quiet'
+    $ok = New-Button $f $env:AI_VAULT_DLG_OK 'OK' 'accent'
+    $bottom = $(if ($secret) { $show.Bottom } else { $field.Bottom }) + (Px 20)
+    Add-Buttons $f @($cancel, $ok) $bottom
     $f.AcceptButton = $ok; $f.CancelButton = $cancel
-    $ok.Add_MouseEnter({ $ok.BackColor = $accentHover }); $ok.Add_MouseLeave({ $ok.BackColor = $accent })
+    $f.Add_Shown({ Layout-Field; [void]$box.Focus() })
 
     if ($f.ShowDialog() -eq 'OK') {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($box.Text)
@@ -373,29 +441,19 @@ try {
 
     // A window of its own rather than a MessageBox: the buttons then say
     // Allow and Deny in the user's language, and it matches the other one.
-    // Enter is the safe answer from wherever the focus is: Deny is both the
-    // accept and the cancel button. Allow takes a click, or Tab and Enter.
+    // Both weigh the same, and Deny has the focus: Enter is the safe answer
+    // from wherever the focus starts, Esc too. Allow takes a click, or Tab
+    // and Enter on it.
     const CONFIRM: &str = r#"
     $f = New-Window $env:AI_VAULT_DLG_TITLE
-    Add-Heading $f ''
+    $lbl = Add-Text $f $env:AI_VAULT_DLG_TEXT (Px 22)
 
-    $msg = [System.Windows.Forms.Label]::new()
-    $msg.Text = $env:AI_VAULT_DLG_TEXT
-    $msg.Font = New-Font 10; $msg.ForeColor = $ink
-    $msg.Left = Px 62; $msg.Top = Px 54; $msg.Width = Px 398
-    $g = $f.CreateGraphics()
-    $msg.Height = [int]($g.MeasureString($msg.Text, $msg.Font, $msg.Width).Height) + (Px 4)
-    $g.Dispose()
-    $f.Controls.Add($msg)
-    $f.ClientSize = [System.Drawing.Size]::new((Px 480), $msg.Bottom + (Px 66))
-
-    $deny = New-Button $f $env:AI_VAULT_DLG_DENY 'Cancel' $false
-    $allow = New-Button $f $env:AI_VAULT_DLG_ALLOW 'OK' $true
-    Add-Buttons $f @($deny, $allow)
+    $deny = New-Button $f $env:AI_VAULT_DLG_DENY 'Cancel' 'outline'
+    $allow = New-Button $f $env:AI_VAULT_DLG_ALLOW 'OK' 'outline'
+    Add-Buttons $f @($deny, $allow) ($lbl.Bottom + (Px 24))
     $f.AcceptButton = $deny
     $f.CancelButton = $deny
     $f.Add_Shown({ $deny.Focus() })
-    $allow.Add_MouseEnter({ $allow.BackColor = $accentHover }); $allow.Add_MouseLeave({ $allow.BackColor = $accent })
 
     if ($f.ShowDialog() -eq 'OK') { exit 0 }
     exit 1

@@ -122,10 +122,13 @@ here must also report the version being published.
   and a Chinese master password could not be entered at all. The field is an
   ordinary text box whose text is hidden by colour instead: one bullet per
   character and a caret are drawn over it, and a check box shows the text.
-- **The windows follow the display.** They are laid out for the screen's scale
-  (DPI-aware above 100 %), set in Microsoft YaHei UI or Segoe UI, with the
-  shield as their icon. The confirm window has Allow and Deny buttons of its
-  own, and Enter is Deny.
+- **The windows follow the display and the theme**, the way a zenity window
+  follows the GTK theme: laid out for the screen's scale (DPI-aware above
+  100 %), dark when the user's apps are dark (the title bar too), the user's
+  accent colour on the one affirmative button, which is the rightmost one as in
+  a GNOME dialog; Cancel is text only. Microsoft YaHei UI or Segoe UI, with the
+  shield as the icon. The confirm window has Deny and Allow of equal weight,
+  and Enter is Deny.
 - **`bw` installed with npm works** (`bw.cmd` is unwrapped the same way).
   `bw_run` needs Git for Windows: `bash.exe` is looked up next to the `git.exe`
   on PATH. The clipboard goes through Windows PowerShell, as UTF-8 on stdin and
