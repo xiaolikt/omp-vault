@@ -72,7 +72,7 @@ must not be rewritten).
 |---|---|
 | Linux x64 / arm64 | ✅ published (`@xiaolikt/ai-vault-linux-x64` / `-linux-arm64`) |
 | Windows x64 | ✅ published (`@xiaolikt/ai-vault-win32-x64`); dialogs via Windows PowerShell + WinForms, both built in |
-| macOS arm64 / x64 | 🔧 compiles (`cargo check --target aarch64-apple-darwin` passes); the binary needs the Apple SDK, so `.github/workflows/build.yml` builds it on a macOS runner |
+| macOS arm64 / x64 | ✅ published (`@xiaolikt/ai-vault-darwin-arm64` / `-darwin-x64`), built by `.github/workflows/build.yml` on a macOS runner — the Apple SDK cannot be had anywhere else |
 
 What is portable:
 - **Crypto/storage**: pure Rust (chacha20poly1305, scrypt, hmac, sha2, base64, zeroize)

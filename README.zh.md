@@ -73,7 +73,7 @@ printf '//registry.npmjs.org/:_authToken=%s\n' "<token>" > ~/.npmrc && chmod 600
 |---|---|
 | Linux x64 / arm64 | ✅ 已发布（`@xiaolikt/ai-vault-linux-x64` / `-linux-arm64`） |
 | Windows x64 | ✅ 已发布（`@xiaolikt/ai-vault-win32-x64`），对话框走系统自带的 Windows PowerShell + WinForms |
-| macOS arm64 / x64 | 🔧 代码已可编译（`cargo check --target aarch64-apple-darwin` 通过），二进制需要 Apple SDK —— 由 `.github/workflows/build.yml` 的 macOS runner 产出 |
+| macOS arm64 / x64 | ✅ 已发布（`@xiaolikt/ai-vault-darwin-arm64` / `-darwin-x64`），由 `.github/workflows/build.yml` 在 macOS runner 上构建——Apple SDK 别处拿不到 |
 
 跨平台的部分：
 - **加密/存储**：纯 Rust（chacha20poly1305、scrypt、hmac、sha2、base64、zeroize）
