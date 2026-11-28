@@ -8,10 +8,11 @@
  * dialog takes over here.
  */
 import { createHmac, randomBytes } from "node:crypto";
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, extname, join } from "node:path";
 import { lang } from "./i18n.js";
 import { fileURLToPath } from "node:url";
 
@@ -58,43 +59,130 @@ export class CliError extends Error {
 	}
 }
 
-/**
- * `AI_VAULT_BIN`, then the copy this package depends on (npm puts the shim in
- * a node_modules/.bin next to or above the plugin), then PATH, then the usual
- * install spots.
- */
-export function resolveBinary(): string | undefined {
-	const explicit = process.env.AI_VAULT_BIN;
-	if (explicit) return existsSync(explicit) ? explicit : undefined;
+/** How to start the CLI: a program, plus what has to precede our arguments. */
+export interface CliLaunch {
+	program: string;
+	pre: string[];
+}
 
-	// pip/npm layouts hoist differently: walk up from packages/pi-ai-vault/src.
+const WIN32 = process.platform === "win32";
+/** The file npm links for the bin: an `.exe` where there is one, else its `.cmd` wrapper. */
+const BIN_NAMES = WIN32 ? ["ai-vault.exe", "ai-vault.cmd"] : ["ai-vault"];
+
+/**
+ * What an npm `.cmd` wrapper starts, so that that can be started instead.
+ *
+ * npm links a package's bin as a sh script, a `.cmd` and a `.ps1` beside the
+ * real thing. Node refuses to run any of them without a shell on Windows
+ * (`spawn EINVAL`), and a shell would hand every argument to cmd.exe's parser.
+ * A `.cmd` is a fixed format, though; it ends with
+ *
+ *   "%_prog%"  "%dp0%\node_modules\pkg\bin\tool.js" %*
+ *
+ * so it is read, and what it names is started directly: a script with this
+ * very Node, anything else as the program it is.
+ */
+export function npmShimLaunch(shim: string): CliLaunch | undefined {
+	let text: string;
+	try {
+		text = readFileSync(shim, "utf8");
+	} catch {
+		return undefined;
+	}
+	const target = /"%dp0%([^"\r\n]+)"\s*%\*/.exec(text)?.[1];
+	if (!target) return undefined;
+	const wrapped = join(dirname(shim), target);
+	if (!existsSync(wrapped)) return undefined;
+	return /\.[cm]?js$/i.test(wrapped) ? { program: process.execPath, pre: [wrapped] } : { program: wrapped, pre: [] };
+}
+
+/** A file that was found, as something `spawn` can start. */
+function launchOf(candidate: string): CliLaunch | undefined {
+	if (!existsSync(candidate)) return undefined;
+	if (!WIN32) return { program: candidate, pre: [] };
+	const ext = extname(candidate).toLowerCase();
+	if (ext === ".exe" || ext === ".com") return { program: candidate, pre: [] };
+	if (ext === ".cmd" || ext === ".bat") return npmShimLaunch(candidate);
+	return undefined; // the sh script and the .ps1 need a shell as well
+}
+
+/**
+ * The prebuilt binary that came with this package: `@xiaolikt/ai-vault`
+ * depends on `@xiaolikt/ai-vault-<os>-<arch>`, resolved by Node from here, so
+ * a hoisted and a nested node_modules layout both work.
+ */
+function platformBinary(): CliLaunch | undefined {
+	const id = `@xiaolikt/ai-vault-${process.platform}-${process.arch}/package.json`;
+	try {
+		const manifest = createRequire(import.meta.url).resolve(id);
+		const binary = join(dirname(manifest), "bin", WIN32 ? "ai-vault.exe" : "ai-vault");
+		return existsSync(binary) ? { program: binary, pre: [] } : undefined;
+	} catch {
+		return undefined; // no prebuilt binary for this platform
+	}
+}
+
+/**
+ * `AI_VAULT_BIN`, then the prebuilt binary that came with this package, then
+ * the wrappers npm links in a node_modules/.bin next to or above the plugin,
+ * then PATH, then the usual install spots.
+ *
+ * On Windows the program is always a real executable: a wrapper is unwrapped
+ * to what it starts, never handed to `spawn` as it is.
+ */
+export function resolveLaunch(): CliLaunch | undefined {
+	const explicit = process.env.AI_VAULT_BIN;
+	if (explicit) return launchOf(explicit);
+
+	const bundled = platformBinary();
+	if (bundled) return bundled;
+
+	// npm layouts hoist differently: walk up from packages/pi-ai-vault/src.
 	let dir = dirname(fileURLToPath(import.meta.url));
 	for (let depth = 0; depth < 5; depth++) {
-		for (const name of process.platform === "win32" ? ["ai-vault.exe", "ai-vault.cmd", "ai-vault.ps1"] : ["ai-vault"]) {
-			const bundled = join(dir, "node_modules", ".bin", name);
-			if (existsSync(bundled)) return bundled;
+		for (const name of BIN_NAMES) {
+			const found = launchOf(join(dir, "node_modules", ".bin", name));
+			if (found) return found;
 		}
 		const parent = dirname(dir);
 		if (parent === dir) break;
 		dir = parent;
 	}
 
-	// Windows has no execute bit and npm links .cmd/.ps1 wrappers beside the exe.
-	const names = process.platform === "win32" ? ["ai-vault.exe", "ai-vault.cmd", "ai-vault.ps1", "ai-vault"] : ["ai-vault"];
 	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
 		if (!entry) continue;
-		for (const name of names) {
-			const candidate = join(entry, name);
-			if (existsSync(candidate)) return candidate;
+		for (const name of BIN_NAMES) {
+			const found = launchOf(join(entry, name));
+			if (found) return found;
 		}
 	}
 	for (const base of [join(homedir(), ".local", "bin"), join(homedir(), ".cargo", "bin"), join(homedir(), ".ai-vault", "bin")]) {
-		for (const name of names) {
-			const candidate = join(base, name);
-			if (existsSync(candidate)) return candidate;
+		for (const name of BIN_NAMES) {
+			const found = launchOf(join(base, name));
+			if (found) return found;
 		}
 	}
 	return undefined;
+}
+
+/** The program `resolveLaunch()` would start, for messages and the like. */
+export function resolveBinary(): string | undefined {
+	return resolveLaunch()?.program;
+}
+
+/**
+ * Start one CLI call. A program Node will not start is reported through
+ * `CliError` like every other failure, not thrown from inside the promise.
+ */
+function startCli(launch: CliLaunch, args: string[], env: NodeJS.ProcessEnv): ChildProcessWithoutNullStreams {
+	try {
+		// windowsHide: the CLI is a console program, and gets no window of its
+		// own when the host has none. The dialogs it opens are windows it opens
+		// on purpose, and show regardless.
+		return spawn(launch.program, [...launch.pre, ...args], { stdio: ["pipe", "pipe", "pipe"], env, windowsHide: true });
+	} catch (error) {
+		throw new CliError(EXIT.error, undefined, `cannot run ${launch.program}: ${error instanceof Error ? error.message : String(error)}`, "");
+	}
 }
 
 const NEEDS_UI = /^needs-ui:\s*(\w+)(?:\s+field=(\S+))?/m;
@@ -152,7 +240,9 @@ export class HostSecret {
 }
 
 export class VaultCli {
-	readonly bin = resolveBinary();
+	private readonly launch = resolveLaunch();
+	/** The program that gets started: `AI_VAULT_BIN` when that was set. */
+	readonly bin = this.launch?.program;
 	/** Set by the extension at startup; the same secret for every binding. */
 	host = new HostSecret();
 
@@ -166,15 +256,17 @@ export class VaultCli {
 	}
 
 	async run(args: string[], opts: { stdin?: string; signal?: AbortSignal } = {}): Promise<CliRun> {
-		const bin = this.bin;
-		if (!bin) {
+		const launch = this.launch;
+		if (!launch) {
 			throw new CliError(EXIT.error, undefined, "ai-vault CLI not found", "");
 		}
 		if (opts.signal?.aborted) {
 			throw new CliError(EXIT.denied, undefined, "aborted", "");
 		}
 		const run = await new Promise<CliRun>((resolve, reject) => {
-			const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...this.host.env() } });
+			// A program Node will not start fails here like any other CLI failure,
+			// not as a bare exception from inside the promise.
+			const child = startCli(launch, args, { ...process.env, ...this.host.env() });
 			let stdout = "";
 			let stderr = "";
 			const onAbort = () => child.kill("SIGKILL");
@@ -187,7 +279,7 @@ export class VaultCli {
 			});
 			child.on("error", (error) => {
 				opts.signal?.removeEventListener("abort", onAbort);
-				reject(new CliError(EXIT.error, undefined, `cannot run ${bin}: ${error.message}`, ""));
+				reject(new CliError(EXIT.error, undefined, `cannot run ${launch.program}: ${error.message}`, ""));
 			});
 			child.on("close", (code) => {
 				opts.signal?.removeEventListener("abort", onAbort);

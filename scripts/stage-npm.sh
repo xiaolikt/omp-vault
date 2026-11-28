@@ -10,8 +10,10 @@
 #   npm publish --access public
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="$(node -p "require('$ROOT/package.json').version")"
-PACKAGE="$(node -p "require('$ROOT/package.json').name")"
+# Read the manifest from inside the repository: `pwd` under Git Bash (the
+# Windows runner) is an MSYS path that Node cannot open.
+VERSION="$(cd "$ROOT" && node -p "require('./package.json').version")"
+PACKAGE="$(cd "$ROOT" && node -p "require('./package.json').name")"
 
 detect() {
 	case "$(uname -s)" in
@@ -34,9 +36,28 @@ if [[ "${1:-}" == "--from" ]]; then
 	SOURCE="${2:?--from needs a path}"
 	shift 2
 	[[ -x "$SOURCE" ]] || { echo "no binary at $SOURCE" >&2; exit 1; }
+	# A cross build is not rebuilt here, so it must at least be newer than the
+	# last version bump: 0.9.1 shipped a Windows exe that answered `--version`
+	# with 0.9.0, because it was linked before the bump and staged after it.
+	for manifest in "$ROOT/package.json" "$ROOT/crates/ai-vault/Cargo.toml"; do
+		if [[ "$SOURCE" -ot "$manifest" ]]; then
+			echo "refusing: $SOURCE predates $manifest — rebuild it since the version was bumped" >&2
+			exit 1
+		fi
+	done
 else
 	# A stale target/release would ship a binary with the wrong --version.
 	cargo build --release --manifest-path "$ROOT/Cargo.toml"
+fi
+
+# Where the binary can run here (a native build), it must carry the version
+# being published. A cross build for another OS or CPU cannot run, and only
+# the check above applies to it.
+if said="$("$SOURCE" --version 2>/dev/null)"; then
+	if [[ "$said" != "ai-vault $VERSION" ]]; then
+		echo "refusing: $SOURCE says '$said', the package is $VERSION" >&2
+		exit 1
+	fi
 fi
 
 # Accept a plain npm platform (darwin-arm64) or a Rust triple

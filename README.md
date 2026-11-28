@@ -11,6 +11,7 @@ client of it, so agents no longer keep a copy each.
 ~/.ai-vault/audit.log       who read what and when; never a value
 ~/.ai-vault/store.lock      file lock for read-modify-write across processes
 $XDG_RUNTIME_DIR/ai-vault/sessions/<token>.json   unlock tokens (0600, tmpfs)
+%TEMP%\ai-vault\sessions\<token>.json             the same on Windows: a regular file under the user's profile
 ```
 
 Because the location is fixed and owned by the CLI, pi, omp, scripts and any
@@ -70,7 +71,7 @@ must not be rewritten).
 | Platform | Status |
 |---|---|
 | Linux x64 / arm64 | ✅ published (`@xiaolikt/ai-vault-linux-x64` / `-linux-arm64`) |
-| Windows x64 | ✅ published (`@xiaolikt/ai-vault-win32-x64`); dialogs via PowerShell/WinForms |
+| Windows x64 | ✅ published (`@xiaolikt/ai-vault-win32-x64`); dialogs via Windows PowerShell + WinForms, both built in |
 | macOS arm64 / x64 | 🔧 compiles (`cargo check --target aarch64-apple-darwin` passes); the binary needs the Apple SDK, so `.github/workflows/build.yml` builds it on a macOS runner |
 
 What is portable:
@@ -79,7 +80,8 @@ What is portable:
 - **Permissions**: 0600/0700 on Unix; Windows has no mode bits and relies on the
   `%USERPROFILE%\.ai-vault` ACL
 - **Session directory**: `$XDG_RUNTIME_DIR` (Linux), `$TMPDIR` (macOS), `%TEMP%`
-  (Windows) — per-user, OS-cleaned
+  (Windows) — per-user; tmpfs on Linux, and on Windows a regular folder that the
+  next `ai-vault` run sweeps of expired tokens
 - **Dialogs**: zenity / osascript / PowerShell+WinForms behind one `Answer`
   contract (`NoUi` is what falls back to the host prompt)
 
@@ -96,7 +98,30 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 
 `stage-npm.sh` accepts either an npm platform name (`darwin-arm64`) or a Rust
 triple (`aarch64-apple-darwin`). macOS binaries can only be linked with the
-Apple SDK, so CI does that (build + publish on a `v*` tag).
+Apple SDK, so CI does that (build + publish on a `v*` tag). The darwin packages
+are already listed under `optionalDependencies`; npm skips an optional
+dependency that is not published yet, so the list can precede them.
+`--from` refuses a binary older than the last version bump, and one that can run
+here must also report the version being published.
+
+### Windows
+
+- **The extension starts `ai-vault.exe` itself.** Node will not run npm's
+  `.cmd`/`.ps1` wrappers without a shell, so the plugin resolves the binary of
+  `@xiaolikt/ai-vault-win32-x64` directly and, where only a wrapper exists, reads
+  it and starts what it names with its own Node.
+- **A dialog needs an interactive session.** Services, scheduled tasks that run
+  without a logged-on user and sshd sessions have no visible desktop; there the
+  CLI answers exit code 3 (`needs-ui`) and the host prompt is used. A window
+  nobody answers closes after the same 600 s as on Linux, and counts as a cancel.
+- **What is typed in a dialog is UTF-8**, whatever the console's code page is
+  (936 on a Chinese Windows). A dialog that fails to open is reported as
+  `needs-ui`, never as a cancel.
+- **`bw` installed with npm works** (`bw.cmd` is unwrapped the same way).
+  `bw_run` needs Git for Windows: `bash.exe` is looked up next to the `git.exe`
+  on PATH. The clipboard goes through Windows PowerShell, as UTF-8 on stdin and
+  stdout.
+- The store is `%USERPROFILE%\.ai-vault`, protected by the profile's ACL.
 
 ### From source / git
 
@@ -471,7 +496,9 @@ may *use* passwords but cannot *get around you* to take them.
   upgrades it. Anything below `2^15` is refused as a downgrade.
 - **The master password** only passes through a dialog or the host prompt; the
   key `unlock` derives only goes into the token file (0600, tmpfs when there is
-  one). `BW_*` is stripped from every child environment.
+  one; on Windows a regular file under `%TEMP%`, protected by the profile's ACL,
+  which a reboot leaves in place until the next `ai-vault` run removes it once
+  expired). `BW_*` is stripped from every child environment.
 - **Audit**: `~/.ai-vault/audit.log` records sessions, entries, allow/deny with
   the reason, and attempts such as `unsigned-relay`, `bad-approval`,
   `modified-outside`; never a value. Rotated at 1 MiB.

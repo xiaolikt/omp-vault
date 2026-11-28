@@ -46,7 +46,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { constants as fsConstants, accessSync, readFileSync, promises as fs } from "node:fs";
+import { constants as fsConstants, accessSync, existsSync, readFileSync, promises as fs } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
@@ -56,6 +56,7 @@ import { bitwardenItems, filterItems } from "./import-map.js";
 import type { Draft } from "./types.js";
 import { onSessionLeave, sessionLabel, withTier } from "./host.js";
 import { confirmWindow, hasDisplay, promptSecret } from "./prompt.js";
+import { npmShimLaunch, type CliLaunch } from "./cli.js";
 import { getSettingsSafe, settingsCli, settingsToken } from "./settings.js";
 import { tr } from "./i18n.js";
 import { scrubDeep, scrubText } from "./scrub.js";
@@ -292,6 +293,62 @@ function childEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
 	return env;
 }
 
+const WIN32 = process.platform === "win32";
+
+/** A file under the Windows directory: `%SystemRoot%` already is `C:\Windows`. */
+const systemFile = (...parts: string[]): string => path.join(process.env.SystemRoot ?? "C:/Windows", ...parts);
+
+/** `taskkill /T /F`: the process and everything it started. Windows has no process groups. Exported for tests. */
+export function killTree(pid: number): void {
+	const taskkill = systemFile("System32", "taskkill.exe");
+	try {
+		spawnSync(taskkill, ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", timeout: 5000, windowsHide: true });
+	} catch {
+		/* best-effort: the caller still kills the process itself */
+	}
+}
+
+/** How long a copy command may take to set the clipboard and exit. */
+const COPY_TIMEOUT_MS = 15_000;
+
+let bashLaunch: CliLaunch | undefined;
+
+/**
+ * The shell `bw_run` runs a command in. Git for Windows keeps `bash.exe` in
+ * `<install>\bin` and does not put that on PATH (`git.exe` is what is found
+ * there), so the installation git.exe came from is searched as well.
+ * Exported for tests.
+ */
+export function resolveBash(): CliLaunch {
+	if (bashLaunch) return bashLaunch;
+	bashLaunch = { program: "bash", pre: [] };
+	if (WIN32) {
+		const onPath = (exe: string): string | undefined => {
+			for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+				if (dir && existsSync(path.join(dir, exe))) return path.join(dir, exe);
+			}
+			return undefined;
+		};
+		const roots = [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Programs")];
+		bashLaunch.program =
+			onPath("bash.exe") ??
+			bashBeside(onPath("git.exe")) ??
+			roots.filter((base): base is string => !!base).map((base) => path.join(base, "Git", "bin", "bash.exe")).find((candidate) => existsSync(candidate)) ??
+			"bash";
+	}
+	return bashLaunch;
+}
+
+/** `<install>\bin\bash.exe`, from whichever directory of a Git for Windows installation one starts. */
+function bashBeside(gitExe: string | undefined): string | undefined {
+	for (let dir = gitExe && path.dirname(gitExe); dir; dir = path.dirname(dir)) {
+		const candidate = path.join(dir, "bin", "bash.exe");
+		if (existsSync(candidate)) return candidate;
+		if (path.dirname(dir) === dir) break;
+	}
+	return undefined;
+}
+
 function exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
 	if (opts.signal?.aborted) return Promise.reject(new Error(`${cmd} cancelled`));
 	const { promise, resolve, reject } = Promise.withResolvers<ExecResult>();
@@ -300,12 +357,20 @@ function exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<Exec
 		cwd: opts.cwd,
 		stdio: ["pipe", "pipe", "pipe"],
 		detached: opts.group === true,
+		windowsHide: true,
 	});
 	let out = "";
 	let err = "";
 	let truncated = false;
 	let settled = false;
 	const kill = () => {
+		if (WIN32) {
+			// No process groups on Windows: take the whole tree down, or a command
+			// that timed out leaves what it started running with the secret in its environment.
+			if (child.pid) killTree(child.pid);
+			child.kill("SIGKILL");
+			return;
+		}
 		if (opts.group && child.pid) {
 			try {
 				process.kill(-child.pid, "SIGKILL");
@@ -388,16 +453,42 @@ export async function auditEvent(event: string, detail: string, session?: string
 // ---------------------------------------------------------------------------
 // Bitwarden CLI plumbing (secrets only ever travel via env vars / pipes)
 // ---------------------------------------------------------------------------
-let bwBin: string | undefined;
+/** How to start the Bitwarden CLI; `pre` is empty unless an npm wrapper had to be unwrapped. Exported for tests. */
+let bwLaunch: CliLaunch | undefined;
 
-async function resolveBw(): Promise<string> {
-	if (bwBin) return bwBin;
+/** Runs at all: answers `--version` with exit 0. */
+async function bwRuns(launch: CliLaunch): Promise<boolean> {
 	try {
-		await exec("bw", ["--version"], { timeout: 20_000 });
-		bwBin = "bw";
-		return bwBin;
+		const r = await exec(launch.program, [...launch.pre, "--version"], { timeout: 20_000 });
+		return r.code === 0;
 	} catch {
-		/* fall through to nvm scan */
+		return false;
+	}
+}
+
+export async function resolveBw(): Promise<CliLaunch> {
+	if (bwLaunch) return bwLaunch;
+	// `bw.exe` is found by the bare name on Windows, `bw` elsewhere.
+	if (await bwRuns({ program: "bw", pre: [] })) {
+		bwLaunch = { program: "bw", pre: [] };
+		return bwLaunch;
+	}
+	// npm installs `bw` as bw.cmd (with a .ps1 and a sh script beside it), which
+	// Windows cannot start without a shell: start the JavaScript it wraps with
+	// this Node instead.
+	if (WIN32) {
+		for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+			if (!dir) continue;
+			for (const name of ["bw.exe", "bw.cmd", "bw.bat"]) {
+				const candidate = path.join(dir, name);
+				if (!existsSync(candidate)) continue;
+				const launch = name === "bw.exe" ? { program: candidate, pre: [] } : npmShimLaunch(candidate);
+				if (launch && (await bwRuns(launch))) {
+					bwLaunch = launch;
+					return bwLaunch;
+				}
+			}
+		}
 	}
 	try {
 		const nvmDir = path.join(homedir(), ".nvm", "versions", "node");
@@ -408,8 +499,8 @@ async function resolveBw(): Promise<string> {
 		for (const v of versions) {
 			const p = path.join(nvmDir, v, "bin", "bw");
 			if (await fs.access(p).then(() => true, () => false)) {
-				bwBin = p;
-				return bwBin;
+				bwLaunch = { program: p, pre: [] };
+				return bwLaunch;
 			}
 		}
 	} catch {
@@ -422,10 +513,10 @@ async function runBw(
 	args: string[],
 	opts: { session?: string; extraEnv?: Record<string, string>; signal?: AbortSignal } = {},
 ): Promise<string> {
-	const bin = await resolveBw();
+	const bw = await resolveBw();
 	const env: Record<string, string> = { ...opts.extraEnv };
 	if (opts.session) env.BW_SESSION = opts.session;
-	const r = await exec(bin, [...args, "--nointeraction"], { env, signal: opts.signal });
+	const r = await exec(bw.program, [...bw.pre, ...args, "--nointeraction"], { env, signal: opts.signal });
 	if (r.code !== 0) {
 		const hint = tail(r.stderr) || `exit ${r.code}`;
 		// Never include stdout in errors — some commands print secrets on success-ish paths.
@@ -522,8 +613,8 @@ async function lock(st: BwState, reason: string): Promise<void> {
 		await auditEvent("lock", `reason=${reason}`, st.sessionLabel);
 		if (!releaseSessionKey()) return; // another binding still uses its own key
 		try {
-			const bin = await resolveBw();
-			await exec(bin, ["lock", "--nointeraction"], { timeout: 15_000 });
+			const bw = await resolveBw();
+			await exec(bw.program, [...bw.pre, "lock", "--nointeraction"], { timeout: 15_000 });
 		} catch {
 			/* best-effort; dropping our session key is what matters */
 		}
@@ -580,8 +671,8 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 		if (status?.status === "unauthenticated") throw new Error(BW_LOGIN_HINT);
 
 		const pw = await askMasterPassword(ctx, signal);
-		const bin = await resolveBw();
-		const r = await exec(bin, ["unlock", "--passwordenv", "BW_MASTER_PASSWORD", "--raw"], {
+		const bw = await resolveBw();
+		const r = await exec(bw.program, [...bw.pre, "unlock", "--passwordenv", "BW_MASTER_PASSWORD", "--raw"], {
 			env: { BW_MASTER_PASSWORD: pw },
 			timeout: 60_000,
 			signal,
@@ -881,7 +972,25 @@ type ClipboardBackend = {
 	copy: [string, string[]];
 	clear: [string, string[]];
 	read: [string, string[]];
+	/** wl-copy and xclip keep running to own the selection; the others set it and exit. */
+	lingers: boolean;
 };
+
+/**
+ * Windows: Windows PowerShell with WinForms. The value travels as UTF-8
+ * bytes on stdin and stdout: never on a command line, and never through the
+ * console's code page, which is not UTF-8 on a Chinese Windows.
+ */
+const PS_CLIP_ARGS = ["-NoProfile", "-NonInteractive", "-STA", "-Command"];
+const PS_SET_CLIP =
+	"Add-Type -AssemblyName System.Windows.Forms; $stdin = [Console]::OpenStandardInput(); $buffer = New-Object System.IO.MemoryStream; " +
+	"$stdin.CopyTo($buffer); $text = [System.Text.Encoding]::UTF8.GetString($buffer.ToArray()); " +
+	"if ($text.Length -eq 0) { exit 1 }; [System.Windows.Forms.Clipboard]::SetText($text); exit 0";
+const PS_GET_CLIP =
+	"Add-Type -AssemblyName System.Windows.Forms; $bytes = [System.Text.Encoding]::UTF8.GetBytes([System.Windows.Forms.Clipboard]::GetText()); " +
+	"$stdout = [Console]::OpenStandardOutput(); $stdout.Write($bytes, 0, $bytes.Length); $stdout.Flush(); exit 0";
+const PS_CLEAR_CLIP =
+	"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::Clear(); exit 0";
 
 /** Whether an executable is on PATH, so a Wayland session can fall back to X11. */
 function commandExists(command: string): boolean {
@@ -897,15 +1006,25 @@ function commandExists(command: string): boolean {
 	return false;
 }
 
-function clipboardBackend(): ClipboardBackend | undefined {
+export function clipboardBackend(): ClipboardBackend | undefined {
+	if (WIN32) {
+		const powershell = systemFile("System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+		return {
+			copy: [powershell, [...PS_CLIP_ARGS, PS_SET_CLIP]],
+			clear: [powershell, [...PS_CLIP_ARGS, PS_CLEAR_CLIP]],
+			read: [powershell, [...PS_CLIP_ARGS, PS_GET_CLIP]],
+			lingers: false,
+		};
+	}
 	if (process.platform === "darwin") {
-		return { copy: ["pbcopy", []], clear: ["pbcopy", []], read: ["pbpaste", []] };
+		return { copy: ["pbcopy", []], clear: ["pbcopy", []], read: ["pbpaste", []], lingers: false };
 	}
 	if (process.env.WAYLAND_DISPLAY && commandExists("wl-copy") && commandExists("wl-paste")) {
 		return {
 			copy: ["wl-copy", []],
 			clear: ["wl-copy", ["-c"]],
 			read: ["wl-paste", ["--no-newline"]],
+			lingers: true,
 		};
 	}
 	if (process.env.DISPLAY && commandExists("xclip")) {
@@ -913,6 +1032,7 @@ function clipboardBackend(): ClipboardBackend | undefined {
 			copy: ["xclip", ["-selection", "clipboard"]],
 			clear: ["xclip", ["-selection", "clipboard", "/dev/null"]],
 			read: ["xclip", ["-selection", "clipboard", "-o"]],
+			lingers: true,
 		};
 	}
 	return undefined;
@@ -936,17 +1056,19 @@ function clipboardMatches(current: string, value: string): boolean {
 
 async function copyToClipboard(value: string): Promise<void> {
 	const backend = clipboardBackend();
-	if (!backend) throw new Error("No clipboard available (need Wayland, X11, or macOS).");
+	if (!backend) throw new Error("No clipboard available (need Wayland, X11, macOS, or Windows PowerShell).");
 	const drops = clipboardDrops;
 	const [cmd, args] = backend.copy;
 	const { promise, resolve, reject } = Promise.withResolvers<void>();
-	// wl-copy/xclip stay alive to own the selection; a quick clean exit also means success.
-	const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "pipe"], detached: true, env: childEnv() });
+	// A backend that owns the selection stays alive, detached from this process.
+	const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "pipe"], detached: backend.lingers, env: childEnv(), windowsHide: true });
 	let settled = false;
 	let stderr = "";
+	const watchdog = setTimeout(() => finish(new Error(`${cmd} did not finish`)), COPY_TIMEOUT_MS);
 	const finish = (err?: Error) => {
 		if (settled) return;
 		settled = true;
+		clearTimeout(watchdog);
 		if (err) reject(err);
 		else {
 			child.unref();
@@ -966,7 +1088,10 @@ async function copyToClipboard(value: string): Promise<void> {
 			return;
 		}
 		child.stdin?.end();
-		setTimeout(() => finish(), 500);
+		// A backend that owns the selection never exits: after a moment without an
+		// error, the value is in place. Every other backend is waited for, so that
+		// a copy that failed is reported and never looks like success.
+		if (backend.lingers) setTimeout(() => finish(), 500);
 	});
 	clipboardPending = value;
 	try {
@@ -1029,13 +1154,13 @@ function clearClipboardSync(): void {
 	clipboardPending = undefined;
 	if (!value || !backend) return;
 	try {
-		const r = spawnSync(backend.read[0], backend.read[1], { encoding: "utf8", timeout: 1000, env: childEnv() });
+		const r = spawnSync(backend.read[0], backend.read[1], { encoding: "utf8", timeout: WIN32 ? 3000 : 1000, env: childEnv(), windowsHide: true });
 		if (r.status === 0 && typeof r.stdout === "string" && r.stdout.length > 0 && !clipboardMatches(r.stdout, value)) return;
 	} catch {
 		/* clear anyway */
 	}
 	try {
-		spawnSync(backend.clear[0], backend.clear[1], { input: "", timeout: 2000, env: childEnv() });
+		spawnSync(backend.clear[0], backend.clear[1], { input: "", timeout: WIN32 ? 3000 : 2000, env: childEnv(), windowsHide: true });
 	} catch {
 		/* best-effort */
 	}
@@ -1316,7 +1441,8 @@ export function registerBitwarden(pi: ExtensionAPI, st: BwState, ompHost: boolea
 			if (!approved) throw new Error("User declined the command.");
 			const { value, itemName } = await secretOf(approved.session, approved.item, field, signal);
 			rememberScrubValue(envName, value);
-			const r = await exec("bash", ["-c", params.command], {
+			const bash = resolveBash();
+			const r = await exec(bash.program, [...bash.pre, "-c", params.command], {
 				env: { [envName]: value },
 				cwd,
 				timeout: seconds * 1000,

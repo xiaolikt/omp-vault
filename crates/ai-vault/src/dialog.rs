@@ -6,7 +6,8 @@
 //!
 //! When no window can open at all, the caller gets `NoUi` and the host UI
 //! (pi/omp prompt) takes over. Cancel and our own timeout end the prompt here:
-//! they never turn into a second prompt.
+//! they never turn into a second prompt. Every platform answers the value as
+//! UTF-8, whatever the terminal's code page is.
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use std::env;
@@ -33,8 +34,17 @@ pub fn has_display() -> bool {
             .iter()
             .any(|name| env::var_os(name).is_some_and(|v| !v.is_empty()));
     }
-    // macOS and Windows always have a window server for an interactive user.
-    #[cfg(not(target_os = "linux"))]
+    // macOS always has a window server for an interactive user.
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    // Only the interactive session on Windows has a desktop anyone can see.
+    #[cfg(target_os = "windows")]
+    {
+        win::has_display()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         true
     }
@@ -163,38 +173,88 @@ mod mac {
 #[cfg(target_os = "windows")]
 mod win {
     use super::{Answer, DIALOG_SECONDS};
+    use std::io::Read;
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
 
     // WinForms from PowerShell: no extra dependency, and PasswordChar can hide
     // the input. Exit 0 = OK (value on stdout), 1 = cancel, 2 = no window.
+    //
+    // Two things matter on a real Windows desktop:
+    //   * `[Console]::Out.Write` encodes with the console's code page (936 on a
+    //     Chinese Windows), so a password typed in Chinese arrived as mojibake
+    //     and keyed a store no other machine could open. The value leaves as
+    //     UTF-8 bytes through the raw stream instead.
+    //   * Any error (a policy that forbids Add-Type, WinForms that will not
+    //     load) used to make PowerShell exit 1, which reads as "the user
+    //     cancelled": the host was told not to retry. The scripts trap into
+    //     exit 2, and an exit 1 that printed an error counts the same.
     const PREAMBLE: &str = r#"
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-$f = New-Object System.Windows.Forms.Form
-$f.Text = $env:AI_VAULT_DLG_TITLE
-$f.Width = 480; $f.Height = 200; $f.StartPosition = 'CenterScreen'
-$f.TopMost = $true; $f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false
-$lbl = New-Object System.Windows.Forms.Label
-$lbl.Text = $env:AI_VAULT_DLG_TEXT; $lbl.Left = 12; $lbl.Top = 12; $lbl.Width = 440; $lbl.Height = 60
-$f.Controls.Add($lbl)
-$box = New-Object System.Windows.Forms.TextBox
-$box.Left = 12; $box.Top = 80; $box.Width = 440
-if ($env:AI_VAULT_DLG_SECRET -eq '1') { $box.UseSystemPasswordChar = $true }
-$f.Controls.Add($box)
-$ok = New-Object System.Windows.Forms.Button
-$ok.Text = 'OK'; $ok.DialogResult = 'OK'; $ok.Left = 280; $ok.Top = 115; $f.AcceptButton = $ok
-$cancel = New-Object System.Windows.Forms.Button
-$cancel.Text = $env:AI_VAULT_DLG_CANCEL; $cancel.DialogResult = 'Cancel'; $cancel.Left = 370; $cancel.Top = 115; $f.CancelButton = $cancel
-$f.Controls.Add($ok); $f.Controls.Add($cancel)
-$f.Add_Shown({ $box.Focus() })
-if ($f.ShowDialog() -eq 'OK') { [Console]::Out.Write($box.Text); exit 0 } else { exit 1 }
+$ErrorActionPreference = 'Stop'
+try {
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = $env:AI_VAULT_DLG_TITLE
+    $f.Width = 480; $f.Height = 200; $f.StartPosition = 'CenterScreen'
+    $f.TopMost = $true; $f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $env:AI_VAULT_DLG_TEXT; $lbl.Left = 12; $lbl.Top = 12; $lbl.Width = 440; $lbl.Height = 60
+    $f.Controls.Add($lbl)
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Left = 12; $box.Top = 80; $box.Width = 440
+    if ($env:AI_VAULT_DLG_SECRET -eq '1') { $box.UseSystemPasswordChar = $true }
+    $f.Controls.Add($box)
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'OK'; $ok.DialogResult = 'OK'; $ok.Left = 280; $ok.Top = 115; $f.AcceptButton = $ok
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = $env:AI_VAULT_DLG_CANCEL; $cancel.DialogResult = 'Cancel'; $cancel.Left = 370; $cancel.Top = 115; $f.CancelButton = $cancel
+    $f.Controls.Add($ok); $f.Controls.Add($cancel)
+    $f.Add_Shown({ $box.Focus() })
+    if ($f.ShowDialog() -eq 'OK') {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($box.Text)
+        $stdout = [Console]::OpenStandardOutput()
+        $stdout.Write($bytes, 0, $bytes.Length); $stdout.Flush()
+        exit 0
+    }
+    exit 1
+} catch {
+    [Console]::Error.Write($_)
+    exit 2
+}
 "#;
 
+    // A MessageBox has no top-most flag of its own, so it is owned by an
+    // invisible one that has: an approval hiding behind other windows reads as
+    // a hang. The default button stays "No".
     const CONFIRM: &str = r#"
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-$msg = $env:AI_VAULT_DLG_TEXT
-$r = [System.Windows.Forms.MessageBox]::Show($msg, $env:AI_VAULT_DLG_TITLE, 'YesNo', 'Warning', 'Button2')
-if ($r -eq 'Yes') { exit 0 } else { exit 1 }
+$ErrorActionPreference = 'Stop'
+try {
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    $owner = New-Object System.Windows.Forms.Form
+    $owner.TopMost = $true; $owner.Opacity = 0; $owner.ShowInTaskbar = $false
+    $owner.StartPosition = 'CenterScreen'; $owner.Width = 1; $owner.Height = 1
+    $owner.Show()
+    $r = [System.Windows.Forms.MessageBox]::Show($owner, $env:AI_VAULT_DLG_TEXT, $env:AI_VAULT_DLG_TITLE, 'YesNo', 'Warning', 'Button2')
+    $owner.Close()
+    if ($r -eq 'Yes') { exit 0 }
+    exit 1
+} catch {
+    [Console]::Error.Write($_)
+    exit 2
+}
 "#;
+
+    /// Windows PowerShell by its full path. The window takes the master
+    /// password, so the bare name is not left for a PATH entry or a working
+    /// directory to answer to.
+    fn powershell_exe() -> PathBuf {
+        std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .map(|root| root.join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe"))
+            .unwrap_or_else(|| PathBuf::from("powershell"))
+    }
 
     struct Out {
         spawned: bool,
@@ -203,8 +263,20 @@ if ($r -eq 'Yes') { exit 0 } else { exit 1 }
         stderr: String,
     }
 
+    /// Read a pipe to its end on its own thread: a chatty start must not block
+    /// on a full pipe while the window is open.
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    }
+
     fn powershell(script: &str, title: &str, text: &str, secret: bool) -> Out {
-        let mut cmd = Command::new("powershell");
+        let mut cmd = Command::new(powershell_exe());
         cmd.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script])
             .env("AI_VAULT_DLG_TITLE", title)
             .env("AI_VAULT_DLG_TEXT", text)
@@ -213,20 +285,46 @@ if ($r -eq 'Yes') { exit 0 } else { exit 1 }
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let _ = DIALOG_SECONDS; // the dialog is modal for the user, not us
-        match cmd.output() {
-            Ok(out) => Out {
-                spawned: true,
-                code: out.status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            },
-            Err(_) => Out { spawned: false, code: 127, stdout: String::new(), stderr: String::new() },
+        let unspawned = || Out {
+            spawned: false,
+            code: 127,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(_) => return unspawned(),
+        };
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        // A window nobody answers must not hold the caller forever, exactly as
+        // zenity's --timeout does not: after DIALOG_SECONDS it is ours to close,
+        // and closing it is a cancel. (Windows has no `giving up after`.)
+        let deadline = Instant::now() + Duration::from_secs(DIALOG_SECONDS as u64);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+            }
+        };
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
+        match status {
+            None => Out { spawned: true, code: 1, stdout, stderr },
+            Some(status) => Out { spawned: true, code: status.code().unwrap_or(-1), stdout, stderr },
         }
     }
 
+    /// Exit 1 with nothing on stderr is the user's cancel. Anything else means
+    /// no answer came out of a window: our own exit 2, a script PowerShell
+    /// could not even parse (exit 1, with the error on stderr), or a crash.
     fn failed(out: &Out) -> bool {
-        !out.spawned || (out.code != 0 && out.code != 1)
+        !out.spawned || (out.code != 0 && out.code != 1) || (out.code == 1 && !out.stderr.trim().is_empty())
     }
 
     pub fn prompt_secret(title: &str, label: &str) -> Answer<String> {
@@ -257,6 +355,53 @@ if ($r -eq 'Yes') { exit 0 } else { exit 1 }
             return Answer::NoUi;
         }
         Answer::Value(out.code == 0)
+    }
+
+    /// Whether this process may show a window at all. Only the interactive
+    /// session's window station (`WinSta0`) is visible; a service, a scheduled
+    /// task that runs without a logged-on user, or an sshd session gets a
+    /// `Service-0x0-…` station instead, where a dialog would open onto a
+    /// desktop nobody sees and never be answered.
+    pub fn has_display() -> bool {
+        // USEROBJECTFLAGS, as user32 lays it out: two BOOLs and a DWORD.
+        #[repr(C)]
+        #[derive(Default)]
+        struct UserObjectFlags {
+            f_inherit: i32,
+            f_reserved: i32,
+            dw_flags: u32,
+        }
+        const UOI_FLAGS: i32 = 1;
+        const WSF_VISIBLE: u32 = 0x0001;
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetProcessWindowStation() -> *mut core::ffi::c_void;
+            fn GetUserObjectInformationW(
+                hobj: *mut core::ffi::c_void,
+                index: i32,
+                info: *mut core::ffi::c_void,
+                len: u32,
+                needed: *mut u32,
+            ) -> i32;
+        }
+        // SAFETY: two Win32 queries against the calling process's own window
+        // station; every pointer is either handed out by the OS or a live local.
+        unsafe {
+            let station = GetProcessWindowStation();
+            if station.is_null() {
+                return false;
+            }
+            let mut flags = UserObjectFlags::default();
+            let mut needed: u32 = 0;
+            let ok = GetUserObjectInformationW(
+                station,
+                UOI_FLAGS,
+                &mut flags as *mut UserObjectFlags as *mut core::ffi::c_void,
+                std::mem::size_of::<UserObjectFlags>() as u32,
+                &mut needed,
+            );
+            ok != 0 && flags.dw_flags & WSF_VISIBLE != 0
+        }
     }
 }
 
@@ -532,7 +677,9 @@ mod tests {
         assert!(cut.ends_with('…'));
     }
 
+    // The rest of this file's helpers exist only where zenity does.
     #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn gtk_diagnostics_are_not_failures() {
         assert!(is_gtk_diagnostic("(zenity:1234): Gtk-WARNING **: cannot open display"));
         assert!(!is_gtk_diagnostic("zenity: command not found"));
@@ -540,6 +687,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn failed_spawn_and_dead_display_are_no_ui() {
         let missing = Zenity { spawned: false, code: 127, stdout: String::new(), stderr: String::new() };
         assert!(failed_to_open(&missing));
