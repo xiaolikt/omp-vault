@@ -23,13 +23,13 @@ import {
 	type BitwardenMeta,
 	type BwState,
 } from "./bitwarden.js";
-import { CliError, VaultCli } from "./cli.js";
+import { CliError } from "./cli.js";
 import { ITEM_TYPES, isSecretField, parseItemType } from "./import-map.js";
 import type { Draft, ItemType } from "./types.js";
 import { registerEnte } from "./ente.js";
 import { isOmpHost, onSessionLeave, sessionLabel, subagentId, withTier } from "./host.js";
 import { confirmWindow, forDialog, promptSecret, promptText, type PromptHost } from "./prompt.js";
-import { forgetSettings, getSettingsSafe, type Settings } from "./settings.js";
+import { forgetSettings, getSettingsSafe, setSettingsToken, settingsCli, settingsToken, type Settings } from "./settings.js";
 
 type Ctx = ExtensionToolContext | ExtensionCommandContext;
 
@@ -100,7 +100,7 @@ interface Scope {
 	unlocking?: Promise<boolean>;
 }
 
-const cli = new VaultCli();
+const cli = settingsCli();
 
 const CLI_MISSING =
 	tr("ai-vault CLI not found. Install it once for a machine-wide store: cargo install --path <repo>/crates/ai-vault (or point AI_VAULT_BIN at a compiled binary)", "ai-vault CLI 没找到。装一次就有全机共享的库：cargo install --path <repo>/crates/ai-vault（或用 AI_VAULT_BIN 指向编译好的二进制）");
@@ -148,6 +148,8 @@ async function lockNow(scope: Scope): Promise<void> {
 	scope.token = undefined;
 	scope.epoch++;
 	scope.items = 0;
+	setSettingsToken(undefined);
+	forgetSettings();
 	if (!token || !cli.available) return;
 	try {
 		await cli.run(["lock", "--token", token]);
@@ -174,6 +176,7 @@ async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Pro
 				scope.items = status.items;
 				scope.mode = status.mode;
 				scope.auto = false;
+				setSettingsToken(scope.token);
 				return true;
 			} catch (error) {
 				if (!(error instanceof CliError) || !error.auth) {
@@ -194,6 +197,7 @@ async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Pro
 			scope.items = status.items;
 			scope.mode = status.mode;
 			scope.auto = status.auto;
+			setSettingsToken(undefined);
 			return true;
 		} catch (error) {
 			if (error instanceof CliError && /not initialized/i.test(error.message)) {
@@ -237,6 +241,7 @@ async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Pro
 			// per-binding token would bring back a confirm window on every read.
 			scope.token = result.mode === "never" ? undefined : result.token;
 			scope.items = result.items;
+			setSettingsToken(scope.token);
 			return true;
 		} catch (error) {
 			if (error instanceof CliError && error.auth) {
@@ -693,6 +698,7 @@ const HELP = [
 	tr("/vault init                        create the machine-wide encrypted store (a dialog sets the master password)", "/vault init                        创建全机共享的本地加密库（弹出窗口设置主密码）"),
 	tr("/vault unlock | lock               unlock / lock (clears this session's grants)", "/vault unlock | lock               解锁 / 锁定（清空本会话的授权）"),
 	tr("/vault mode [never|time|session]   show/switch the unlock policy (switching needs the master password)", "/vault mode [never|time|session]   查看/切换解锁模式（切换要主密码）"),
+	tr("/vault confirm [off|on]           a window per read while unlocked (off asks the master password)", "/vault confirm [off|on]           解锁后每次读取是否弹确认窗（关要主密码）"),
 	tr("/vault settings [key value]        show/change settings (vault.unlock, bitwarden.*, ente.* …)", "/vault settings [键 值]            查看/修改设置（vault.unlock、bitwarden.*、ente.* …）"),
 	tr("/vault ente-key                    save Ente's ENTE_CLI_VAULT_KEY (no keychain, no login)", "/vault ente-key                    保存 ente 的 ENTE_CLI_VAULT_KEY（免钥匙串/免登录）"),
 	tr("/vault status                      state and grants left", "/vault status                      状态与授权剩余时间"),
@@ -861,22 +867,61 @@ function commandHandler(scope: Scope, bw: BwState) {
 				}
 				return;
 			}
+			case "confirm": {
+				// /vault confirm            show
+				// /vault confirm off|on     turn the per-read window off (asks the master password) / on
+				const [arg] = rest;
+				if (!arg) {
+					try {
+						const current = await cli.json<Settings>(["settings", ...tokenArgs(scope)]);
+						note(ctx, `vault.confirm: ${current.vault.confirm}${current.vault.confirm ? tr("  (a window per read while unlocked)", "  （解锁后每次读取弹确认窗）") : tr("  (the unlock is the approval; reads are audited)", "  （解锁即授权；读取仍记审计）")}`);
+					} catch (error) {
+						note(ctx, `ai-vault: ${describe(error)}`, "error");
+					}
+					return;
+				}
+				const value = arg.toLowerCase();
+				if (!["off", "on", "false", "true"].includes(value)) {
+					note(ctx, tr("usage: /vault confirm [off|on]", "用法: /vault confirm [off|on]"), "warning");
+					return;
+				}
+				const turnOff = value === "off" || value === "false";
+				try {
+					const run = await cli.withPassword(["settings", "vault.confirm", turnOff ? "false" : "true", ...tokenArgs(scope)], () =>
+						promptSecret(dialogs(ctx), tr("ai-vault · master password", "ai-vault · 主密码"), tr("turn off the per-read confirmation", "关闭每次读取的确认窗")),
+					);
+					forgetSettings();
+					const updated = JSON.parse(run.stdout) as Settings;
+					note(
+						ctx,
+						updated.vault.confirm
+							? tr("vault.confirm is on: every read opens a confirm window.", "vault.confirm 已开：每次读取弹确认窗。")
+							: tr(
+									"vault.confirm is off: while a session is unlocked, reads return without a window. Each read is still written to the audit log. Turning it back on: /vault confirm on",
+									"vault.confirm 已关：会话解锁期间读取不再弹窗。每次读取仍写审计。重新打开：/vault confirm on",
+								),
+					);
+				} catch (error) {
+					note(ctx, `ai-vault: ${error instanceof CliError && error.denied ? tr("cancelled", "已取消") : describe(error)}`, "warning");
+				}
+				return;
+			}
 			case "settings": {
 				const [key, ...valueParts] = rest;
 				const value = valueParts.join(" ").trim();
 				try {
 					if (!key) {
-						note(ctx, settingsText(await cli.json<Settings>(["settings"])));
+						note(ctx, settingsText(await cli.json<Settings>(["settings", ...tokenArgs(scope)])));
 						return;
 					}
 					if (!value) {
-						const one = await cli.json<{ key: string; value: string }>(["settings", key]);
+						const one = await cli.json<{ key: string; value: string }>(["settings", key, ...tokenArgs(scope)]);
 						note(ctx, `${one.key}: ${one.value}`);
 						return;
 					}
 					// `vault.unlock` opens its own password window (or answers
 					// needs-ui); the other keys do not prompt at all.
-					const run = await cli.withPassword(["settings", key, value], () =>
+					const run = await cli.withPassword(["settings", key, value, ...tokenArgs(scope)], () =>
 						promptSecret(dialogs(ctx), tr("ai-vault · master password", "ai-vault · 主密码"), tr("changing the unlock policy needs verification", "改变解锁模式需要验证")),
 					);
 					forgetSettings();

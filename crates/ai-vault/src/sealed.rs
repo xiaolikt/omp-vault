@@ -33,12 +33,6 @@ impl Kind {
         }
     }
 
-    fn policy(self, config: &config::Config) -> config::StorePolicy {
-        match self {
-            Kind::Bitwarden => config.bitwarden.store,
-            Kind::Ente => config.ente,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,9 +118,7 @@ impl Stored {
 
 /// Store a key, honouring the current `bitwarden.unlock` policy. `session`
 /// means "do not persist": the caller keeps it in memory instead.
-pub fn save(paths: &Paths, kind: Kind, secret: &str) -> Result<Option<i64>, String> {
-    let config = config::load(paths);
-    let policy = kind.policy(&config);
+pub fn save(paths: &Paths, kind: Kind, secret: &str, policy: config::StorePolicy) -> Result<Option<i64>, String> {
     if policy.unlock == UnlockMode::Session {
         clear(paths, kind);
         return Err(format!(

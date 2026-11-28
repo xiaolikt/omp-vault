@@ -70,24 +70,32 @@ enum Cmd {
     },
     /// Show or change machine-wide settings
     Settings {
-        /// Dotted key (vault.unlock, vault.hours, bitwarden.unlock,
-        /// bitwarden.hours, bitwarden.import); omit to print everything
+        /// Dotted key (vault.unlock, vault.hours, vault.confirm,
+        /// bitwarden.unlock, bitwarden.hours, bitwarden.import, ente.*); omit
+        /// to print everything
         key: Option<String>,
         /// New value; omit to print the current one
         value: Option<String>,
-        /// Read the vault master password from stdin (changing vault.unlock)
+        /// Read the vault master password from stdin (for the changes that need it)
         #[arg(long)]
         password_stdin: bool,
+        #[arg(long, env = "AI_VAULT_TOKEN")]
+        token: Option<String>,
     },
     /// The persisted `bw` session key (bitwarden.unlock = never | time)
     BwSession {
         /// get | put | clear
         action: String,
+        /// `put` reads the policy from the store, so it needs an unlocked session
+        #[arg(long, env = "AI_VAULT_TOKEN")]
+        token: Option<String>,
     },
     /// Ente's `ENTE_CLI_VAULT_KEY` (ente.unlock = never | time)
     EnteSession {
         /// get | put | clear
         action: String,
+        #[arg(long, env = "AI_VAULT_TOKEN")]
+        token: Option<String>,
     },
     /// Show or change how often the master password is asked for
     Mode {
@@ -102,6 +110,8 @@ enum Cmd {
         /// Read the master password from stdin (changing the mode needs it)
         #[arg(long)]
         password_stdin: bool,
+        #[arg(long, env = "AI_VAULT_TOKEN")]
+        token: Option<String>,
     },
     /// Session state, item count, and remaining read grants
     Status {
@@ -342,13 +352,13 @@ fn dispatch(cmd: Cmd, paths: &Paths, json: bool) -> Outcome {
         Cmd::Unlock { password_stdin, requester, idle_min } => {
             unlock(paths, &out, password_stdin, &requester, idle_min)
         }
-        Cmd::Settings { key, value, password_stdin } => {
-            settings(paths, &out, key.as_deref(), value.as_deref(), None, password_stdin)
+        Cmd::Settings { key, value, password_stdin, token } => {
+            settings(paths, &out, token.as_deref(), key.as_deref(), value.as_deref(), None, password_stdin)
         }
-        Cmd::BwSession { action } => sealed_session(paths, &out, Kind::Bitwarden, &action),
-        Cmd::EnteSession { action } => sealed_session(paths, &out, Kind::Ente, &action),
-        Cmd::Mode { action, value, hours, password_stdin } => {
-            mode(paths, &out, &action, value.as_deref(), hours, password_stdin)
+        Cmd::BwSession { action, token } => sealed_session(paths, &out, Kind::Bitwarden, &action, token.as_deref()),
+        Cmd::EnteSession { action, token } => sealed_session(paths, &out, Kind::Ente, &action, token.as_deref()),
+        Cmd::Mode { action, value, hours, password_stdin, token } => {
+            mode(paths, &out, token.as_deref(), &action, value.as_deref(), hours, password_stdin)
         }
         Cmd::Status { token } => status(paths, &out, token),
         Cmd::Lock { token, all } => lock(paths, &out, token, all),
@@ -404,8 +414,8 @@ fn idle_ms(minutes: Option<i64>) -> i64 {
 ///   time    -> absolute deadline, `hours` from now
 ///   session -> no deadline, with a 7-day ceiling in case an agent dies
 ///              without locking
-fn policy(paths: &Paths, idle_min: Option<i64>) -> (i64, Option<i64>, UnlockPolicy) {
-    let policy = config::load(paths).unlock;
+fn policy(idle_min: Option<i64>, config: &config::Config) -> (i64, Option<i64>, UnlockPolicy) {
+    let policy = config.unlock;
     if let Some(minutes) = idle_min {
         return (idle_ms(Some(minutes)), None, policy);
     }
@@ -497,6 +507,10 @@ fn open_store(paths: &Paths) -> Result<crypto::StoreFile, Fault> {
 }
 
 fn items_with(session: &Session, store: &crypto::StoreFile) -> Result<Vec<Item>, Fault> {
+    Ok(payload_with(session, store)?.items)
+}
+
+fn payload_with(session: &Session, store: &crypto::StoreFile) -> Result<crypto::Payload, Fault> {
     let key = session
         .key()
         .ok_or_else(|| Fault::Auth("session token has no usable key — unlock again".into()))?;
@@ -506,6 +520,19 @@ fn items_with(session: &Session, store: &crypto::StoreFile) -> Result<Vec<Item>,
     })
 }
 
+/// Write the settings back into the store under this session's key.
+fn config_write(paths: &Paths, session: &Session, config: &config::Config) -> Result<(), Fault> {
+    let _guard = StoreLock::acquire(paths)?;
+    let store = open_store(paths)?;
+    let key = session
+        .key()
+        .ok_or_else(|| Fault::Auth("session token has no usable key — unlock again".into()))?;
+    let sealed = config::write_with(&store, &key, config)?;
+    let bytes = serde_json::to_vec(&sealed).map_err(|e| Fault::Error(format!("cannot serialize store: {e}")))?;
+    crypto::write_atomic(&paths.store(), &bytes)?;
+    Ok(())
+}
+
 /// The secret the host process (pi/omp extension) holds and passes to each
 /// CLI call through the environment. A bare `ai-vault` typed by a human has
 /// none, which is fine: that caller never needs to relay an approval.
@@ -513,13 +540,18 @@ fn host_secret() -> Option<String> {
     std::env::var("AI_VAULT_HOST_SECRET").ok().filter(|s| !s.is_empty())
 }
 
-/// What session files are signed with: the host's memory-only secret when
-/// there is one, else the store's wrap key (a human at a terminal).
-fn signing_key(paths: &Paths) -> Result<Option<String>, String> {
-    if let Some(secret) = host_secret() {
-        return Ok(Some(secret));
+/// What a session file is signed with: the host's memory-only secret when
+/// the caller presented one, else the store's wrap key (a human at a terminal).
+fn signer(paths: &Paths) -> Result<session::Signer, String> {
+    match host_secret() {
+        Some(secret) => Ok(session::Signer::Host(secret)),
+        None => sealed::wrap_key_hex(paths).map(session::Signer::Wrap),
     }
-    sealed::wrap_key_hex(paths).map(Some)
+}
+
+/// Both keys, for checking a file against whichever one signed it.
+fn signing_keys(paths: &Paths) -> Result<(Option<String>, Option<String>), String> {
+    Ok((host_secret(), Some(sealed::wrap_key_hex(paths)?)))
 }
 
 /// The host integration (the extension) is recognised by the secret it
@@ -553,7 +585,8 @@ fn auto_session(paths: &Paths) -> Option<Session> {
 /// An explicit token, else the machine-wide auto session.
 fn load_session(paths: &Paths, token: Option<&str>) -> Result<Session, Fault> {
     if let Some(token) = token.filter(|t| !t.is_empty()) {
-        return session::load(paths, token, signing_key(paths)?.as_deref()).map_err(Fault::Auth);
+        let (host, wrap) = signing_keys(paths)?;
+        return session::load(paths, token, host.as_deref(), wrap.as_deref()).map_err(Fault::Auth);
     }
     auto_session(paths).ok_or_else(|| {
         Fault::Auth("vault is locked (no session token) — unlock first".into())
@@ -572,8 +605,8 @@ fn persist(paths: &Paths, session: &Session) {
     } else {
         // Best-effort like the rest of this helper; a failed sign means the
         // next call simply asks to unlock again.
-        match signing_key(paths) {
-            Ok(key) => session.save(paths, key.as_deref()),
+        match signer(paths) {
+            Ok(signer) => session.save(paths, &signer),
             Err(e) => Err(e),
         }
     };
@@ -593,14 +626,14 @@ where
 {
     let _guard = StoreLock::acquire(paths)?;
     let store = open_store(paths)?;
-    let mut items = items_with(session, &store)?;
+    let mut payload = payload_with(session, &store)?;
     let now = store::now_iso();
-    f(&mut items, &now)?;
+    f(&mut payload.items, &now)?;
     let key = session
         .key()
         .ok_or_else(|| Fault::Auth("session token has no usable key — unlock again".into()))?;
     let salt = crypto::hex_to_bytes(&session.salt).ok_or_else(|| Fault::Error("session salt is corrupt".into()))?;
-    let sealed = crypto::seal(&salt, session.kdf.unwrap_or_default(), &key, &items)?;
+    let sealed = crypto::seal(&salt, session.kdf.unwrap_or_default(), &key, &payload.items, &payload.config)?;
     let bytes = serde_json::to_vec(&sealed).map_err(|e| Fault::Error(format!("cannot serialize store: {e}")))?;
     crypto::write_atomic(&paths.store(), &bytes)?;
     Ok(())
@@ -618,14 +651,14 @@ fn rekey(paths: &Paths, out: &Out, password_stdin: bool) -> Outcome {
     } else {
         ask_password(tr("ai-vault · upgrade key parameters", "ai-vault · 升级密钥参数"), tr("master password", "主密码"))?
     };
-    let (items, _old_key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
+    let (payload, _old_key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
         crypto::OpenError::WrongPassword => Fault::Auth("wrong master password".into()),
         crypto::OpenError::Broken(message) => Fault::Error(message),
     })?;
     let salt = crypto::hex_to_bytes(&store.salt).ok_or_else(|| Fault::Error("vault salt is corrupt".into()))?;
     let kdf = Kdf::default();
     let new_key = crypto::derive_key(&password, &salt, kdf).map_err(|e| Fault::Error(e.to_string()))?;
-    let sealed = crypto::seal(&salt, kdf, &new_key, &items)?;
+    let sealed = crypto::seal(&salt, kdf, &new_key, &payload.items, &payload.config)?;
     {
         let _guard = StoreLock::acquire(paths)?;
         let bytes = serde_json::to_vec(&sealed).map_err(|e| Fault::Error(format!("cannot serialize store: {e}")))?;
@@ -634,7 +667,7 @@ fn rekey(paths: &Paths, out: &Out, password_stdin: bool) -> Outcome {
     // Other live sessions hold the old key; they cannot open the new file and
     // will be told to unlock again. The machine session is simply re-minted.
     let _ = session::delete_auto(paths);
-    if config::load(paths).unlock.mode == UnlockMode::Never {
+    if payload.config.unlock.mode == UnlockMode::Never {
         let auto = Session::new("rekey", 0, None, &sealed, &new_key);
         session::save_auto(paths, &auto)?;
     }
@@ -655,7 +688,6 @@ fn doctor(paths: &Paths, out: &Out) -> Outcome {
         "audit": paths.audit(),
         "display": dialog::has_display(),
         "zenity": which("zenity"),
-        "mode": config::load(paths).unlock.mode.as_str(),
         "auto": paths.auto_session().exists(),
         "kdf": crypto::read_store(&paths.store()).ok().flatten().map(|s| s.kdf().n),
     });
@@ -702,7 +734,11 @@ fn init(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_mi
     let salt = crypto::random_bytes::<16>();
     let kdf = Kdf::default();
     let key = crypto::derive_key(&password, &salt, kdf).map_err(|e| Fault::Error(e.to_string()))?;
-    let sealed = crypto::seal(&salt, kdf, &key, &[])?;
+    let mut config = config::Config::default();
+    if let Some(legacy) = config::take_legacy(paths) {
+        config = legacy;
+    }
+    let sealed = crypto::seal(&salt, kdf, &key, &[], &config)?;
     {
         let _guard = StoreLock::acquire(paths)?;
         if paths.store().exists() {
@@ -712,13 +748,13 @@ fn init(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_mi
         crypto::write_atomic(&paths.store(), &bytes)?;
     }
     session::ensure_session_dir(paths)?;
-    let (idle, deadline, policy) = policy(paths, idle_min);
-    let secret = signing_key(paths)?;
+    let (idle, deadline, policy) = policy(idle_min, &config);
     let session = Session::new(requester, idle, deadline, &sealed, &key);
     if policy.mode == UnlockMode::Never {
         session::save_auto(paths, &session)?;
     } else {
-        session.save(paths, secret.as_deref())?;
+        let signer = signer(paths)?;
+        session.save(paths, &signer)?;
     }
     audit::append(&paths.audit(), requester, "init", None, None);
     let value = json!({
@@ -742,26 +778,38 @@ fn unlock(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_
     } else {
         ask_password(tr("ai-vault · unlock", "ai-vault · 解锁"), tr("local store master password", "本地库主密码"))?
     };
-    let (items, key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
+    let (mut payload, key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
         crypto::OpenError::WrongPassword => {
             audit::append(&paths.audit(), requester, "unlock_failed", None, Some("bad-password"));
             Fault::Auth("wrong master password".into())
         }
         crypto::OpenError::Broken(message) => Fault::Error(message),
     })?;
+    let items = payload.items;
+    // A plaintext config.json from an older version is brought inside the
+    // store now that the password has been verified — minus anything that
+    // lowers protection, which a file edit must never grant.
+    let migrated = config::take_legacy(paths).map(|legacy| {
+        payload.config = legacy;
+        true
+    });
+    if migrated == Some(true) {
+        let salt = crypto::hex_to_bytes(&store.salt).ok_or_else(|| Fault::Error("vault salt is corrupt".into()))?;
+        let sealed = crypto::seal(&salt, store.kdf(), &key, &items, &payload.config)?;
+        let bytes = serde_json::to_vec(&sealed).map_err(|e| Fault::Error(format!("cannot serialize store: {e}")))?;
+        crypto::write_atomic(&paths.store(), &bytes)?;
+    }
     session::ensure_session_dir(paths)?;
     session::sweep(paths);
-    let (idle, deadline, policy) = policy(paths, idle_min);
-    // A host that did not pass a secret gets a fresh one to keep for this
-    // session: it is the only thing that can sign later edits to the file.
+    let (idle, deadline, policy) = policy(idle_min, &payload.config);
     // The host brings its own secret (so the same process can sign later
     // calls); everyone else is signed with the wrap key.
-    let secret = signing_key(paths)?;
     let session = Session::new(requester, idle, deadline, &store, &key);
     if policy.mode == UnlockMode::Never {
         session::save_auto(paths, &session)?;
     } else {
-        session.save(paths, secret.as_deref())?;
+        let signer = signer(paths)?;
+        session.save(paths, &signer)?;
     }
     audit::append(&paths.audit(), requester, "unlock", None, Some(policy.mode.as_str()));
     let value = json!({
@@ -784,6 +832,7 @@ fn setting_key(raw: &str) -> Option<&'static str> {
     match raw.trim().to_lowercase().as_str() {
         "vault.unlock" | "vault.mode" | "unlock" | "mode" => Some("vault.unlock"),
         "vault.hours" | "hours" => Some("vault.hours"),
+        "vault.confirm" | "confirm" => Some("vault.confirm"),
         "bitwarden.unlock" | "bitwarden.mode" | "bw.unlock" | "bw.mode" => Some("bitwarden.unlock"),
         "bitwarden.hours" | "bw.hours" => Some("bitwarden.hours"),
         "bitwarden.import" | "bw.import" | "import" => Some("bitwarden.import"),
@@ -801,6 +850,7 @@ fn settings_value(config: &config::Config, paths: &Paths) -> serde_json::Value {
         "vault": {
             "unlock": config.unlock.mode.as_str(),
             "hours": config.unlock.hours,
+            "confirm": config.unlock.confirm,
             "auto": paths.auto_session().exists(),
         },
         "bitwarden": {
@@ -824,6 +874,11 @@ fn settings_human(config: &config::Config, paths: &Paths) -> String {
     [
         format!("vault.unlock: {}   (never | time | session)", config.unlock.mode.as_str()),
         format!("vault.hours: {}{}", config.unlock.hours, tr("   (time mode)", "   (time 模式)")),
+        format!(
+            "vault.confirm: {}{}",
+            config.unlock.confirm,
+            tr("   (a window per read while unlocked)", "   （解锁后每次读取弹确认窗）")
+        ),
         format!("{} {}", tr("vault machine-wide session:", "vault 机器级会话:"), if paths.auto_session().exists() { tr("yes (no password)", "有（免密）") } else { tr("no", "无") }),
         format!("bitwarden.unlock: {}   (never | time | session)", config.bitwarden.store.unlock.as_str()),
         format!("bitwarden.hours: {}", config.bitwarden.store.hours),
@@ -851,12 +906,18 @@ fn settings_human(config: &config::Config, paths: &Paths) -> String {
 fn settings(
     paths: &Paths,
     out: &Out,
+    token: Option<&str>,
     key: Option<&str>,
     value: Option<&str>,
     hours: Option<i64>,
     password_stdin: bool,
 ) -> Outcome {
-    let mut config = config::load(paths);
+    // The settings live inside the store's ciphertext: reading them needs the
+    // store's key, i.e. an unlocked session. That is the whole point — there
+    // is no file an agent could edit.
+    let session = load_session(paths, token)?;
+    let store = open_store(paths)?;
+    let mut config = payload_with(&session, &store)?.config;
 
     let Some(raw_key) = key.filter(|k| !k.trim().is_empty()) else {
         let value = settings_value(&config, paths);
@@ -873,6 +934,7 @@ fn settings(
         let shown = match key {
             "vault.unlock" => config.unlock.mode.as_str().to_string(),
             "vault.hours" => config.unlock.hours.to_string(),
+            "vault.confirm" => config.unlock.confirm.to_string(),
             "bitwarden.unlock" => config.bitwarden.store.unlock.as_str().to_string(),
             "bitwarden.hours" => config.bitwarden.store.hours.to_string(),
             "ente.unlock" => config.ente.unlock.as_str().to_string(),
@@ -887,19 +949,13 @@ fn settings(
         "vault.unlock" => {
             let mode = UnlockMode::parse(raw_value)
                 .ok_or_else(|| Fault::Usage(format!("unknown mode \"{raw_value}\" — never, time or session")))?;
-            let store = open_store(paths)?;
             // Changing when the vault opens is a security decision: always verify.
-            let password = if password_stdin {
-                read_password()?
-            } else {
-                ask_password(tr("ai-vault · master password", "ai-vault · 主密码"), tr("switching the unlock policy", "切换解锁模式"))?
-            };
-            let (_, vault_key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
-                crypto::OpenError::WrongPassword => Fault::Auth("wrong master password".into()),
-                crypto::OpenError::Broken(message) => Fault::Error(message),
-            })?;
-            config.unlock = UnlockPolicy { mode, hours: hours.unwrap_or(config.unlock.hours).clamp(1, 24 * 90) };
-            config::save(paths, &config)?;
+            let (payload, vault_key) = verify_master(paths, &store, password_stdin, tr("switching the unlock policy", "切换解锁模式"))?;
+            config.unlock.mode = mode;
+            if let Some(hours) = hours {
+                config.unlock.hours = hours.clamp(1, 24 * 90);
+            }
+            config_write(paths, &session, &config)?;
             session::ensure_session_dir(paths)?;
             if mode == UnlockMode::Never {
                 let auto = Session::new("mode", 0, None, &store, &vault_key);
@@ -907,6 +963,7 @@ fn settings(
             } else {
                 session::delete_auto(paths);
             }
+            let _ = payload;
             audit::append(&paths.audit(), "cli", "mode", None, Some(mode.as_str()));
         }
         "vault.hours" => {
@@ -914,16 +971,36 @@ fn settings(
                 .parse()
                 .map_err(|_| Fault::Usage(format!("\"{raw_value}\" is not a number of hours")))?;
             config.unlock.hours = hours.clamp(1, 24 * 90);
-            config::save(paths, &config)?;
+            config_write(paths, &session, &config)?;
+        }
+        "vault.confirm" => {
+            // Turning the per-read window off is a security decision, priced
+            // like the unlock policy: the master password.
+            let on = matches!(raw_value, "true" | "1" | "yes" | "on" | "ask")
+                || if matches!(raw_value, "false" | "0" | "no" | "off") {
+                    false
+                } else {
+                    return Err(Fault::Usage(format!("\"{raw_value}\" is not true or false")));
+                };
+            if !on {
+                verify_master(paths, &store, password_stdin, tr("turn off the per-read confirmation", "关闭每次读取的确认窗"))?;
+            }
+            config.unlock.confirm = on;
+            config_write(paths, &session, &config)?;
+            audit::append(&paths.audit(), "cli", "settings", None, Some(if on { "confirm=on" } else { "confirm=off" }));
         }
         "bitwarden.unlock" => {
             let mode = UnlockMode::parse(raw_value)
                 .ok_or_else(|| Fault::Usage(format!("unknown mode \"{raw_value}\" — never, time or session")))?;
+            // Keeping the bw session key on disk is a downgrade of its own.
+            if mode != UnlockMode::Session {
+                verify_master(paths, &store, password_stdin, tr("keeping the Bitwarden session on disk", "把 Bitwarden 会话落盘"))?;
+            }
             config.bitwarden.store.unlock = mode;
             if let Some(hours) = hours {
                 config.bitwarden.store.hours = hours.clamp(1, 24 * 90);
             }
-            config::save(paths, &config)?;
+            config_write(paths, &session, &config)?;
             // Going back to per-session must not leave a key on disk.
             if mode == UnlockMode::Session {
                 sealed::clear(paths, Kind::Bitwarden);
@@ -934,16 +1011,19 @@ fn settings(
                 .parse()
                 .map_err(|_| Fault::Usage(format!("\"{raw_value}\" is not a number of hours")))?;
             config.bitwarden.store.hours = hours.clamp(1, 24 * 90);
-            config::save(paths, &config)?;
+            config_write(paths, &session, &config)?;
         }
         "ente.unlock" => {
             let mode = UnlockMode::parse(raw_value)
                 .ok_or_else(|| Fault::Usage(format!("unknown mode \"{raw_value}\" — never, time or session")))?;
+            if mode != UnlockMode::Session {
+                verify_master(paths, &store, password_stdin, tr("keeping the Ente key on disk", "把 Ente 密钥落盘"))?;
+            }
             config.ente.unlock = mode;
             if let Some(hours) = hours {
                 config.ente.hours = hours.clamp(1, 24 * 90);
             }
-            config::save(paths, &config)?;
+            config_write(paths, &session, &config)?;
             if mode == UnlockMode::Session {
                 sealed::clear(paths, Kind::Ente);
             }
@@ -953,14 +1033,18 @@ fn settings(
                 .parse()
                 .map_err(|_| Fault::Usage(format!("\"{raw_value}\" is not a number of hours")))?;
             config.ente.hours = hours.clamp(1, 24 * 90);
-            config::save(paths, &config)?;
+            config_write(paths, &session, &config)?;
         }
         _ => {
             let import = ImportPolicy::parse(raw_value).ok_or_else(|| {
                 Fault::Usage(format!("unknown import policy \"{raw_value}\" — ask, always or never"))
             })?;
+            // "always" imports a Bitwarden hit with no window: a downgrade.
+            if import == ImportPolicy::Always {
+                verify_master(paths, &store, password_stdin, tr("importing Bitwarden hits without asking", "不询问就导入 Bitwarden 条目"))?;
+            }
             config.bitwarden.import = import;
-            config::save(paths, &config)?;
+            config_write(paths, &session, &config)?;
         }
     }
 
@@ -969,23 +1053,47 @@ fn settings(
     Ok(())
 }
 
+/// Ask for the master password and prove it against the store. Used for
+/// every change that lowers protection. Returns the opened payload and the
+/// key, for the one caller that mints the machine-wide session.
+fn verify_master(
+    paths: &Paths,
+    store: &crypto::StoreFile,
+    password_stdin: bool,
+    why: &str,
+) -> Result<(crypto::Payload, crypto::Key), Fault> {
+    let password = if password_stdin {
+        read_password()?
+    } else {
+        ask_password(tr("ai-vault · master password", "ai-vault · 主密码"), why)?
+    };
+    crypto::open_with_passphrase(store, &password).map_err(|e| match e {
+        crypto::OpenError::WrongPassword => {
+            audit::append(&paths.audit(), "cli", "settings", None, Some("denied=bad-password"));
+            Fault::Auth("wrong master password".into())
+        }
+        crypto::OpenError::Broken(message) => Fault::Error(message),
+    })
+}
+
 /// `/vault mode` is a shortcut for the `vault.unlock` setting.
 fn mode(
     paths: &Paths,
     out: &Out,
+    token: Option<&str>,
     action: &str,
     value: Option<&str>,
     hours: Option<i64>,
     password_stdin: bool,
 ) -> Outcome {
     match action.trim() {
-        "" | "get" | "status" => settings(paths, out, Some("vault.unlock"), None, None, password_stdin),
-        "set" => settings(paths, out, Some("vault.unlock"), value, hours, password_stdin),
+        "" | "get" | "status" => settings(paths, out, token, Some("vault.unlock"), None, None, password_stdin),
+        "set" => settings(paths, out, token, Some("vault.unlock"), value, hours, password_stdin),
         other => Err(Fault::Usage(format!("unknown mode action \"{other}\""))),
     }
 }
 
-fn sealed_session(paths: &Paths, out: &Out, kind: Kind, action: &str) -> Outcome {
+fn sealed_session(paths: &Paths, out: &Out, kind: Kind, action: &str, token: Option<&str>) -> Outcome {
     match action.trim() {
         "" | "get" => {
             let stored = sealed::load(paths, kind)?
@@ -1003,7 +1111,14 @@ fn sealed_session(paths: &Paths, out: &Out, kind: Kind, action: &str) -> Outcome
             if key.is_empty() {
                 return Err(Fault::Usage("bw-session put expects the session key on stdin".into()));
             }
-            let expires_at = sealed::save(paths, kind, &key)?;
+            let session = load_session(paths, token)?;
+            let store = open_store(paths)?;
+            let payload = payload_with(&session, &store)?;
+            let policy = match kind {
+                Kind::Bitwarden => payload.config.bitwarden.store,
+                Kind::Ente => payload.config.ente,
+            };
+            let expires_at = sealed::save(paths, kind, &key, policy)?;
             audit::append(&paths.audit(), "cli", "sealed", None, Some(secret_kind_label(kind)));
             out.value(json!({ "ok": true, "expiresAt": expires_at }), || {
                 match expires_at {
@@ -1038,7 +1153,7 @@ fn status(paths: &Paths, out: &Out, token: Option<String>) -> Outcome {
         .iter()
         .map(|(name, until)| (name.clone(), json!({ "expiresAt": until, "leftMs": until - now })))
         .collect();
-    let policy = config::load(paths).unlock;
+    let policy = payload_with(&session, &store)?.config.unlock;
     let auto = session::load_auto(paths)
         .ok()
         .flatten()
@@ -1052,6 +1167,7 @@ fn status(paths: &Paths, out: &Out, token: Option<String>) -> Outcome {
         "expiresAt": session.expiry(),
         "mode": policy.mode.as_str(),
         "hours": policy.hours,
+        "confirm": policy.confirm,
         "auto": auto,
         "store": paths.store(),
         "grants": grants,
@@ -1141,7 +1257,8 @@ fn get(
 ) -> Outcome {
     let mut session = load_session(paths, token.as_deref())?;
     let store = open_store(paths)?;
-    let items = items_with(&session, &store)?;
+    let payload = payload_with(&session, &store)?;
+    let items = payload.items;
     let item = store::find(&items, name).cloned().ok_or_else(|| {
         let names = items.iter().map(|i| i.name.clone()).collect::<Vec<_>>().join(", ");
         Fault::Error(format!("no such entry: \"{name}\". available: {}", if names.is_empty() { "(empty)" } else { &names }))
@@ -1151,8 +1268,17 @@ fn get(
     // `never` mode is the "the agent may use these freely" mode: the machine-wide
     // session is the authorization, so no window opens on each read.
     let auto = token.as_deref().map_or(true, |t| t.trim().is_empty());
+    // `vault.confirm = false`: the master password that opened this session is
+    // the approval. Safe for exactly that reason — a session the extension
+    // opened can only exist because the user typed the password (a token the
+    // model finds on disk is useless without the host secret). Every read is
+    // still written to the audit log, entry by entry.
+    let no_confirm = payload.config.unlock.confirm == false;
     let via = if auto {
         "no-password"
+    } else if no_confirm {
+        audit::append(&paths.audit(), &session.requester, "read_allow", Some(&item.name), Some("confirm-off"));
+        "unlocked-no-confirm"
     } else if session.grant(&item.name, now).is_some() {
         "existing-grant"
     } else {

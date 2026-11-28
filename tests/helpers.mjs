@@ -134,3 +134,39 @@ export function bind(ompVault, omp = true) {
 }
 
 export const textOf = (result) => result.content.find((block) => block.type === "text")?.text ?? "";
+
+/** A fresh human session token for the throwaway store, or undefined. */
+export function unlockToken() {
+	const run = spawnSync(process.env.AI_VAULT_BIN, ["unlock", "--password-stdin", "--json"], {
+		input: "correct horse battery\n",
+		env: process.env,
+		encoding: "utf8",
+	});
+	return run.status === 0 ? JSON.parse(run.stdout).token : undefined;
+}
+
+/**
+ * Change an ai-vault setting the way a host does: with a session token, and
+ * with the master password on stdin for the changes that lower protection
+ * (confirm off, unlock never, import always …). Returns the CLI result.
+ */
+export function setSetting(key, value, { password } = {}) {
+	// The extension caches settings for 30s; a change made here must be seen.
+	process.emit("ai-vault:settings-changed");
+	const bin = process.env.AI_VAULT_BIN;
+	const run = spawnSync(bin, ["unlock", "--password-stdin", "--json"], {
+		input: `${password ?? "correct horse battery"}\n`,
+		env: process.env,
+		encoding: "utf8",
+	});
+	// In `never` mode the unlock refreshes the machine-wide session and the
+	// caller is expected to use no token at all (that is what `auto: true`
+	// means); a per-session token is not minted there.
+	const unlocked = run.status === 0 ? JSON.parse(run.stdout) : undefined;
+	const token = unlocked && !unlocked.auto ? unlocked.token : undefined;
+	return spawnSync(bin, ["settings", key, value, "--password-stdin", ...(token ? ["--token", token] : [])], {
+		input: `${password ?? "correct horse battery"}\n`,
+		env: process.env,
+		encoding: "utf8",
+	});
+}

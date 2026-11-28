@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, subCtx, textOf, useMocks } from "./helpers.mjs";
+import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, setSetting, subCtx, textOf, useMocks } from "./helpers.mjs";
 
 // The extension is only a client: these drive the real ai-vault binary (built
 // by `npm test`) plus the mock zenity, with a throwaway store.
@@ -188,29 +188,22 @@ test("a denied Bitwarden read is not retried", async () => {
 
 test("never mode reads without any window, and the switch needs the password", async () => {
 	const bin = process.env.AI_VAULT_BIN;
-	const switchMode = (mode) =>
-		spawnSync(bin, ["mode", "set", mode, "--password-stdin"], {
-			input: `${PW}\n`,
-			env: process.env,
-			encoding: "utf8",
-		});
+	// `mode set` reads and writes the settings inside the store: it needs an
+	// unlocked session (the helper opens one) and the master password.
+	const switchMode = (mode) => setSetting("vault.unlock", mode);
 	const toNever = switchMode("never");
-	assert.equal(toNever.status, 0, toNever.stderr);
+	assert.equal(toNever.status, 0, "set never: " + toNever.stderr + " | env HOST=" + process.env.AI_VAULT_HOST + " SECRET=" + (process.env.AI_VAULT_HOST_SECRET ? "set" : "unset"));
 
 	const b = bind(aiVault, true);
 	const ctx = makeCtx().ctx;
 	const before = prompts("--question") + prompts("--password");
 	const result = await b.tool("vault_get", { name: "GitHub" }, ctx);
-	assert.equal(result.details.via, "no-password");
+	assert.equal(result.details.via, "no-password", textOf(result));
 	assert.match(textOf(result), /pw-one/);
 	assert.equal(prompts("--question") + prompts("--password"), before, "no window in never mode");
 
 	// A wrong password must not change the policy.
-	const wrong = spawnSync(bin, ["mode", "set", "session", "--password-stdin"], {
-		input: "definitely-wrong\n",
-		env: process.env,
-		encoding: "utf8",
-	});
+	const wrong = setSetting("vault.unlock", "session", { password: "definitely-wrong" });
 	assert.equal(wrong.status, 5);
 
 	const back = switchMode("session");
@@ -219,7 +212,7 @@ test("never mode reads without any window, and the switch needs the password", a
 
 test("bitwarden.import=never reads once with a single window", async () => {
 	const bin = process.env.AI_VAULT_BIN;
-	spawnSync(bin, ["settings", "bitwarden.import", "never"], { env: process.env });
+	setSetting("bitwarden.import", "never");
 	forgetSettings();
 	const b = bind(aiVault, true);
 	const ctx = makeCtx().ctx;
@@ -235,7 +228,7 @@ test("bitwarden.import=never reads once with a single window", async () => {
 
 test("bitwarden.import=always pulls the entry in without a window", async () => {
 	const bin = process.env.AI_VAULT_BIN;
-	spawnSync(bin, ["settings", "bitwarden.import", "always"], { env: process.env });
+	setSetting("bitwarden.import", "always");
 	forgetSettings();
 	const b = bind(aiVault, true);
 	const ctx = makeCtx().ctx;
@@ -253,16 +246,24 @@ test("bitwarden.import=always pulls the entry in without a window", async () => 
 		JSON.parse(textOf(listed)).some((i) => i.name === "OtherService"),
 		true,
 	);
-	spawnSync(bin, ["settings", "bitwarden.import", "ask"], { env: process.env });
+	setSetting("bitwarden.import", "ask");
 	forgetSettings();
 });
 
 test("a persisted Bitwarden session costs no password", async () => {
 	const bin = process.env.AI_VAULT_BIN;
-	const set = (key, value) => spawnSync(bin, ["settings", key, value], { env: process.env, encoding: "utf8" });
+	const set = (key, value) => setSetting(key, value);
 	assert.equal(set("bitwarden.unlock", "never").status, 0);
 	forgetSettings();
-	const put = spawnSync(bin, ["bw-session", "put"], { input: "GOOD_SESSION", env: process.env, encoding: "utf8" });
+	answers.master(dir, PW);
+	await bind(aiVault, true).cmd("unlock", makeCtx().ctx);
+	const { settingsToken: st, settingsCli: sc } = await import("../packages/pi-ai-vault/src/settings.ts");
+	forgetSettings();
+	const put = spawnSync(bin, ["bw-session", "put", "--token", st() ?? ""], {
+		input: "GOOD_SESSION",
+		env: { ...process.env, AI_VAULT_HOST: "1", AI_VAULT_HOST_SECRET: sc().host.value },
+		encoding: "utf8",
+	});
 	assert.equal(put.status, 0, put.stderr);
 
 	const b = bind(aiVault, true);
@@ -369,3 +370,4 @@ test("vault_get falls back to Bitwarden for a non-login hit and imports it with 
 	assert.equal(card.fields.cardholderName, "Li Jun");
 	assert.equal(JSON.stringify(listed).includes("4111111111111111"), false, "list must mask the card number");
 });
+

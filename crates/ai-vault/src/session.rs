@@ -54,8 +54,41 @@ pub struct Session {
     /// by definition not protected from this user.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "mac")]
     pub mac: Option<String>,
+    /// Which key signed `mac`: "host" (the extension's in-memory secret) or
+    /// "wrap" (the store's key, for a human at a terminal). Verification uses
+    /// the key actually named here, never whichever one happens to be in the
+    /// environment — so a token created one way is not voided by a call made
+    /// the other way.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "signedBy")]
+    pub signed_by: Option<String>,
 }
 
+
+/// Who signs a session file: the host process's in-memory secret, or the
+/// store's wrap key when a human runs `ai-vault` by hand.
+pub enum Signer {
+    Host(String),
+    Wrap(String),
+}
+
+impl Signer {
+    fn label(&self) -> &'static str {
+        match self {
+            Signer::Host(_) => "host",
+            Signer::Wrap(_) => "wrap",
+        }
+    }
+
+    fn hmac(&self, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        let key = match self {
+            Signer::Host(k) | Signer::Wrap(k) => k.as_str(),
+        };
+        let mut hasher = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key.as_bytes()).expect("HMAC takes any key length");
+        hasher.update(body);
+        hasher.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
 
 fn mac_body(session: &Session) -> Vec<u8> {
     // Same struct, `mac` blanked, canonical key order: serde_json::Value sorts
@@ -83,35 +116,48 @@ impl Session {
             key: B64.encode(key),
             grants: BTreeMap::new(),
             mac: None,
+            signed_by: None,
         }
     }
 
-    /// (Re)sign this session with the host's secret. Called before every save.
-    pub fn sign(&mut self, host_secret: Option<&str>) {
-        self.mac = host_secret.map(|secret| {
-            use hmac::{Hmac, Mac};
-            let mut hasher = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes())
-                .expect("HMAC takes any key length");
-            hasher.update(&mac_body(self));
-            hasher.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
-        });
+    /// (Re)sign this session and record who signed it. Called before every save.
+    pub fn sign(&mut self, signer: &Signer) {
+        self.signed_by = Some(signer.label().to_string());
+        let body = mac_body(self);
+        self.mac = Some(signer.hmac(&body));
     }
 
-    /// True when the file was written by a process holding `host_secret`.
-    /// A session with no mac at all is only valid as the `never`-mode session.
-    pub fn verifies(&self, host_secret: Option<&str>) -> bool {
-        let (Some(secret), Some(mac)) = (host_secret, self.mac.as_deref()) else {
-            // The only legitimate unsigned session is the machine-wide one.
-            return self.mac.is_none() && host_secret.is_none();
+    /// True when the file was written by whoever it says signed it, checked
+    /// with *that* key — never whichever one happens to be in the environment.
+    pub fn verifies(&self, host_secret: Option<&str>, wrap_key: Option<&str>) -> bool {
+        let Some(mac) = self.mac.as_deref() else {
+            // The only legitimate unsigned session is the machine-wide one,
+            // which is protected by the directory instead.
+            return host_secret.is_none() && wrap_key.is_none();
+        };
+        let key: &str = match self.signed_by.as_deref() {
+            Some("host") => match host_secret {
+                Some(k) => k,
+                None => return false,
+            },
+            Some("wrap") => match wrap_key {
+                Some(k) => k,
+                None => return false,
+            },
+            // A file from before `signedBy`: accept whichever key fits.
+            _ => match host_secret.or(wrap_key) {
+                Some(k) => k,
+                None => return false,
+            },
         };
         use hmac::{Hmac, Mac};
-        let Ok(mut hasher) = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()) else {
+        let Ok(mut hasher) = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key.as_bytes()) else {
             return false;
         };
         hasher.update(&mac_body(self));
         let expected: String = hasher.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        // Constant-time compare is not required for a 256-bit tag, but cheap.
-        expected.len() == mac.len() && expected.bytes().zip(mac.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
+        expected.len() == mac.len()
+            && expected.bytes().zip(mac.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
     }
 
     pub fn key(&self) -> Option<Zeroizing<[u8; 32]>> {
@@ -152,9 +198,9 @@ impl Session {
             .filter(|until| *until > now)
     }
 
-    pub fn save(&self, paths: &Paths, host_secret: Option<&str>) -> Result<(), String> {
+    pub fn save(&self, paths: &Paths, signer: &Signer) -> Result<(), String> {
         let mut signed = self.clone();
-        signed.sign(host_secret);
+        signed.sign(signer);
         let dir = paths.sessions();
         fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         crate::perms::restrict_dir(&dir);
@@ -165,7 +211,7 @@ impl Session {
 
 /// Load a token for the given store. Missing, expired, or stale tokens are
 /// removed and reported as locked so the caller unlocks again.
-pub fn load(paths: &Paths, token: &str, host_secret: Option<&str>) -> Result<Session, String> {
+pub fn load(paths: &Paths, token: &str, host_secret: Option<&str>, wrap_key: Option<&str>) -> Result<Session, String> {
     let path = paths.session_file(token);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -183,7 +229,18 @@ pub fn load(paths: &Paths, token: &str, host_secret: Option<&str>) -> Result<Ses
     }
     // Edited on disk (a grant minted, a requester renamed): treat as a break-in
     // attempt, say so, and drop it.
-    if !session.verifies(host_secret) {
+    // Only a file this caller holds a key for is judged; one signed under a
+    // key the caller does not have is simply not theirs to use (and is left
+    // alone for whoever does hold that key).
+    let has_key_for_it = match session.signed_by.as_deref() {
+        Some("host") => host_secret.is_some(),
+        Some("wrap") => wrap_key.is_some(),
+        _ => host_secret.is_some() || wrap_key.is_some(),
+    };
+    if !has_key_for_it {
+        return Err("this session belongs to another caller — unlock again".into());
+    }
+    if !session.verifies(host_secret, wrap_key) {
         let _ = fs::remove_file(&path);
         return Err("session file was modified outside ai-vault — unlock again".into());
     }

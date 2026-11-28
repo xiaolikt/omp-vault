@@ -56,7 +56,7 @@ import { bitwardenItems, filterItems } from "./import-map.js";
 import type { Draft } from "./types.js";
 import { onSessionLeave, sessionLabel, withTier } from "./host.js";
 import { confirmWindow, hasDisplay, promptSecret } from "./prompt.js";
-import { getSettingsSafe, settingsCli } from "./settings.js";
+import { getSettingsSafe, settingsCli, settingsToken } from "./settings.js";
 import { tr } from "./i18n.js";
 import { scrubDeep, scrubText } from "./scrub.js";
 
@@ -603,7 +603,8 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 		if (policy.unlock !== "session") {
 			// Keep the key where the CLI can hand it back; the file's expiry comes
 			// from the bitwarden.hours policy.
-			await settingsCli().run(["bw-session", "put"], { stdin: key }).catch(() => undefined);
+			const token = settingsToken();
+			await settingsCli().run(["bw-session", "put", ...(token ? ["--token", token] : [])], { stdin: key }).catch(() => undefined);
 		}
 		await auditEvent("unlock", "ok", st.sessionLabel);
 		// Refresh in the background: a full sync can take seconds on large vaults.

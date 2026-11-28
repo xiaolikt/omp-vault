@@ -65,6 +65,20 @@ HOST_JSON=$(printf 'correct horse' | "$BIN" unlock --password-stdin --json)
 ECHOED=$(printf '%s' "$HOST_JSON" | python3 -c "import json,sys;print(json.load(sys.stdin).get('hostSecret',''))")
 [[ "$ECHOED" == "$HS" ]] && ok "the host's own secret is echoed back" || bad "hostSecret echo mismatch"
 TOKEN=$(printf '%s' "$HOST_JSON" | json token)
+# The settings live inside the store: reading or changing them needs an
+# unlocked session, and the changes that lower protection need the master
+# password on stdin as well. `setting KEY [VALUE]` does both.
+TOKEN_HUMAN=$(printf 'correct horse' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET "$BIN" unlock --password-stdin --json | json token)
+setting() {
+	local key="$1"; shift
+	local tok="$TOKEN_HUMAN" args=()
+	while [[ $# -gt 0 ]]; do
+		if [[ "$1" == "--token" ]]; then tok="$2"; shift 2; else args+=("$1"); shift; fi
+	done
+	printf 'correct horse\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET "$BIN" settings "$key" "${args[@]}" --password-stdin --token "$tok" --json
+}
+# The value of one setting, as `settings KEY` prints it.
+setting_value() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['value'])" "$1"; }
 # relay <entry> <y|n>: a signed approval for the host's token.
 relay() {
 	local ap
@@ -146,8 +160,8 @@ check "an edited token file is rejected" 5 bash -c "'$BIN' get Draft --token '$T
 check "M1: a junk file in the sessions dir is swept on the next call" 0 "$BIN" path --json
 
 echo "== sealed Bitwarden session (M4) =="
-check "switch bitwarden.unlock to never" 0 "$BIN" settings bitwarden.unlock never --json
-check "store a bw session key" 0 bash -c "printf 'BW_BEARER_TOKEN_PLAINTEXT' | '$BIN' bw-session put --json"
+check "switch bitwarden.unlock to never" 0 setting bitwarden.unlock never
+check "store a bw session key" 0 bash -c "printf 'BW_BEARER_TOKEN_PLAINTEXT' | '$BIN' bw-session put --token '$TOKEN_HUMAN' --json"
 grep -q 'BW_BEARER_TOKEN_PLAINTEXT' "$AI_VAULT_DIR/bitwarden.session.json" && bad "the bw key is plaintext on disk" || ok "the bw key is not plaintext on disk"
 [[ -f "$AI_VAULT_DIR/.wrap" ]] && ok "a wrap key exists" || bad "no wrap key"
 [[ "$(mode_of "$AI_VAULT_DIR/.wrap")" == "600" ]] && ok "the wrap key is 0600" || bad "the wrap key is not 0600"
@@ -155,17 +169,17 @@ grep -q 'BW_BEARER_TOKEN_PLAINTEXT' "$AI_VAULT_DIR/bitwarden.session.json" && ba
 mv "$AI_VAULT_DIR/.wrap" "$TMP/wrap.bak"
 check "without the wrap key the session does not open" 1 "$BIN" bw-session get
 mv "$TMP/wrap.bak" "$AI_VAULT_DIR/.wrap"
-"$BIN" settings bitwarden.unlock session --json >/dev/null
+setting bitwarden.unlock session >/dev/null
 
 echo "== ente sealed key (M4 pattern) =="
-check "ente.unlock is readable" 0 "$BIN" settings ente.unlock --json
-check "ente-session put refused in session mode" 1 bash -c "printf 'K' | '$BIN' ente-session put"
-check "switch ente.unlock to never" 0 "$BIN" settings ente.unlock never --json
-check "store the Ente vault key" 0 bash -c "printf 'ENTE_KEY_PLAINTEXT' | '$BIN' ente-session put --json"
+check "ente.unlock is readable" 0 setting ente.unlock
+check "ente-session put refused in session mode" 1 bash -c "printf 'K' | '$BIN' ente-session put --token '$TOKEN_HUMAN'"
+check "switch ente.unlock to never" 0 setting ente.unlock never
+check "store the Ente vault key" 0 bash -c "printf 'ENTE_KEY_PLAINTEXT' | '$BIN' ente-session put --token '$TOKEN_HUMAN' --json"
 grep -q 'ENTE_KEY_PLAINTEXT' "$AI_VAULT_DIR/ente.session.json" && bad "the ente key is plaintext on disk" || ok "the ente key is sealed at rest"
 [[ "$(mode_of "$AI_VAULT_DIR/ente.session.json")" == "600" ]] && ok "ente.session.json is 0600" || bad "ente.session.json is not 0600"
 "$BIN" ente-session get --json | grep -q 'ENTE_KEY_PLAINTEXT' && ok "ente-session get unseals it" || bad "ente-session get cannot unseal"
-"$BIN" settings ente.unlock session --json >/dev/null
+setting ente.unlock session >/dev/null
 check "switching back to session clears the ente key" 5 "$BIN" ente-session get
 
 echo "== item types =="
@@ -212,6 +226,37 @@ PY
 relay Note y >"$TMP/note" 2>&1; [[ $? -eq 0 ]] && ok "get returns a secure note's body" || bad "get of a note failed"
 grep -q 'body: hunter2' "$TMP/note" && ok "the note body is in notes" || bad "note body missing"
 
+echo "== the settings cannot be edited on disk =="
+[[ -f "$AI_VAULT_DIR/config.json" ]] && bad "a plaintext config.json exists" || ok "no plaintext config.json: the settings live inside the store's ciphertext"
+grep -q '"confirm"' "$AI_VAULT_DIR/store.json" && bad "settings are readable in store.json" || ok "settings are not readable in store.json"
+# The attack: a config.json that turns the per-read window off. It is picked
+# up at the next unlock as a legacy file — minus anything that lowers
+# protection, so the attack gains nothing.
+echo '{"vault":{"unlock":"session","hours":8,"confirm":false}}' >"$AI_VAULT_DIR/config.json"
+TKH=$(printf 'correct horse' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET "$BIN" unlock --password-stdin --json | json token)
+setting vault.confirm --token "$TKH" >"$TMP/c2"
+[[ "$(setting_value "$TMP/c2")" == "true" ]] && ok "the legacy file's confirm=false did not make it in" || bad "confirm=false was migrated from the file"
+[[ -f "$AI_VAULT_DIR/config.json" ]] && bad "config.json still there" || ok "the legacy file was removed after migration"
+echo '{"vault":{"unlock":"never","hours":8,"confirm":true}}' >"$AI_VAULT_DIR/config.json"
+TKH=$(printf 'correct horse' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET "$BIN" unlock --password-stdin --json | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["token"] if not d.get("auto") else "")')
+setting vault.unlock --token "$TKH" >"$TMP/c2b"
+[[ "$(setting_value "$TMP/c2b")" == "session" ]] && ok "the legacy file's unlock=never did not make it in either" || bad "unlock=never was migrated from the file"
+# Flipping one byte of the store (where the settings now live) is a tamper.
+cp "$AI_VAULT_DIR/store.json" "$TMP/store.bak"
+python3 -c "
+import json,base64;p='$AI_VAULT_DIR/store.json';d=json.load(open(p));ct=bytearray(base64.b64decode(d['ct']));ct[-1]^=1;d['ct']=base64.b64encode(bytes(ct)).decode();json.dump(d,open(p,'w'))"
+check "a byte flipped in the store is rejected" 5 bash -c "printf 'correct horse' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' unlock --password-stdin"
+cp "$TMP/store.bak" "$AI_VAULT_DIR/store.json"
+# Turning the window off the real way costs the master password.
+TKH=$(printf 'correct horse' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET "$BIN" unlock --password-stdin --json | json token)
+check "confirm off with a wrong password is refused" 5 bash -c "printf 'wrong\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' settings vault.confirm false --password-stdin --token '$TKH'"
+setting vault.confirm false --token "$TKH" >"$TMP/c3"
+setting vault.confirm --token "$TKH" >"$TMP/c3v"
+[[ "$(setting_value "$TMP/c3v")" == "false" ]] && ok "confirm off with the right password" || bad "confirm could not be turned off"
+setting vault.confirm true --token "$TKH" >"$TMP/c4"
+setting vault.confirm --token "$TKH" >"$TMP/c4v"
+[[ "$(setting_value "$TMP/c4v")" == "true" ]] && ok "turning it back on needs no password" || bad "confirm could not be turned back on"
+
 echo "== rekey (L2) =="
 OLD_N=$(python3 -c "import json;print(json.load(open('$AI_VAULT_DIR/store.json'))['kdf']['N'])")
 check "rekey with the password" 0 bash -c "printf 'correct horse' | '$BIN' rekey --password-stdin --json"
@@ -234,10 +279,9 @@ PY
 grep -q 'p1ssw0rd' "$AI_VAULT_DIR/audit.log" && bad "a secret reached the audit log" || ok "no secret in audit.log"
 
 echo "== unlock modes =="
-check "mode get works without a token" 0 "$BIN" mode --json
-check "switching the mode needs the password" 3 "$BIN" mode set never
-check "a wrong password does not switch it" 5 bash -c "printf 'wrong password' | '$BIN' mode set never --password-stdin"
-check "never mode is set with the password" 0 bash -c "printf 'correct horse' | '$BIN' mode set never --password-stdin --json"
+check "mode get works with a session" 0 bash -c "printf 'correct horse\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' mode --password-stdin --token '$TOKEN_HUMAN' --json"
+check "a wrong password does not switch it" 5 bash -c "printf 'wrong password\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' mode set never --password-stdin --token '$TOKEN_HUMAN'"
+check "never mode is set with the password" 0 bash -c "printf 'correct horse\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' mode set never --password-stdin --token '$TOKEN_HUMAN' --json"
 check "never mode needs no token" 0 "$BIN" status --json
 printf 'correct horse' | "$BIN" unlock --password-stdin --json >"$TMP/u2" 2>&1
 python3 - "$TMP/u2" <<'PY' && ok "unlock reports the mode" || bad "unlock output is wrong"
@@ -245,29 +289,29 @@ import json,sys
 d = json.load(open(sys.argv[1]))
 assert d["mode"] == "never" and d["auto"] is True, d
 PY
-check "back to session mode" 0 bash -c "printf 'correct horse' | '$BIN' mode set session --password-stdin --json"
+check "back to session mode" 0 bash -c "printf 'correct horse\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' mode set session --password-stdin --token '$TOKEN_HUMAN' --json"
 check "session mode needs a token again" 5 "$BIN" status
 
 echo "== settings =="
-check "settings prints everything" 0 "$BIN" settings --json
-check "set bitwarden.import" 0 "$BIN" settings bitwarden.import never --json
-"$BIN" settings bitwarden.import --json >"$TMP/set1"
+check "settings prints everything" 0 bash -c "printf 'correct horse\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' settings --password-stdin --token '$TOKEN_HUMAN' --json"
+check "set bitwarden.import" 0 setting bitwarden.import never
+setting bitwarden.import >"$TMP/set1"
 python3 - "$TMP/set1" <<'PY' && ok "the import policy was stored" || bad "the import policy was not stored"
 import json,sys
 assert json.load(open(sys.argv[1]))["value"] == "never"
 PY
-check "an unknown setting is a usage error" 2 "$BIN" settings nope.value 1
-check "bw-session put is refused in session mode" 1 bash -c "printf 'K' | '$BIN' bw-session put"
-check "switch bitwarden.unlock to never" 0 "$BIN" settings bitwarden.unlock never --json
-check "bw-session put stores the key" 0 bash -c "printf 'GOOD_SESSION' | '$BIN' bw-session put --json"
+check "an unknown setting is a usage error" 2 bash -c "printf 'correct horse\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' unlock --password-stdin --json | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"token\"])' >'$TMP/tk'; printf 'correct horse\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' settings nope.value 1 --password-stdin --token \"\$(cat '$TMP/tk')\""
+check "bw-session put is refused in session mode" 1 bash -c "printf 'K' | '$BIN' bw-session put --token '$TOKEN_HUMAN'"
+check "switch bitwarden.unlock to never" 0 setting bitwarden.unlock never
+check "bw-session put stores the key" 0 bash -c "printf 'GOOD_SESSION' | '$BIN' bw-session put --token '$TOKEN_HUMAN' --json"
 [[ "$(mode_of "$AI_VAULT_DIR/bitwarden.session.json")" == "600" ]] && ok "the bw session file is 0600" || bad "the bw session file is not 0600"
 check "bw-session get returns it" 0 "$BIN" bw-session get --json
-check "switch back to session" 0 "$BIN" settings bitwarden.unlock session --json
+check "switch back to session" 0 setting bitwarden.unlock session
 check "the stored key is gone" 5 "$BIN" bw-session get
-check "bitwarden.unlock time keeps an expiry" 0 "$BIN" settings bitwarden.unlock time --json
-check "bw-session put in time mode" 0 bash -c "printf 'K2' | '$BIN' bw-session put --json"
+check "bitwarden.unlock time keeps an expiry" 0 setting bitwarden.unlock time
+check "bw-session put in time mode" 0 bash -c "printf 'K2' | '$BIN' bw-session put --token '$TOKEN_HUMAN' --json"
 grep -q '"expiresAt": *[0-9]' "$AI_VAULT_DIR/bitwarden.session.json" && ok "time mode writes a deadline" || bad "time mode wrote no deadline"
-"$BIN" settings bitwarden.unlock session --json >/dev/null
+setting bitwarden.unlock session >/dev/null
 
 echo "== two stores share the sessions dir =="
 # A second store in another directory uses the same XDG_RUNTIME_DIR sessions

@@ -1,15 +1,26 @@
-import { test } from "node:test";
+import { test, before } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, textOf, useMocks } from "./helpers.mjs";
+import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, setSetting, textOf, useMocks } from "./helpers.mjs";
+const { settingsToken, settingsCli } = await import("../packages/pi-ai-vault/src/settings.ts");
+/** The extension's one HostSecret, as env for a CLI call made on its behalf. */
+const hostSecretFor = () => settingsCli().host.value;
 
 const { forgetSettings } = await import("../packages/pi-ai-vault/src/settings.ts");
 
 const dir = useMocks();
 const { default: aiVault } = await import("../packages/pi-ai-vault/src/index.ts");
 cleanUpOnExit(dir);
+
+// The settings live inside the store now, so changing one needs an
+// initialised store — the same throwaway one the vault tests use.
+before(async () => {
+	answers.master(dir, "correct horse battery", "correct horse battery");
+	const boot = bind(aiVault, true);
+	await boot.cmd("init", makeCtx().ctx);
+});
 
 const enteLog = () => {
 	try {
@@ -98,7 +109,7 @@ const enteEnv = () => {
 
 test("session mode passes no vault key: the OS keychain stays in charge", async () => {
 	const bin = process.env.AI_VAULT_BIN;
-	spawnSync(bin, ["settings", "ente.unlock", "session"], { env: process.env });
+	setSetting("ente.unlock", "session");
 	forgetSettings();
 	const b = bind(aiVault, true);
 	await b.tool("ente_list", {}, makeCtx().ctx);
@@ -107,9 +118,17 @@ test("session mode passes no vault key: the OS keychain stays in charge", async 
 
 test("ente.unlock=never feeds the sealed key to the ente child", async () => {
 	const bin = process.env.AI_VAULT_BIN;
-	const set = spawnSync(bin, ["settings", "ente.unlock", "never"], { env: process.env, encoding: "utf8" });
+	const set = setSetting("ente.unlock", "never");
 	assert.equal(set.status, 0, set.stderr);
-	const put = spawnSync(bin, ["ente-session", "put"], { input: "MY_SECRET_VAULT_KEY", env: process.env, encoding: "utf8" });
+	// Unlock through the extension so the token is a host session (the put
+	// below is then made under the same secret).
+	answers.master(dir, "correct horse battery");
+	await bind(aiVault, true).cmd("unlock", makeCtx().ctx);
+	const put = spawnSync(bin, ["ente-session", "put", "--token", settingsToken() ?? ""], {
+		input: "MY_SECRET_VAULT_KEY",
+		env: { ...process.env, AI_VAULT_HOST: "1", AI_VAULT_HOST_SECRET: hostSecretFor() },
+		encoding: "utf8",
+	});
 	assert.equal(put.status, 0, put.stderr);
 	forgetSettings();
 
@@ -121,7 +140,7 @@ test("ente.unlock=never feeds the sealed key to the ente child", async () => {
 
 test("an inherited ENTE_CLI_VAULT_KEY is not trusted in session mode", async () => {
 	const bin = process.env.AI_VAULT_BIN;
-	spawnSync(bin, ["settings", "ente.unlock", "session"], { env: process.env });
+	setSetting("ente.unlock", "session");
 	spawnSync(bin, ["ente-session", "clear"], { env: process.env });
 	forgetSettings();
 	const previous = process.env.ENTE_CLI_VAULT_KEY;

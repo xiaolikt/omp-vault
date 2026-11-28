@@ -115,8 +115,20 @@ pub fn store_id(store: &StoreFile) -> String {
     digest.iter().take(12).map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn seal(salt: &[u8], kdf: Kdf, key: &[u8; 32], items: &[Item]) -> Result<StoreFile, String> {
-    let plaintext = serde_json::to_vec(items).map_err(|e| format!("cannot serialize vault: {e}"))?;
+/// What the ciphertext holds: the entries and the settings together, so the
+/// settings are protected by the same key as the passwords and cannot be
+/// edited on disk. `v: 1` files (before settings moved in) hold a bare array
+/// of items and are read as "all defaults".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Payload {
+    pub items: Vec<Item>,
+    #[serde(default)]
+    pub config: crate::config::Config,
+}
+
+pub fn seal(salt: &[u8], kdf: Kdf, key: &[u8; 32], items: &[Item], config: &crate::config::Config) -> Result<StoreFile, String> {
+    let plaintext = serde_json::to_vec(&Payload { items: items.to_vec(), config: *config })
+        .map_err(|e| format!("cannot serialize vault: {e}"))?;
     let iv = random_bytes::<12>();
     let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|e| format!("bad key: {e}"))?;
     let body = cipher
@@ -133,7 +145,7 @@ pub fn seal(salt: &[u8], kdf: Kdf, key: &[u8; 32], items: &[Item]) -> Result<Sto
     })
 }
 
-pub fn open_with_key(store: &StoreFile, key: &[u8; 32]) -> Result<Vec<Item>, OpenError> {
+pub fn open_with_key(store: &StoreFile, key: &[u8; 32]) -> Result<Payload, OpenError> {
     if store.v != 1 {
         return Err(OpenError::Broken("unsupported vault format".into()));
     }
@@ -146,16 +158,21 @@ pub fn open_with_key(store: &StoreFile, key: &[u8; 32]) -> Result<Vec<Item>, Ope
     let (iv, body) = blob.split_at(12);
     let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| OpenError::Broken("bad key".into()))?;
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(iv), body)
-        .map_err(|_| OpenError::WrongPassword)?;
-    serde_json::from_slice(&plaintext).map_err(|_| OpenError::Broken("vault contents are not a list of entries".into()))
+        .decrypt(Nonce::from_slice(iv), body).map_err(|_| OpenError::WrongPassword)?;
+    // A bare array is a v1 store written before settings lived inside; the
+    // defaults apply to it. A wrong password cannot reach here (the tag
+    // fails first), so a parse error really is a format problem.
+    if let Ok(items) = serde_json::from_slice::<Vec<Item>>(&plaintext) {
+        return Ok(Payload { items, config: crate::config::Config::default() });
+    }
+    serde_json::from_slice(&plaintext).map_err(|_| OpenError::Broken("vault contents are not a store this version understands".into()))
 }
 
-pub fn open_with_passphrase(store: &StoreFile, passphrase: &str) -> Result<(Vec<Item>, Key), OpenError> {
+pub fn open_with_passphrase(store: &StoreFile, passphrase: &str) -> Result<(Payload, Key), OpenError> {
     let salt = hex_to_bytes(&store.salt).ok_or_else(|| OpenError::Broken("vault salt is not hex".into()))?;
     let key = derive_key(passphrase, &salt, store.kdf())?;
-    let items = open_with_key(store, &key)?;
-    Ok((items, key))
+    let payload = open_with_key(store, &key)?;
+    Ok((payload, key))
 }
 
 pub fn hex_to_bytes(text: &str) -> Option<Vec<u8>> {
@@ -238,12 +255,12 @@ mod tests {
         let salt = random_bytes::<16>();
         let kdf = fast();
         let key = derive_key("correct horse", &salt, kdf).unwrap();
-        let sealed = seal(&salt, kdf, &key, &sample()).unwrap();
+        let sealed = seal(&salt, kdf, &key, &sample(), &Default::default()).unwrap();
         let opened = open_with_key(&sealed, &key).unwrap();
-        assert_eq!(opened.len(), 1);
-        assert_eq!(opened[0].password, "hunter2");
+        assert_eq!(opened.items.len(), 1);
+        assert_eq!(opened.items[0].password, "hunter2");
         let (again, _) = open_with_passphrase(&sealed, "correct horse").unwrap();
-        assert_eq!(again[0].username.as_deref(), Some("octo"));
+        assert_eq!(again.items[0].username.as_deref(), Some("octo"));
     }
 
     #[test]
@@ -251,7 +268,7 @@ mod tests {
         let salt = random_bytes::<16>();
         let kdf = fast();
         let key = derive_key("right", &salt, kdf).unwrap();
-        let sealed = seal(&salt, kdf, &key, &sample()).unwrap();
+        let sealed = seal(&salt, kdf, &key, &sample(), &Default::default()).unwrap();
         assert!(matches!(open_with_passphrase(&sealed, "wrong"), Err(OpenError::WrongPassword)));
     }
 
@@ -259,9 +276,43 @@ mod tests {
     fn each_seal_uses_a_fresh_iv() {
         let salt = random_bytes::<16>();
         let key = derive_key("pw", &salt, fast()).unwrap();
-        let a = seal(&salt, fast(), &key, &sample()).unwrap();
-        let b = seal(&salt, fast(), &key, &sample()).unwrap();
+        let a = seal(&salt, fast(), &key, &sample(), &Default::default()).unwrap();
+        let b = seal(&salt, fast(), &key, &sample(), &Default::default()).unwrap();
         assert_ne!(a.ct, b.ct);
+    }
+
+    #[test]
+    fn settings_live_inside_the_ciphertext() {
+        let salt = random_bytes::<16>();
+        let kdf = fast();
+        let key = derive_key("pw", &salt, kdf).unwrap();
+        let mut config = crate::config::Config::default();
+        config.unlock.confirm = false;
+        let sealed = seal(&salt, kdf, &key, &sample(), &config).unwrap();
+        let text = serde_json::to_string(&sealed).unwrap();
+        assert!(!text.contains("confirm"), "the settings must not be readable on disk");
+        let opened = open_with_key(&sealed, &key).unwrap();
+        assert!(!opened.config.unlock.confirm);
+    }
+
+    #[test]
+    fn a_v1_bare_array_store_still_opens() {
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+        use base64::Engine as _;
+        let salt = random_bytes::<16>();
+        let kdf = fast();
+        let key = derive_key("pw", &salt, kdf).unwrap();
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).unwrap();
+        let iv = random_bytes::<12>();
+        let plain = serde_json::to_vec(&sample()).unwrap();
+        let body = cipher.encrypt(Nonce::from_slice(&iv), plain.as_slice()).unwrap();
+        let mut blob = iv.to_vec();
+        blob.extend_from_slice(&body);
+        let v1 = StoreFile { v: 1, salt: salt.iter().map(|b| format!("{b:02x}")).collect(), kdf: Some(kdf), ct: base64::engine::general_purpose::STANDARD.encode(blob) };
+        let (payload, _) = open_with_passphrase(&v1, "pw").unwrap();
+        assert_eq!(payload.items[0].name, "GitHub");
+        assert!(payload.config.unlock.confirm, "a store from before the switch keeps the safe default");
     }
 
     #[test]
@@ -276,9 +327,9 @@ mod tests {
         // Written by the TS release, with the default KDF.
         let salt = "00112233445566778899aabbccddeeff";
         let key = derive_key("pw", &hex_to_bytes(salt).unwrap(), fast()).unwrap();
-        let sealed = seal(&hex_to_bytes(salt).unwrap(), fast(), &key, &sample()).unwrap();
+        let sealed = seal(&hex_to_bytes(salt).unwrap(), fast(), &key, &sample(), &Default::default()).unwrap();
         let json = serde_json::json!({ "v": 1, "salt": salt, "kdf": { "N": 32768, "r": 8, "p": 1 }, "ct": sealed.ct });
         let store: StoreFile = serde_json::from_value(json).unwrap();
-        assert_eq!(open_with_passphrase(&store, "pw").unwrap().0[0].name, "GitHub");
+        assert_eq!(open_with_passphrase(&store, "pw").unwrap().0.items[0].name, "GitHub");
     }
 }

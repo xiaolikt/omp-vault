@@ -78,6 +78,15 @@ pub struct UnlockPolicy {
     /// `Time` mode only: hours between password prompts.
     #[serde(default = "default_hours")]
     pub hours: i64,
+    /// Whether each read of an entry opens a confirm window while the session
+    /// is unlocked. On by default. Off means "the master password I just typed
+    /// is enough" — reads are still audited, entry by entry.
+    #[serde(default = "default_confirm")]
+    pub confirm: bool,
+}
+
+fn default_confirm() -> bool {
+    true
 }
 
 fn default_hours() -> i64 {
@@ -86,7 +95,7 @@ fn default_hours() -> i64 {
 
 impl Default for UnlockPolicy {
     fn default() -> Self {
-        UnlockPolicy { mode: UnlockMode::Session, hours: default_hours() }
+        UnlockPolicy { mode: UnlockMode::Session, hours: default_hours(), confirm: default_confirm() }
     }
 }
 
@@ -142,18 +151,37 @@ pub struct Config {
     pub ente: StorePolicy,
 }
 
-/// A missing or unreadable config means the defaults. A broken file must not
-/// lock anyone out of their vault.
-pub fn load(paths: &Paths) -> Config {
-    match fs::read_to_string(paths.config()) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => Config::default(),
-    }
+/// The settings are inside the store's ciphertext (see `crypto::Payload`), so
+/// they can only be read or changed with the store's key: a password, or a
+/// session that was opened with one. There is no file to edit.
+//
+// Callers hold either a `Session` (its key opens the store) or a freshly
+// derived key. Both go through `read_with` / `write_with`.
+pub fn write_with(
+    store: &crate::crypto::StoreFile,
+    key: &[u8; 32],
+    config: &Config,
+) -> Result<crate::crypto::StoreFile, String> {
+    let payload = crypto::open_with_key(store, key).map_err(|e| e.to_string())?;
+    let salt = crypto::hex_to_bytes(&store.salt).ok_or_else(|| "vault salt is corrupt".to_string())?;
+    crypto::seal(&salt, store.kdf(), key, &payload.items, config)
 }
 
-pub fn save(paths: &Paths, config: &Config) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(config).map_err(|e| format!("cannot serialize config: {e}"))?;
-    crypto::write_atomic(&paths.config(), &bytes)
+/// A legacy plaintext config.json from before the settings moved inside the
+/// store. Returned once so the next unlock can carry it in; then the file
+/// is removed. Only the *defaults-safe* keys migrate; the two that lower
+/// protection (`vault.unlock = never`, `vault.confirm = false`) do not, so
+/// an edit made while the file was still plain text grants nothing.
+pub fn take_legacy(paths: &Paths) -> Option<Config> {
+    let text = fs::read_to_string(paths.config()).ok()?;
+    let _ = fs::remove_file(paths.config());
+    let Ok(parsed) = serde_json::from_str::<Config>(&text) else { return None };
+    let mut config = parsed;
+    if config.unlock.mode == UnlockMode::Never {
+        config.unlock.mode = UnlockMode::Session;
+    }
+    config.unlock.confirm = true;
+    Some(config)
 }
 
 #[cfg(test)]
@@ -183,6 +211,7 @@ mod tests {
         // A config written by the previous version had only `unlock`.
         let parsed: Config = serde_json::from_str(r#"{"unlock":{"mode":"time","hours":4}}"#).unwrap();
         assert_eq!(parsed.unlock.mode, UnlockMode::Time);
+        assert_eq!(parsed.unlock.confirm, true, "a config from before the switch keeps confirming");
         assert_eq!(parsed.bitwarden.import, ImportPolicy::Ask);
         assert_eq!(parsed.bitwarden.store.hours, 8);
     }
