@@ -8,9 +8,8 @@
 //! Identical to the format the TypeScript release used, so an existing store
 //! opens without a migration step.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -184,7 +183,7 @@ pub fn read_store(path: &Path) -> Result<Option<StoreFile>, String> {
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    crate::perms::restrict_dir(dir);
 
     let tmp = dir.join(format!(
         ".{}.{}.{}.tmp",
@@ -192,11 +191,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         std::process::id(),
         B64.encode(random_bytes::<6>()).replace(['/', '+', '='], "")
     ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
+    let mut file = crate::perms::open_private(&tmp)
         .map_err(|e| format!("cannot create a temp file next to {}: {e}", path.display()))?;
     let outcome = (|| -> std::io::Result<()> {
         file.write_all(bytes)?;
@@ -208,9 +203,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         return Err(format!("cannot write {}: {e}", path.display()));
     }
-    if let Ok(dir_file) = File::open(dir) {
-        let _ = dir_file.sync_all();
-    }
+    crate::perms::sync_dir(dir);
     Ok(())
 }
 

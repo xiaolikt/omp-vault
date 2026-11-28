@@ -14,6 +14,7 @@ mod crypto;
 mod dialog;
 mod import;
 mod paths;
+mod perms;
 mod session;
 mod store;
 

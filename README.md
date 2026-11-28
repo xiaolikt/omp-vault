@@ -58,6 +58,34 @@ printf '//registry.npmjs.org/:_authToken=%s\n' "<token>" > ~/.npmrc && chmod 600
 
 别的平台要有自己的二进制包：`./scripts/stage-npm.sh darwin-arm64 --from <交叉编译产物>`，发布后把对应名字加进 `optionalDependencies`。没有匹配的平台包时，shim 会明确报错并提示 `cargo install --path crates/ai-vault`。
 
+### 平台
+
+| 平台 | 状态 |
+|---|---|
+| Linux x64 / arm64 | ✅ 已发布（`@xiaolikt/ai-vault-linux-x64` / `-linux-arm64`） |
+| Windows x64 | ✅ 已发布（`@xiaolikt/ai-vault-win32-x64`），对话框走 PowerShell/WinForms |
+| macOS arm64 / x64 | 🔧 代码已可编译（`cargo check --target aarch64-apple-darwin` 通过），二进制需要 Apple SDK —— 由 `.github/workflows/build.yml` 的 macOS runner 产出 |
+
+跨平台的部分：
+- **加密/存储**：纯 Rust（chacha20poly1305、scrypt、hmac、sha2、base64、zeroize）
+- **文件锁**：`fs4`（Linux/macOS 用 flock，Windows 用 LockFileEx）
+- **权限**：Unix 设 0600/0700；Windows 没有位权限，靠 `%USERPROFILE%\.ai-vault` 的 ACL
+- **会话目录**：Linux `$XDG_RUNTIME_DIR`、macOS `$TMPDIR`、Windows `%TEMP%`（都是每人一份、可被系统清理）
+- **弹窗**：Linux zenity / macOS osascript / Windows PowerShell+WinForms，同一套 `Answer` 契约（`NoUi` 才回退到宿主输入框）
+
+自己交叉编译（不需要 Mac/Windows 机器）：
+
+```bash
+cargo install cargo-zigbuild
+rustup target add aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
+cargo zigbuild --release --target aarch64-unknown-linux-gnu
+cargo zigbuild --release --target x86_64-pc-windows-gnu
+./scripts/stage-npm.sh linux-arm64 --from target/aarch64-unknown-linux-gnu/release/ai-vault
+./scripts/stage-npm.sh win32-x64  --from target/x86_64-pc-windows-gnu/release/ai-vault.exe
+```
+
+`stage-npm.sh` 两种写法都收：npm 平台名（`darwin-arm64`）或 Rust triple（`aarch64-apple-darwin`）。macOS 的二进制只能用 Apple SDK 链，所以留给 CI（tag push 时自动构建 + 发布）。
+
 ### 从源码 / git
 
 ```bash

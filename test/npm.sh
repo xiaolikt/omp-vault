@@ -17,7 +17,20 @@ bad() { printf '  FAIL %s\n' "$*"; FAIL=$((FAIL + 1)); }
 
 echo "== stage the platform package =="
 bash "$ROOT/scripts/stage-npm.sh" >"$TMP/stage" 2>&1 || { cat "$TMP/stage"; exit 1; }
-PLATFORM="$(cd "$ROOT/npm" && ls -d */ | head -1 | tr -d /)"
+# The one that matches this machine: the others are for other OSes and npm
+# refuses to install a tarball whose os/cpu does not match.
+case "$(uname -s)" in
+	Linux) OS=linux ;;
+	Darwin) OS=darwin ;;
+	*) OS=win32 ;;
+esac
+case "$(uname -m)" in
+	x86_64|amd64) ARCH=x64 ;;
+	aarch64|arm64) ARCH=arm64 ;;
+	*) ARCH="$(uname -m)" ;;
+esac
+PLATFORM="$OS-$ARCH"
+[[ -d "$ROOT/npm/$PLATFORM" ]] || PLATFORM="$(cd "$ROOT/npm" && ls -d */ | head -1 | tr -d /)"
 [[ -f "$ROOT/npm/$PLATFORM/bin/ai-vault" ]] && ok "staged $PLATFORM" || bad "nothing staged"
 
 echo "== pack =="

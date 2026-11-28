@@ -1,11 +1,18 @@
-//! Desktop dialogs, the same zenity windows the TypeScript release opened.
+//! Desktop dialogs.
 //!
-//! When a display exists but zenity cannot run, the caller gets `NoUi` and
-//! falls back to its host UI (pi/omp prompt). Cancel and our own timeout end
-//! the prompt here: they never turn into a second prompt.
+//!   Linux    zenity (X11 or Wayland)
+//!   macOS    osascript (a native dialog, hidden answer for secrets)
+//!   Windows  PowerShell + WinForms (a native dialog, PasswordChar for secrets)
+//!
+//! When no window can open at all, the caller gets `NoUi` and the host UI
+//! (pi/omp prompt) takes over. Cancel and our own timeout end the prompt here:
+//! they never turn into a second prompt.
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use std::env;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use std::path::Path;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use std::process::{Command, Stdio};
 
 const DIALOG_SECONDS: u32 = 600;
@@ -20,11 +27,233 @@ pub enum Answer<T> {
 }
 
 pub fn has_display() -> bool {
-    ["DISPLAY", "WAYLAND_DISPLAY"]
-        .iter()
-        .any(|name| env::var_os(name).is_some_and(|v| !v.is_empty()))
+    #[cfg(target_os = "linux")]
+    {
+        return ["DISPLAY", "WAYLAND_DISPLAY"]
+            .iter()
+            .any(|name| env::var_os(name).is_some_and(|v| !v.is_empty()));
+    }
+    // macOS and Windows always have a window server for an interactive user.
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }
 
+// ---------------------------------------------------------------- macOS
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::{Answer, DIALOG_SECONDS};
+    use std::process::{Command, Stdio};
+
+    /// Escape a value for AppleScript's double-quoted string literals.
+    fn quote(text: &str) -> String {
+        text.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    struct Out {
+        spawned: bool,
+        code: i32,
+        stdout: String,
+        stderr: String,
+    }
+
+    fn osascript(script: &str) -> Out {
+        match Command::new("osascript")
+            .args(["-e", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            Ok(out) => Out {
+                spawned: true,
+                code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            },
+            Err(_) => Out { spawned: false, code: 127, stdout: String::new(), stderr: String::new() },
+        }
+    }
+
+    fn failed(out: &Out) -> bool {
+        !out.spawned
+            || {
+                let e = out.stderr.to_lowercase();
+                e.contains("not allowed") || e.contains("application isn")
+            }
+    }
+
+    pub fn prompt_secret(title: &str, label: &str) -> Answer<String> {
+        let script = format!(
+            "tell application \"System Events\" to display dialog \"{}\" with title \"{}\" default answer \"\" with hidden answer buttons {{\"取消\", \"OK\"}} default button \"OK\" giving up after {}",
+            quote(label),
+            quote(title),
+            DIALOG_SECONDS
+        );
+        let out = osascript(&script);
+        if failed(&out) {
+            return Answer::NoUi;
+        }
+        if !out.stdout.contains("text returned:") {
+            return Answer::Cancelled;
+        }
+        let value = out
+            .stdout
+            .split("text returned:")
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            Answer::Cancelled
+        } else {
+            Answer::Value(value)
+        }
+    }
+
+    pub fn prompt_text(title: &str, label: &str) -> Answer<String> {
+        let script = format!(
+            "tell application \"System Events\" to display dialog \"{}\" with title \"{}\" default answer \"\" buttons {{\"取消\", \"OK\"}} default button \"OK\" giving up after {}",
+            quote(label),
+            quote(title),
+            DIALOG_SECONDS
+        );
+        let out = osascript(&script);
+        if failed(&out) {
+            return Answer::NoUi;
+        }
+        if !out.stdout.contains("text returned:") {
+            return Answer::Cancelled;
+        }
+        Answer::Value(
+            out.stdout
+                .split("text returned:")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        )
+    }
+
+    pub fn confirm(title: &str, message: &str) -> Answer<bool> {
+        let script = format!(
+            "tell application \"System Events\" to display dialog \"{}\" with title \"{}\" buttons {{\"拒绝\", \"允许\"}} default button \"拒绝\" giving up after {}",
+            quote(message),
+            quote(title),
+            DIALOG_SECONDS
+        );
+        let out = osascript(&script);
+        if failed(&out) {
+            return Answer::NoUi;
+        }
+        Answer::Value(out.code == 0 && out.stdout.contains("button returned:允许"))
+    }
+}
+
+// -------------------------------------------------------------- Windows
+
+#[cfg(target_os = "windows")]
+mod win {
+    use super::{Answer, DIALOG_SECONDS};
+    use std::process::{Command, Stdio};
+
+    // WinForms from PowerShell: no extra dependency, and PasswordChar can hide
+    // the input. Exit 0 = OK (value on stdout), 1 = cancel, 2 = no window.
+    const PREAMBLE: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$f = New-Object System.Windows.Forms.Form
+$f.Text = $env:AI_VAULT_DLG_TITLE
+$f.Width = 480; $f.Height = 200; $f.StartPosition = 'CenterScreen'
+$f.TopMost = $true; $f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false
+$lbl = New-Object System.Windows.Forms.Label
+$lbl.Text = $env:AI_VAULT_DLG_TEXT; $lbl.Left = 12; $lbl.Top = 12; $lbl.Width = 440; $lbl.Height = 60
+$f.Controls.Add($lbl)
+$box = New-Object System.Windows.Forms.TextBox
+$box.Left = 12; $box.Top = 80; $box.Width = 440
+if ($env:AI_VAULT_DLG_SECRET -eq '1') { $box.UseSystemPasswordChar = $true }
+$f.Controls.Add($box)
+$ok = New-Object System.Windows.Forms.Button
+$ok.Text = 'OK'; $ok.DialogResult = 'OK'; $ok.Left = 280; $ok.Top = 115; $f.AcceptButton = $ok
+$cancel = New-Object System.Windows.Forms.Button
+$cancel.Text = '取消'; $cancel.DialogResult = 'Cancel'; $cancel.Left = 370; $cancel.Top = 115; $f.CancelButton = $cancel
+$f.Controls.Add($ok); $f.Controls.Add($cancel)
+$f.Add_Shown({ $box.Focus() })
+if ($f.ShowDialog() -eq 'OK') { [Console]::Out.Write($box.Text); exit 0 } else { exit 1 }
+"#;
+
+    const CONFIRM: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$msg = $env:AI_VAULT_DLG_TEXT
+$r = [System.Windows.Forms.MessageBox]::Show($msg, $env:AI_VAULT_DLG_TITLE, 'YesNo', 'Warning', 'Button2')
+if ($r -eq 'Yes') { exit 0 } else { exit 1 }
+"#;
+
+    struct Out {
+        spawned: bool,
+        code: i32,
+        stdout: String,
+        stderr: String,
+    }
+
+    fn powershell(script: &str, title: &str, text: &str, secret: bool) -> Out {
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script])
+            .env("AI_VAULT_DLG_TITLE", title)
+            .env("AI_VAULT_DLG_TEXT", text)
+            .env("AI_VAULT_DLG_SECRET", if secret { "1" } else { "0" })
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let _ = DIALOG_SECONDS; // the dialog is modal for the user, not us
+        match cmd.output() {
+            Ok(out) => Out {
+                spawned: true,
+                code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            },
+            Err(_) => Out { spawned: false, code: 127, stdout: String::new(), stderr: String::new() },
+        }
+    }
+
+    fn failed(out: &Out) -> bool {
+        !out.spawned || (out.code != 0 && out.code != 1)
+    }
+
+    pub fn prompt_secret(title: &str, label: &str) -> Answer<String> {
+        let out = powershell(PREAMBLE, title, label, true);
+        if failed(&out) {
+            return Answer::NoUi;
+        }
+        if out.code != 0 || out.stdout.is_empty() {
+            return Answer::Cancelled;
+        }
+        Answer::Value(out.stdout)
+    }
+
+    pub fn prompt_text(title: &str, label: &str) -> Answer<String> {
+        let out = powershell(PREAMBLE, title, label, false);
+        if failed(&out) {
+            return Answer::NoUi;
+        }
+        if out.code != 0 {
+            return Answer::Cancelled;
+        }
+        Answer::Value(out.stdout)
+    }
+
+    pub fn confirm(title: &str, message: &str) -> Answer<bool> {
+        let out = powershell(CONFIRM, title, message, false);
+        if failed(&out) {
+            return Answer::NoUi;
+        }
+        Answer::Value(out.code == 0)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 struct Zenity {
     /// False when the process could not be started at all (zenity missing).
     spawned: bool,
@@ -33,6 +262,7 @@ struct Zenity {
     stderr: String,
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn zenity(args: &[String]) -> Zenity {
     match Command::new("zenity")
         .args(args)
@@ -51,14 +281,17 @@ fn zenity(args: &[String]) -> Zenity {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn arg(text: impl Into<String>) -> String {
     text.into()
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn timeout_arg() -> String {
     format!("--timeout={DIALOG_SECONDS}")
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn trim_newline(text: &str) -> String {
     text.trim_end_matches(['\r', '\n']).to_string()
 }
@@ -66,6 +299,7 @@ fn trim_newline(text: &str) -> String {
 /// True when the configured display looks usable. Only consulted when zenity
 /// exits 1 with no output at all: a cancel on a live display, or a silent
 /// start failure on a dead one.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn display_reachable() -> bool {
     if let Some(wl) = env::var_os("WAYLAND_DISPLAY").filter(|v| !v.is_empty()) {
         let runtime = match env::var_os("XDG_RUNTIME_DIR") {
@@ -94,6 +328,7 @@ fn display_reachable() -> bool {
 /// and a failed start both use it), so stderr decides: GTK's own diagnostics
 /// carry a `(zenity:PID): Gtk-WARNING` prefix; any other line, or a display
 /// failure, means the window never opened.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn failed_to_open(z: &Zenity) -> bool {
     if !z.spawned {
         return true;
@@ -118,6 +353,7 @@ fn failed_to_open(z: &Zenity) -> bool {
         .any(|line| !is_gtk_diagnostic(line))
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn is_gtk_diagnostic(line: &str) -> bool {
     // (zenity:1234): Gtk-WARNING **: ...
     let line = line.trim_start_matches('*');
@@ -163,6 +399,20 @@ pub fn for_dialog(value: &str, max: usize) -> String {
 
 /// Secret entry. Empty and cancel are both "no value".
 pub fn prompt_secret(title: &str, label: &str) -> Answer<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return mac::prompt_secret(title, label);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return win::prompt_secret(title, label);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    prompt_secret_zenity(title, label)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn prompt_secret_zenity(title: &str, label: &str) -> Answer<String> {
     if !has_display() {
         return Answer::NoUi;
     }
@@ -185,6 +435,20 @@ pub fn prompt_secret(title: &str, label: &str) -> Answer<String> {
 
 /// Plain text entry. Cancel is `Cancelled`; confirming an empty field is `""`.
 pub fn prompt_text(title: &str, label: &str) -> Answer<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return mac::prompt_text(title, label);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return win::prompt_text(title, label);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    prompt_text_zenity(title, label)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn prompt_text_zenity(title: &str, label: &str) -> Answer<String> {
     if !has_display() {
         return Answer::NoUi;
     }
@@ -208,6 +472,20 @@ pub fn prompt_text(title: &str, label: &str) -> Answer<String> {
 
 /// Yes/no window. Deny and timeout are false and do not fall through.
 pub fn confirm(title: &str, message: &str) -> Answer<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        return mac::confirm(title, message);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return win::confirm(title, message);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    confirm_zenity(title, message)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn confirm_zenity(title: &str, message: &str) -> Answer<bool> {
     if !has_display() {
         return Answer::NoUi;
     }

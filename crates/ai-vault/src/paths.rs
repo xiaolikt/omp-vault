@@ -53,14 +53,30 @@ impl Paths {
         self.dir.join("store.lock")
     }
 
-    /// Session tokens hold key material, so they prefer tmpfs when there is one:
-    /// they vanish at logout instead of lying on disk.
+    /// Session tokens hold key material, so they prefer a tmpfs when there is
+    /// one: they vanish at logout instead of lying on disk.
+    ///
+    ///   Linux   $XDG_RUNTIME_DIR (a tmpfs)
+    ///   macOS   $TMPDIR (per-user, cleaned by the OS)
+    ///   Windows %TEMP% (per-user)
     pub fn sessions(&self) -> PathBuf {
-        match env::var_os("XDG_RUNTIME_DIR") {
-            Some(runtime) if !runtime.is_empty() && self.dir == Paths::resolve(None).dir => {
-                PathBuf::from(runtime).join("ai-vault").join("sessions")
+        if self.dir != Paths::resolve(None).dir {
+            return self.dir.join("sessions");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+                return PathBuf::from(runtime).join("ai-vault").join("sessions");
             }
-            _ => self.dir.join("sessions"),
+            return self.dir.join("sessions");
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            env::temp_dir().join("ai-vault").join("sessions")
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            self.dir.join("sessions")
         }
     }
 
@@ -70,5 +86,12 @@ impl Paths {
 }
 
 pub fn home() -> PathBuf {
-    env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| Path::new(".").to_path_buf())
+    #[cfg(windows)]
+    let key = "USERPROFILE";
+    #[cfg(not(windows))]
+    let key = "HOME";
+    env::var_os(key)
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| Path::new(".").to_path_buf())
 }

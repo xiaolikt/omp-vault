@@ -3,7 +3,6 @@
 //! these commands and never links against the encryption itself.
 
 use std::io::{self, BufRead, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -296,7 +295,7 @@ fn migrate_legacy(paths: &Paths) {
     if std::fs::copy(&legacy_store, paths.store()).is_err() {
         return;
     }
-    let _ = std::fs::set_permissions(&paths.store(), std::fs::Permissions::from_mode(0o600));
+    crate::perms::restrict_file(&paths.store());
     if legacy.join("audit.log").exists() && !paths.audit().exists() {
         let _ = std::fs::copy(legacy.join("audit.log"), paths.audit());
     }

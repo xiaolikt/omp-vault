@@ -9,7 +9,6 @@
 //! unless `bw-session get` is asked for it.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -72,9 +71,9 @@ fn wrap_key(paths: &Paths) -> Result<crypto::Key, String> {
     }
     let fresh = crypto::random_bytes::<32>();
     fs::create_dir_all(&paths.dir).map_err(|e| format!("cannot create {}: {e}", paths.dir.display()))?;
-    let _ = fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o700));
+    crate::perms::restrict_dir(&paths.dir);
     crypto::write_atomic(&path, &fresh)?;
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    crate::perms::restrict_file(&path);
     Ok(crypto::Key::new(fresh))
 }
 
@@ -149,7 +148,7 @@ pub fn save(paths: &Paths, kind: Kind, secret: &str) -> Result<Option<i64>, Stri
     let bytes = serde_json::to_vec(&stored).map_err(|e| format!("cannot serialize session: {e}"))?;
     let path = paths.dir.join(kind.file());
     crypto::write_atomic(&path, &bytes)?;
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    crate::perms::restrict_file(&path);
     Ok(expires_at)
 }
 

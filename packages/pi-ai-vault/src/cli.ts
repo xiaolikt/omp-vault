@@ -64,20 +64,29 @@ export function resolveBinary(): string | undefined {
 	// pip/npm layouts hoist differently: walk up from packages/pi-ai-vault/src.
 	let dir = dirname(fileURLToPath(import.meta.url));
 	for (let depth = 0; depth < 5; depth++) {
-		const bundled = join(dir, "node_modules", ".bin", "ai-vault");
-		if (existsSync(bundled)) return bundled;
+		for (const name of process.platform === "win32" ? ["ai-vault.exe", "ai-vault.cmd", "ai-vault.ps1"] : ["ai-vault"]) {
+			const bundled = join(dir, "node_modules", ".bin", name);
+			if (existsSync(bundled)) return bundled;
+		}
 		const parent = dirname(dir);
 		if (parent === dir) break;
 		dir = parent;
 	}
 
+	// Windows has no execute bit and npm links .cmd/.ps1 wrappers beside the exe.
+	const names = process.platform === "win32" ? ["ai-vault.exe", "ai-vault.cmd", "ai-vault.ps1", "ai-vault"] : ["ai-vault"];
 	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
 		if (!entry) continue;
-		const candidate = join(entry, "ai-vault");
-		if (existsSync(candidate)) return candidate;
+		for (const name of names) {
+			const candidate = join(entry, name);
+			if (existsSync(candidate)) return candidate;
+		}
 	}
-	for (const candidate of [join(homedir(), ".local", "bin", "ai-vault"), join(homedir(), ".cargo", "bin", "ai-vault")]) {
-		if (existsSync(candidate)) return candidate;
+	for (const base of [join(homedir(), ".local", "bin"), join(homedir(), ".cargo", "bin"), join(homedir(), ".ai-vault", "bin")]) {
+		for (const name of names) {
+			const candidate = join(base, name);
+			if (existsSync(candidate)) return candidate;
+		}
 	}
 	return undefined;
 }

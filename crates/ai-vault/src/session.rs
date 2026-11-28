@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -158,7 +157,7 @@ impl Session {
         signed.sign(host_secret);
         let dir = paths.sessions();
         fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        crate::perms::restrict_dir(&dir);
         let text = serde_json::to_vec(&signed).map_err(|e| format!("cannot serialize session: {e}"))?;
         crypto::write_atomic(&paths.session_file(&signed.token), &text)
     }
@@ -277,7 +276,7 @@ pub fn load_auto(paths: &Paths) -> Result<Option<Session>, String> {
 
 pub fn save_auto(paths: &Paths, session: &Session) -> Result<(), String> {
     fs::create_dir_all(&paths.dir).map_err(|e| format!("cannot create {}: {e}", paths.dir.display()))?;
-    let _ = fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o700));
+    crate::perms::restrict_dir(&paths.dir);
     let bytes = serde_json::to_vec(session).map_err(|e| format!("cannot serialize session: {e}"))?;
     crypto::write_atomic(&paths.auto_session(), &bytes)
 }
@@ -294,8 +293,8 @@ pub fn ensure_session_dir(paths: &Paths) -> Result<(), String> {
     fs::create_dir_all(&paths.dir).map_err(|e| format!("cannot create {}: {e}", paths.dir.display()))?;
     let dir = paths.sessions();
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    let _ = fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o700));
+    crate::perms::restrict_dir(&dir);
+    crate::perms::restrict_dir(&paths.dir);
     Ok(())
 }
 
@@ -314,30 +313,19 @@ impl StoreLock {
             .create(true)
             .read(true)
             .write(true)
-            .mode(0o600)
             .open(&path)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc != 0 {
-                return Err(format!("cannot lock {}: {}", path.display(), std::io::Error::last_os_error()));
-            }
-        }
+        crate::perms::restrict_file(&path);
+        // fs4 takes an OS lock on Unix (flock), Windows (LockFileEx) and macOS.
+        <fs::File as fs4::fs_std::FileExt>::lock_exclusive(&file)
+            .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
         Ok(StoreLock { file, path })
     }
 }
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            unsafe {
-                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-            }
-        }
+        let _ = <fs::File as fs4::fs_std::FileExt>::unlock(&self.file);
         let _ = &self.path;
     }
 }

@@ -3,9 +3,8 @@
 //! Records who asked for what, never a value. A full or read-only disk is not
 //! allowed to break the operation being audited.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -37,20 +36,19 @@ pub fn append(path: &Path, session: &str, event: &str, item: Option<&str>, reaso
     };
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        crate::perms::restrict_dir(dir);
     }
     if let Ok(meta) = fs::metadata(path) {
         if meta.len() > MAX_BYTES {
             let _ = fs::rename(path, path.with_extension("log.1"));
         }
     }
-    let result = OpenOptions::new()
+    let result = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .mode(0o600)
         .open(path)
         .and_then(|mut file| {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            crate::perms::restrict_file(path);
             file.write_all(format!("{line}\n").as_bytes())
         });
     result.is_ok()

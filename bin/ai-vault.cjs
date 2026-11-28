@@ -29,6 +29,12 @@ function candidates() {
 	// A source checkout: package root/target/{release,debug}/ai-vault.
 	const root = join(__dirname, "..");
 	found.push(join(root, "target", "release", EXE), join(root, "target", "debug", EXE));
+	// Windows has no exec bit and npm links .cmd/.ps1 wrappers: try the whole set.
+	if (process.platform === "win32") {
+		for (const name of ["ai-vault.exe", "ai-vault.cmd", "ai-vault.ps1"]) {
+			found.push(join(root, "target", "release", name), join(root, "target", "debug", name));
+		}
+	}
 	return found.filter((path) => path && path !== __filename);
 }
 

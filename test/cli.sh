@@ -22,6 +22,8 @@ mkdir -p "$HOME"
 PASS=0
 FAIL=0
 ok() { printf '  PASS %s\n' "$*"; PASS=$((PASS + 1)); }
+# GNU stat (-c) vs BSD stat (-f): the mode, in octal, on either.
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 bad() { printf '  FAIL %s\n' "$*"; FAIL=$((FAIL + 1)); }
 # check <description> <expected-exit> <command...>
 check() {
@@ -43,7 +45,7 @@ grep -q 'needs-ui: password' "$TMP/err" && ok "the needs-ui step is named" || ba
 check "a short password is a usage error" 2 bash -c "printf 'short' | '$BIN' init --password-stdin"
 check "init creates the store" 0 bash -c "printf 'correct horse' | '$BIN' init --password-stdin --requester cli"
 [[ -f "$AI_VAULT_DIR/store.json" ]] && ok "store.json exists" || bad "store.json missing"
-[[ "$(stat -c %a "$AI_VAULT_DIR/store.json")" == "600" ]] && ok "store.json is 0600" || bad "store.json is not 0600"
+[[ "$(mode_of "$AI_VAULT_DIR/store.json")" == "600" ]] && ok "store.json is 0600" || bad "store.json is not 0600"
 
 echo "== unlock =="
 check "unlock without a window asks the host" 3 "$BIN" unlock
@@ -148,7 +150,7 @@ check "switch bitwarden.unlock to never" 0 "$BIN" settings bitwarden.unlock neve
 check "store a bw session key" 0 bash -c "printf 'BW_BEARER_TOKEN_PLAINTEXT' | '$BIN' bw-session put --json"
 grep -q 'BW_BEARER_TOKEN_PLAINTEXT' "$AI_VAULT_DIR/bitwarden.session.json" && bad "the bw key is plaintext on disk" || ok "the bw key is not plaintext on disk"
 [[ -f "$AI_VAULT_DIR/.wrap" ]] && ok "a wrap key exists" || bad "no wrap key"
-[[ "$(stat -c %a "$AI_VAULT_DIR/.wrap")" == "600" ]] && ok "the wrap key is 0600" || bad "the wrap key is not 0600"
+[[ "$(mode_of "$AI_VAULT_DIR/.wrap")" == "600" ]] && ok "the wrap key is 0600" || bad "the wrap key is not 0600"
 "$BIN" bw-session get --json | grep -q 'BW_BEARER_TOKEN_PLAINTEXT' && ok "bw-session get unseals it" || bad "bw-session get cannot unseal"
 mv "$AI_VAULT_DIR/.wrap" "$TMP/wrap.bak"
 check "without the wrap key the session does not open" 1 "$BIN" bw-session get
@@ -161,7 +163,7 @@ check "ente-session put refused in session mode" 1 bash -c "printf 'K' | '$BIN' 
 check "switch ente.unlock to never" 0 "$BIN" settings ente.unlock never --json
 check "store the Ente vault key" 0 bash -c "printf 'ENTE_KEY_PLAINTEXT' | '$BIN' ente-session put --json"
 grep -q 'ENTE_KEY_PLAINTEXT' "$AI_VAULT_DIR/ente.session.json" && bad "the ente key is plaintext on disk" || ok "the ente key is sealed at rest"
-[[ "$(stat -c %a "$AI_VAULT_DIR/ente.session.json")" == "600" ]] && ok "ente.session.json is 0600" || bad "ente.session.json is not 0600"
+[[ "$(mode_of "$AI_VAULT_DIR/ente.session.json")" == "600" ]] && ok "ente.session.json is 0600" || bad "ente.session.json is not 0600"
 "$BIN" ente-session get --json | grep -q 'ENTE_KEY_PLAINTEXT' && ok "ente-session get unseals it" || bad "ente-session get cannot unseal"
 "$BIN" settings ente.unlock session --json >/dev/null
 check "switching back to session clears the ente key" 5 "$BIN" ente-session get
@@ -214,7 +216,7 @@ check "an unknown setting is a usage error" 2 "$BIN" settings nope.value 1
 check "bw-session put is refused in session mode" 1 bash -c "printf 'K' | '$BIN' bw-session put"
 check "switch bitwarden.unlock to never" 0 "$BIN" settings bitwarden.unlock never --json
 check "bw-session put stores the key" 0 bash -c "printf 'GOOD_SESSION' | '$BIN' bw-session put --json"
-[[ "$(stat -c %a "$AI_VAULT_DIR/bitwarden.session.json")" == "600" ]] && ok "the bw session file is 0600" || bad "the bw session file is not 0600"
+[[ "$(mode_of "$AI_VAULT_DIR/bitwarden.session.json")" == "600" ]] && ok "the bw session file is 0600" || bad "the bw session file is not 0600"
 check "bw-session get returns it" 0 "$BIN" bw-session get --json
 check "switch back to session" 0 "$BIN" settings bitwarden.unlock session --json
 check "the stored key is gone" 5 "$BIN" bw-session get

@@ -39,8 +39,20 @@ else
 	cargo build --release --manifest-path "$ROOT/Cargo.toml"
 fi
 
-OS="${TARGET%%-*}"
-ARCH="${TARGET##*-}"
+# Accept a plain npm platform (darwin-arm64) or a Rust triple
+# (aarch64-apple-darwin) — the latter comes straight from cargo zigbuild.
+case "$TARGET" in
+	*-unknown-linux-gnu) OS=linux; ARCH="${TARGET%%-*}"; ARCH="${ARCH/x86_64/x64}" ;;
+	*-unknown-linux-musl) OS=linux; ARCH="${TARGET%%-*}"; ARCH="${ARCH/x86_64/x64}" ;;
+	*aarch64-unknown-linux-*) OS=linux; ARCH=arm64 ;;
+	*-pc-windows-gnu|*-pc-windows-msvc) OS=win32; ARCH="${TARGET%%-*}"; ARCH="${ARCH/x86_64/x64}" ;;
+	*aarch64-pc-windows-*) OS=win32; ARCH=arm64 ;;
+	*x86_64-apple-darwin) OS=darwin; ARCH=x64 ;;
+	*aarch64-apple-darwin) OS=darwin; ARCH=arm64 ;;
+	*) OS="${TARGET%%-*}"; ARCH="${TARGET##*-}" ;;
+esac
+TARGET="$OS-$ARCH"
+[[ "$ARCH" == "amd64" ]] && ARCH=x64
 OUT="$ROOT/npm/$TARGET"
 EXE="ai-vault"
 [[ "$OS" == "win32" ]] && EXE="ai-vault.exe"
