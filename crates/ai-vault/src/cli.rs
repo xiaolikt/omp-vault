@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+use crate::config::{self, UnlockMode, UnlockPolicy};
 use crate::crypto::{self, Kdf};
 use crate::dialog::{self, Answer};
 use crate::import;
@@ -65,6 +66,20 @@ enum Cmd {
         /// Idle minutes before the session locks itself
         #[arg(long, value_name = "MIN")]
         idle_min: Option<i64>,
+    },
+    /// Show or change how often the master password is asked for
+    Mode {
+        /// "get" or "set"
+        #[arg(default_value = "get")]
+        action: String,
+        /// never | time | session (for `set`)
+        value: Option<String>,
+        /// Hours between prompts in `time` mode
+        #[arg(long, value_name = "HOURS")]
+        hours: Option<i64>,
+        /// Read the master password from stdin (changing the mode needs it)
+        #[arg(long)]
+        password_stdin: bool,
     },
     /// Session state, item count, and remaining read grants
     Status {
@@ -265,10 +280,13 @@ fn dispatch(cmd: Cmd, paths: &Paths, json: bool) -> Outcome {
         }
         Cmd::Doctor => doctor(paths, &out),
         Cmd::Init { password_stdin, requester, idle_min } => {
-            init(paths, &out, password_stdin, &requester, idle_ms(idle_min))
+            init(paths, &out, password_stdin, &requester, idle_min)
         }
         Cmd::Unlock { password_stdin, requester, idle_min } => {
-            unlock(paths, &out, password_stdin, &requester, idle_ms(idle_min))
+            unlock(paths, &out, password_stdin, &requester, idle_min)
+        }
+        Cmd::Mode { action, value, hours, password_stdin } => {
+            mode(paths, &out, &action, value.as_deref(), hours, password_stdin)
         }
         Cmd::Status { token } => status(paths, &out, token),
         Cmd::Lock { token, all } => lock(paths, &out, token, all),
@@ -316,6 +334,25 @@ impl Out {
 
 fn idle_ms(minutes: Option<i64>) -> i64 {
     minutes.map(|m| m.clamp(1, 600) * 60_000).unwrap_or(IDLE_MS_DEFAULT)
+}
+
+/// How long a token made now stays valid. `--idle-min` keeps the old
+/// idle-based behaviour; otherwise the machine's mode decides:
+///   never   -> no deadline (and the token is stored machine-wide)
+///   time    -> absolute deadline, `hours` from now
+///   session -> no deadline, with a 7-day ceiling in case an agent dies
+///              without locking
+fn policy(paths: &Paths, idle_min: Option<i64>) -> (i64, Option<i64>, UnlockPolicy) {
+    let policy = config::load(paths).unlock;
+    if let Some(minutes) = idle_min {
+        return (idle_ms(Some(minutes)), None, policy);
+    }
+    let now = session::now_ms();
+    match policy.mode {
+        UnlockMode::Never => (0, None, policy),
+        UnlockMode::Time => (0, Some(now + policy.hours.clamp(1, 24 * 90) * 3_600_000), policy),
+        UnlockMode::Session => (0, Some(now + 7 * 24 * 3_600_000), policy),
+    }
 }
 
 // ---------------------------------------------------------------- input
@@ -386,17 +423,42 @@ fn items_with(session: &Session, store: &crypto::StoreFile) -> Result<Vec<Item>,
     })
 }
 
+/// The auto session is the `never` mode token: no deadline, no password, and
+/// it belongs to the machine rather than to one agent.
+fn auto_session(paths: &Paths) -> Option<Session> {
+    let session = session::load_auto(paths).ok().flatten()?;
+    let store = crypto::read_store(&paths.store()).ok().flatten()?;
+    if crypto::store_id(&store) != session.store_id {
+        session::delete_auto(paths);
+        return None;
+    }
+    Some(session)
+}
+
+/// An explicit token, else the machine-wide auto session.
 fn load_session(paths: &Paths, token: Option<&str>) -> Result<Session, Fault> {
-    let token = token.filter(|t| !t.is_empty()).ok_or_else(|| {
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        return session::load(paths, token).map_err(Fault::Auth);
+    }
+    auto_session(paths).ok_or_else(|| {
         Fault::Auth("vault is locked (no session token) — unlock first".into())
-    })?;
-    session::load(paths, token).map_err(Fault::Auth)
+    })
+}
+
+/// Write a session back where it came from: auto sessions stay machine-wide,
+/// the others stay in the per-agent token file.
+fn persist(paths: &Paths, session: &Session) {
+    let auto = session::load_auto(paths)
+        .ok()
+        .flatten()
+        .is_some_and(|saved| saved.token == session.token);
+    let _ = if auto { session::save_auto(paths, session) } else { session.save(paths) };
 }
 
 fn touch(paths: &Paths, session: &mut Session) {
     session.last_active = session::now_ms();
     let _ = session.prune_grants(session.last_active);
-    let _ = session.save(paths);
+    persist(paths, session);
 }
 
 /// Read-modify-write under one advisory lock. The closure never opens a dialog
@@ -433,6 +495,8 @@ fn doctor(paths: &Paths, out: &Out) -> Outcome {
         "audit": paths.audit(),
         "display": dialog::has_display(),
         "zenity": which("zenity"),
+        "mode": config::load(paths).unlock.mode.as_str(),
+        "auto": paths.auto_session().exists(),
     });
     out.value(value.clone(), || {
         let mut lines = Vec::new();
@@ -450,7 +514,7 @@ fn which(program: &str) -> bool {
     })
 }
 
-fn init(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_ms: i64) -> Outcome {
+fn init(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_min: Option<i64>) -> Outcome {
     if paths.store().exists() {
         return Err(Fault::Error(format!(
             "vault already initialized — {}",
@@ -487,21 +551,28 @@ fn init(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_ms
         crypto::write_atomic(&paths.store(), &bytes)?;
     }
     session::ensure_session_dir(paths)?;
-    let session = Session::new(requester, idle_ms, &sealed, &key);
-    session.save(paths)?;
+    let (idle, deadline, policy) = policy(paths, idle_min);
+    let session = Session::new(requester, idle, deadline, &sealed, &key);
+    if policy.mode == UnlockMode::Never {
+        session::save_auto(paths, &session)?;
+    } else {
+        session.save(paths)?;
+    }
     audit::append(&paths.audit(), requester, "init", None, None);
     let value = json!({
         "ok": true,
         "path": paths.store(),
         "token": session.token,
-        "expiresAt": session.expires_at(),
+        "expiresAt": session.expiry(),
         "items": 0,
+        "mode": policy.mode.as_str(),
+        "auto": policy.mode == UnlockMode::Never,
     });
     out.value(value, || format!("created {}", paths.store().display()));
     Ok(())
 }
 
-fn unlock(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_ms: i64) -> Outcome {
+fn unlock(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_min: Option<i64>) -> Outcome {
     let store = open_store(paths)?;
     let password = if password_stdin {
         read_password()?
@@ -517,19 +588,108 @@ fn unlock(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_
     })?;
     session::ensure_session_dir(paths)?;
     session::sweep(paths);
-    let session = Session::new(requester, idle_ms, &store, &key);
-    session.save(paths)?;
-    audit::append(&paths.audit(), requester, "unlock", None, None);
+    let (idle, deadline, policy) = policy(paths, idle_min);
+    let session = Session::new(requester, idle, deadline, &store, &key);
+    if policy.mode == UnlockMode::Never {
+        session::save_auto(paths, &session)?;
+    } else {
+        session.save(paths)?;
+    }
+    audit::append(&paths.audit(), requester, "unlock", None, Some(policy.mode.as_str()));
     let value = json!({
         "ok": true,
         "token": session.token,
-        "expiresAt": session.expires_at(),
+        "expiresAt": session.expiry(),
         "items": items.len(),
         "requester": requester,
+        "mode": policy.mode.as_str(),
+        "auto": policy.mode == UnlockMode::Never,
         "path": paths.store(),
     });
     out.value(value, || format!("unlocked {} ({} entries)", paths.store().display(), items.len()));
     Ok(())
+}
+
+/// Show or change the password policy. Changing it always costs the master
+/// password: `never` writes the key to disk, so it must not be a drive-by act.
+fn mode(
+    paths: &Paths,
+    out: &Out,
+    action: &str,
+    value: Option<&str>,
+    hours: Option<i64>,
+    password_stdin: bool,
+) -> Outcome {
+    match action.trim() {
+        "" | "get" | "status" => {
+            let policy = config::load(paths).unlock;
+            let auto = paths.auto_session().exists();
+            out.value(
+                json!({
+                    "ok": true,
+                    "mode": policy.mode.as_str(),
+                    "hours": policy.hours,
+                    "auto": auto,
+                    "store": paths.store(),
+                }),
+                || {
+                    format!(
+                        "mode: {}\nhours: {}\nmachine-wide session: {}",
+                        policy.mode.as_str(),
+                        policy.hours,
+                        if auto { "yes (no password needed)" } else { "no" }
+                    )
+                },
+            );
+            Ok(())
+        }
+        "set" => {
+            let value = value.ok_or_else(|| {
+                Fault::Usage("usage: ai-vault mode set never|time|session [--hours N]".into())
+            })?;
+            let mode = UnlockMode::parse(value)
+                .ok_or_else(|| Fault::Usage(format!("unknown mode \"{value}\" — use never, time or session")))?;
+            let store = open_store(paths)?;
+            let password = if password_stdin {
+                read_password()?
+            } else {
+                ask_password("ai-vault · 主密码", "切换解锁模式")?
+            };
+            let (_, key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
+                crypto::OpenError::WrongPassword => Fault::Auth("wrong master password".into()),
+                crypto::OpenError::Broken(message) => Fault::Error(message),
+            })?;
+            let hours = hours.unwrap_or(config::load(paths).unlock.hours).clamp(1, 24 * 90);
+            config::save(paths, &config::Config { unlock: UnlockPolicy { mode, hours } })?;
+            session::ensure_session_dir(paths)?;
+            let auto = if mode == UnlockMode::Never {
+                let session = Session::new("mode", 0, None, &store, &key);
+                session::save_auto(paths, &session)?;
+                true
+            } else {
+                session::delete_auto(paths);
+                false
+            };
+            audit::append(&paths.audit(), "cli", "mode", None, Some(mode.as_str()));
+            let warn = if mode == UnlockMode::Never {
+                "\n注意: 密钥已写到磁盘（0600）。任何能读你文件的程序/人都能读出库里的密码。"
+            } else {
+                ""
+            };
+            out.value(
+                json!({ "ok": true, "mode": mode.as_str(), "hours": hours, "auto": auto }),
+                || {
+                    format!(
+                        "mode set to {}{}",
+                        mode.as_str(),
+                        if auto { " — no password needed from now on" } else { "" }
+                    ) + warn
+                },
+            );
+            Ok(())
+        }
+        other => Err(Fault::Usage(format!("unknown mode action \"{other}\""))),
+    }
 }
 
 fn status(paths: &Paths, out: &Out, token: Option<String>) -> Outcome {
@@ -539,29 +699,42 @@ fn status(paths: &Paths, out: &Out, token: Option<String>) -> Outcome {
     let now = session::now_ms();
     session.prune_grants(now);
     session.last_active = now;
-    session.save(paths)?;
+    persist(paths, &session);
     let grants: serde_json::Map<String, serde_json::Value> = session
         .grants
         .iter()
         .map(|(name, until)| (name.clone(), json!({ "expiresAt": until, "leftMs": until - now })))
         .collect();
+    let policy = config::load(paths).unlock;
+    let auto = session::load_auto(paths)
+        .ok()
+        .flatten()
+        .is_some_and(|saved| saved.token == session.token);
     let value = json!({
         "ok": true,
         "unlocked": true,
         "items": items.len(),
         "requester": session.requester,
         "idleMs": session.idle_ms,
-        "expiresAt": session.expires_at(),
+        "expiresAt": session.expiry(),
+        "mode": policy.mode.as_str(),
+        "hours": policy.hours,
+        "auto": auto,
         "store": paths.store(),
         "grants": grants,
     });
     out.value(value.clone(), || {
+        let expiry = match session.expiry() {
+            Some(at) => format!("in {}s", ((at - now) / 1000).max(0)),
+            None => "never".to_string(),
+        };
         let mut lines = vec![
             format!("store: {}", paths.store().display()),
             format!("requester: {}", session.requester),
             "state: unlocked".to_string(),
+            format!("mode: {}{}", policy.mode.as_str(), if auto { " (machine-wide)" } else { "" }),
             format!("items: {}", items.len()),
-            format!("expires: in {}s", ((session.expires_at() - now) / 1000).max(0)),
+            format!("expires: {expiry}"),
         ];
         for (name, until) in &session.grants {
             lines.push(format!("grant: {name} ({}s left)", ((until - now) / 1000).max(0)));
@@ -573,17 +746,26 @@ fn status(paths: &Paths, out: &Out, token: Option<String>) -> Outcome {
 
 fn lock(paths: &Paths, out: &Out, token: Option<String>, all: bool) -> Outcome {
     let mut count = 0;
+    let mut auto = false;
     if all {
         count = session::delete_all(paths);
+        auto = session::delete_auto(paths);
     } else if let Some(token) = token.filter(|t| !t.is_empty()) {
         if session::delete(paths, &token) {
             count = 1;
         }
     } else {
-        return Err(Fault::Usage("pass --token or --all".into()));
+        // No token: the only thing to lock here is the machine-wide session.
+        auto = session::delete_auto(paths);
+        if !auto {
+            return Err(Fault::Usage("pass --token or --all".into()));
+        }
+    }
+    if auto {
+        count += 1;
     }
     audit::append(&paths.audit(), "cli", "lock", None, Some(if all { "all" } else { "token" }));
-    out.value(json!({ "ok": true, "removed": count }), || format!("locked {count} session(s)"));
+    out.value(json!({ "ok": true, "removed": count, "auto": auto }), || format!("locked {count} session(s)"));
     Ok(())
 }
 
@@ -624,7 +806,12 @@ fn get(
     })?;
 
     let now = session::now_ms();
-    let via = if session.grant(&item.name, now).is_some() {
+    // `never` mode is the "the agent may use these freely" mode: the machine-wide
+    // session is the authorization, so no window opens on each read.
+    let auto = token.as_deref().map_or(true, |t| t.trim().is_empty());
+    let via = if auto {
+        "no-password"
+    } else if session.grant(&item.name, now).is_some() {
         "existing-grant"
     } else {
         let message = format!(
@@ -662,7 +849,7 @@ fn get(
     };
 
     session.last_active = session::now_ms();
-    session.save(paths)?;
+    persist(paths, &session);
     audit::append(&paths.audit(), &session.requester, "read_allow", Some(&item.name), reason);
 
     let mut value = serde_json::to_value(&item).map_err(|e| Fault::Error(e.to_string()))?;
@@ -757,7 +944,7 @@ fn add(paths: &Paths, out: &Out, token: Option<String>, req: AddRequest) -> Outc
         Ok(())
     })?;
     session.last_active = session::now_ms();
-    session.save(paths)?;
+    persist(paths, &session);
     audit::append(&paths.audit(), &session.requester, "add", Some(&name), None);
     out.value(json!({ "ok": true, "item": name, "created": inserted }), || {
         format!("saved \"{name}\" (password entered in the dialog, not shown)")
@@ -790,7 +977,7 @@ fn save(paths: &Paths, out: &Out, token: Option<String>, file: Option<PathBuf>, 
         Ok(())
     })?;
     session.last_active = session::now_ms();
-    session.save(paths)?;
+    persist(paths, &session);
     audit::append(&paths.audit(), &session.requester, "import", Some(&format!("drafts:{count}")), None);
     out.value(json!({ "ok": true, "count": count, "names": names }), || format!("saved {count} entries"));
     Ok(())
@@ -817,7 +1004,7 @@ fn remove(paths: &Paths, out: &Out, token: Option<String>, name: &str, yes: bool
     })?;
     session.grants.remove(&name.to_lowercase());
     session.last_active = session::now_ms();
-    session.save(paths)?;
+    persist(paths, &session);
     audit::append(&paths.audit(), &session.requester, "remove", Some(name), None);
     out.value(json!({ "ok": true, "removed": removed }), || if removed { "removed".to_string() } else { "not found".to_string() });
     Ok(())
@@ -832,7 +1019,7 @@ fn grant(paths: &Paths, out: &Out, token: Option<String>, name: &str, minutes: O
     let until = session::now_ms() + minutes * 60_000;
     session.grants.insert(item.name.to_lowercase(), until);
     session.last_active = session::now_ms();
-    session.save(paths)?;
+    persist(paths, &session);
     audit::append(&paths.audit(), &session.requester, "grant", Some(&item.name), Some("manual"));
     out.value(json!({ "ok": true, "name": item.name, "minutes": minutes, "expiresAt": until }), || {
         format!("granted \"{}\" for {minutes}m", item.name)
@@ -850,7 +1037,7 @@ fn revoke(paths: &Paths, out: &Out, token: Option<String>, name: Option<&str>, a
         return Err(Fault::Usage("pass an entry name or --all".into()));
     }
     session.last_active = session::now_ms();
-    session.save(paths)?;
+    persist(paths, &session);
     audit::append(&paths.audit(), &session.requester, "revoke", name, Some(if all { "all" } else { "entry" }));
     out.value(json!({ "ok": true }), || "revoked".to_string());
     Ok(())
@@ -914,7 +1101,7 @@ fn import_file(paths: &Paths, out: &Out, token: Option<String>, file: &PathBuf, 
         Ok(())
     })?;
     session.last_active = session::now_ms();
-    session.save(paths)?;
+    persist(paths, &session);
     audit::append(&paths.audit(), &session.requester, "import", Some(&format!("json:{count}")), None);
     out.value(json!({ "ok": true, "count": count, "names": names }), || format!("imported {count} login items"));
     Ok(())

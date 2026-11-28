@@ -32,6 +32,16 @@ impl Paths {
         self.dir.join("audit.log")
     }
 
+    /// Unlock policy (mode and, for `time`, the number of hours).
+    pub fn config(&self) -> PathBuf {
+        self.dir.join("config.json")
+    }
+
+    /// The machine-wide token `never` mode keeps, so no prompt is ever needed.
+    pub fn auto_session(&self) -> PathBuf {
+        self.dir.join("agent.session.json")
+    }
+
     /// Shared advisory lock for read-modify-write of the store file.
     pub fn store_lock(&self) -> PathBuf {
         self.dir.join("store.lock")

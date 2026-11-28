@@ -26,7 +26,7 @@ omp plugin install npm:pi-ai-vault  # omp，同一个包
 | 工具 | 作用 | 模型看到密码？ |
 |---|---|---|
 | `vault_list` | 本地库条目元数据 | 否 |
-| `vault_get` | 读一条；弹窗授权，5 分钟内同一请求方可复用 | 是，用户当场允许 |
+| `vault_get` | 读一条：**先本地库，再 Bitwarden**；Bitwarden 命中会问「读一次 / 导入 ai-vault」 | 是，用户当场允许 |
 | `vault_add` | 存一条；密码由用户在弹出的窗口里输入 | 否 |
 | `vault_import` | 把 Bitwarden 登录项抄进本地库（先确认） | 否 |
 | `bw_list` / `bw_run` / `bw_clipboard` / `bw_reveal` | 在线 Bitwarden（`bw` CLI） | 否，`bw_reveal` 除外 |
@@ -40,6 +40,18 @@ omp plugin install npm:pi-ai-vault  # omp，同一个包
 /vault import <bitwarden.json> | import-bw [搜索词]
 /bw status|unlock|lock|clear
 ```
+
+## 解锁模式
+
+本地库什么时候要主密码，由这台机器的模式决定（`/vault mode`，切换要主密码）：
+
+| 模式 | 行为 |
+|---|---|
+| `never` | 永远不问，读取也不弹确认窗——「agent 可以自由使用」的那批密码 |
+| `time` | 解锁后 N 小时（默认 8）再问一次 |
+| `session` | 每个会话一次，会话结束失效（默认） |
+
+`vault_get` 找不到本地条目时会去 Bitwarden 搜；命中后先给你看这一条并问是否读取，读了再问「导入 ai-vault（以后免 Bitwarden）还是只用这一次」。所以 **只有你同意导入的密码才会进 ai-vault**。
 
 ## 隔离
 

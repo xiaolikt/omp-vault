@@ -8,6 +8,7 @@
 
 mod audit;
 mod cli;
+mod config;
 mod crypto;
 mod dialog;
 mod import;

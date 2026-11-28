@@ -13,7 +13,15 @@
  */
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { newBwState, pullBitwardenLogins, queryBitwarden, registerBitwarden, type BitwardenMeta, type BwState } from "./bitwarden.js";
+import {
+	lookupBitwardenLogin,
+	newBwState,
+	pullBitwardenLogins,
+	queryBitwarden,
+	registerBitwarden,
+	type BitwardenMeta,
+	type BwState,
+} from "./bitwarden.js";
 import { CliError, VaultCli } from "./cli.js";
 import { isOmpHost, onSessionLeave, sessionLabel, subagentId, withTier } from "./host.js";
 import { confirmWindow, promptSecret, promptText, type PromptHost } from "./prompt.js";
@@ -22,21 +30,28 @@ type Ctx = ExtensionToolContext | ExtensionCommandContext;
 
 const GRANT_MS_DEFAULT = 5 * 60_000;
 
+type UnlockModeName = "never" | "time" | "session";
+
 interface StatusResult {
 	ok: boolean;
 	unlocked: boolean;
 	items: number;
 	requester: string;
 	idleMs: number;
-	expiresAt: number;
+	expiresAt: number | null;
+	mode: UnlockModeName;
+	hours: number;
+	auto: boolean;
 	grants: Record<string, { expiresAt: number; leftMs: number }>;
 }
 
 interface UnlockResult {
 	ok: boolean;
 	token: string;
-	expiresAt: number;
+	expiresAt: number | null;
 	items: number;
+	mode?: UnlockModeName;
+	auto?: boolean;
 }
 
 interface ListResult {
@@ -71,6 +86,10 @@ interface Scope {
 	epoch: number;
 	/** Cached entry count for the status line. */
 	items: number;
+	/** The machine-wide unlock policy, as the CLI last reported it. */
+	mode?: UnlockModeName;
+	/** True when reads use the machine-wide session instead of a token. */
+	auto?: boolean;
 	unlocking?: Promise<boolean>;
 }
 
@@ -86,11 +105,14 @@ const note = (ctx: Ctx, text: string, level: "info" | "warning" | "error" = "inf
 
 const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-interface Failure {
+/** What a tool call hands back; every error path uses the same shape. */
+interface ToolOutcome {
 	content: { type: "text"; text: string }[];
-	details: { ok: false; denied?: boolean };
-	isError: true;
+	details: { ok?: boolean; denied?: boolean; item?: string; via?: string; count?: number };
+	isError?: boolean;
 }
+
+type Failure = ToolOutcome;
 
 const fail = (text: string, denied = false): Failure => ({
 	content: [{ type: "text" as const, text }],
@@ -127,6 +149,9 @@ async function lockNow(scope: Scope): Promise<void> {
 	}
 }
 
+/** Args for a CLI call: this binding's token, or the machine-wide session. */
+const tokenArgs = (scope: Scope): string[] => (scope.token ? ["--token", scope.token] : []);
+
 /** Make this binding's unlock happen; never throws. */
 async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Promise<boolean> {
 	if (!cli.available) {
@@ -140,6 +165,8 @@ async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Pro
 			try {
 				const status = await cli.json<StatusResult>(["status", "--token", scope.token], { signal });
 				scope.items = status.items;
+				scope.mode = status.mode;
+				scope.auto = false;
 				return true;
 			} catch (error) {
 				if (!(error instanceof CliError) || !error.auth) {
@@ -151,6 +178,24 @@ async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Pro
 					note(ctx, NOT_INITIALIZED, "warning");
 					return false;
 				}
+			}
+		}
+		// `never` mode keeps a machine-wide session: no token, no window. Ask the
+		// CLI before opening anything, so that mode really is password-free.
+		try {
+			const status = await cli.json<StatusResult>(["status"], { signal });
+			scope.items = status.items;
+			scope.mode = status.mode;
+			scope.auto = status.auto;
+			return true;
+		} catch (error) {
+			if (error instanceof CliError && /not initialized/i.test(error.message)) {
+				note(ctx, NOT_INITIALIZED, "warning");
+				return false;
+			}
+			if (!(error instanceof CliError) || !error.auth) {
+				note(ctx, `ai-vault: ${describe(error)}`, "error");
+				return false;
 			}
 		}
 		const attempt = async (password?: string): Promise<UnlockResult> => {
@@ -179,7 +224,11 @@ async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Pro
 				await cli.run(["lock", "--token", result.token]).catch(() => undefined);
 				return false;
 			}
-			scope.token = result.token;
+			scope.mode = result.mode;
+			scope.auto = result.mode === "never";
+			// In `never` mode the CLI wrote the machine-wide session; keeping a
+			// per-binding token would bring back a confirm window on every read.
+			scope.token = result.mode === "never" ? undefined : result.token;
 			scope.items = result.items;
 			return true;
 		} catch (error) {
@@ -236,53 +285,146 @@ const vaultGetParams = Type.Object({
 	reason: Type.Optional(Type.String({ description: "Why this secret is needed (shown to the user in the confirm window)" })),
 });
 type VaultGetDetails = { ok?: boolean; denied?: boolean; item?: string; via?: string };
-function vaultGetTool(scope: Scope): ToolDefinition<typeof vaultGetParams, VaultGetDetails> {
+
+/**
+ * The local vault is the first stop; Bitwarden is the fallback. A hit there is
+ * offered to the user twice: read it this once, then optionally import it so
+ * later reads never touch Bitwarden.
+ */
+async function bitwardenFallback(
+	scope: Scope,
+	ctx: Ctx,
+	bw: BwState,
+	name: string,
+	reason: string | undefined,
+	localMiss: string,
+	signal?: AbortSignal,
+): Promise<ToolOutcome> {
+	const missing = localMiss;
+	let hit;
+	try {
+		hit = await lookupBitwardenLogin(bw, ctx, name, signal);
+	} catch (error) {
+		return fail(`${missing} — the Bitwarden lookup failed: ${describe(error)}`);
+	}
+	if (!hit) return fail(`${missing} — not in Bitwarden either${reason ? ` (reason: ${reason})` : ""}`);
+
+	const label = `${hit.name}${hit.username ? `  user:${hit.username}` : ""}`;
+	const allow = await confirmWindow(
+		dialogs(ctx),
+		"pi-ai-vault · Bitwarden 里找到",
+		`本地库没有「${name}」，Bitwarden 里有：\n${label}\n\n读取这一次吗？`,
+		signal,
+	);
+	if (!allow) return fail(`user denied reading "${hit.name}" from Bitwarden — do not retry`, true);
+
+	const importIt = await confirmWindow(
+		dialogs(ctx),
+		"pi-ai-vault · 导入到 ai-vault",
+		`把「${hit.name}」写进 ai-vault 吗？\n\n允许 → 以后直接读本地库（按当前解锁模式，可能免密）\n拒绝 → 只用这一次，不写入本地库`,
+		signal,
+	);
+	if (importIt) {
+		try {
+			const saved = await cli.json<SaveResult>(["save", "--yes", ...tokenArgs(scope)], {
+				stdin: JSON.stringify([
+					{
+						name: hit.name,
+						username: hit.username || undefined,
+						password: hit.password,
+						uris: hit.uris,
+						source: { kind: "bitwarden", id: hit.id },
+					},
+				]),
+				signal,
+			});
+			scope.items += saved.count;
+			setStatus(ctx, scope);
+		} catch (error) {
+			return fail(`found "${hit.name}" in Bitwarden but could not import it: ${describe(error)}`);
+		}
+		return {
+			content: [
+				{
+					type: "text" as const,
+					text: JSON.stringify(
+						{ name: hit.name, username: hit.username || undefined, password: hit.password, uris: hit.uris, via: "imported-from-bitwarden" },
+						null,
+						1,
+					),
+				},
+			],
+			details: { item: hit.name, via: "imported-from-bitwarden" },
+		};
+	}
+
+	return {
+		content: [
+			{
+				type: "text" as const,
+				text: JSON.stringify(
+					{ name: hit.name, username: hit.username || undefined, password: hit.password, uris: hit.uris, via: "bitwarden-once" },
+					null,
+					1,
+				),
+			},
+		],
+		details: { item: hit.name, via: "bitwarden-once" },
+	};
+}
+
+function vaultGetTool(scope: Scope, bw: BwState): ToolDefinition<typeof vaultGetParams, VaultGetDetails> {
+	const viaOf = (stdout: string): string => {
+		try {
+			return (JSON.parse(stdout) as { via?: string }).via ?? "grant";
+		} catch {
+			return "grant";
+		}
+	};
 	const tool: ToolDefinition<typeof vaultGetParams, VaultGetDetails> = {
 		name: "vault_get",
-		label: "Vault: read a local secret",
+		label: "Vault: read a secret (local first, Bitwarden second)",
 		description:
-			"Read one secret from the machine-wide ai-vault store (not Bitwarden). " +
-			"The user must approve a desktop confirm window; the grant then lasts 5 minutes for the session or subagent that asked. " +
-			"If the user denies, do not retry. Prefer bw_run when the secret should stay out of the chat.",
+			"Read one secret. The machine-wide ai-vault store is asked first; that is the vault the agent may use freely, and in `never` unlock mode it answers without any window. " +
+			"If the entry is not local, Bitwarden is searched: the user is shown the hit, then asked whether to read it once or import it into ai-vault. " +
+			"If the user denies, do not retry. Use bw_run when the value must never enter the chat.",
+		promptSnippet: "Read a secret: local vault first, then Bitwarden (with an import offer).",
 		parameters: vaultGetParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			if (!(await ensureUnlocked(scope, ctx, signal))) return fail(LOCKED);
-			const args = ["get", params.name, "--token", scope.token!];
-			if (params.reason) args.push("--reason", params.reason);
+			const base = ["get", params.name, ...(params.reason ? ["--reason", params.reason] : []), ...tokenArgs(scope)];
 			try {
-				const viaOf = (stdout: string): string => {
-					try {
-						return (JSON.parse(stdout) as { via?: string }).via ?? "grant";
-					} catch {
-						return "grant";
-					}
-				};
 				try {
-					const run = await cli.run([...args, "--json"], { signal });
-					setStatus(ctx, scope, "·granted");
+					const run = await cli.run([...base, "--json"], { signal });
+					setStatus(ctx, scope, "·ok");
 					return {
 						content: [{ type: "text" as const, text: run.stdout.trim() }],
 						details: { item: params.name, via: viaOf(run.stdout) },
 					};
 				} catch (error) {
-					if (!(error instanceof CliError) || error.needsUi !== "confirm") throw error;
-					const sub = subagentId(ctx);
-					const allowed = await confirmWindow(
-						dialogs(ctx),
-						"ai-vault · 读取本地密码",
-						`条目: ${params.name}\n请求方: ${sub ? `子代理 ${sub}` : "主会话"}\n原因: ${params.reason ?? "(未说明)"}\n\n` +
-							"允许后 5 分钟内同一请求方可再次读取。密码会进入对话。",
-						signal,
-					);
-					const run = await cli.run([...args, "--json", "--answer-stdin"], {
-						stdin: allowed ? "y\n" : "n\n",
-						signal,
-					});
-					setStatus(ctx, scope, "·granted");
-					return {
-						content: [{ type: "text" as const, text: run.stdout.trim() }],
-						details: { item: params.name, via: viaOf(run.stdout) },
-					};
+					if (error instanceof CliError && error.needsUi === "confirm") {
+						const sub = subagentId(ctx);
+						const allowed = await confirmWindow(
+							dialogs(ctx),
+							"ai-vault · 读取本地密码",
+							`条目: ${params.name}\n请求方: ${sub ? `子代理 ${sub}` : "主会话"}\n原因: ${params.reason ?? "(未说明)"}\n\n` +
+								"允许后 5 分钟内同一请求方可再次读取。密码会进入对话。",
+							signal,
+						);
+						const run = await cli.run([...base, "--json", "--answer-stdin"], {
+							stdin: allowed ? "y\n" : "n\n",
+							signal,
+						});
+						setStatus(ctx, scope, "·granted");
+						return {
+							content: [{ type: "text" as const, text: run.stdout.trim() }],
+							details: { item: params.name, via: viaOf(run.stdout) },
+						};
+					}
+					if (error instanceof CliError && /^no such entry/.test(error.message)) {
+						return await bitwardenFallback(scope, ctx, bw, params.name, params.reason, error.message, signal);
+					}
+					throw error;
 				}
 			} catch (error) {
 				if (error instanceof CliError && error.denied) setStatus(ctx, scope, "·denied");
@@ -485,6 +627,7 @@ async function importBitwarden(
 const HELP = [
 	"/vault init                        创建全机共享的本地加密库（弹出窗口设置主密码）",
 	"/vault unlock | lock               解锁 / 锁定（清空本会话的授权）",
+	"/vault mode [never|time|session]   查看/切换解锁模式（切换要主密码）",
 	"/vault status                      状态与授权剩余时间",
 	"/vault list                        本地条目元数据",
 	"/vault add [名称]                  新增本地条目（用户名、密码在弹窗里输入）",
@@ -570,30 +713,91 @@ function commandHandler(scope: Scope, bw: BwState) {
 				return;
 			}
 			case "status": {
-				if (!scope.token) {
-					note(ctx, [`store: ${cli.dir}/store.json`, `session: ${label}`, "state: locked"].join("\n"));
-					setStatus(ctx, scope);
-					return;
-				}
 				try {
-					const status = await cli.json<StatusResult>(["status", "--token", scope.token]);
+					const status = await cli.json<StatusResult>(["status", ...tokenArgs(scope)]);
 					scope.items = status.items;
+					scope.mode = status.mode;
+					scope.auto = status.auto;
+					setStatus(ctx, scope);
+					const expiry = status.expiresAt
+						? `${Math.max(0, Math.round((status.expiresAt - Date.now()) / 1000))}s`
+						: "never";
+					const how =
+						status.mode === "never"
+							? "never（免密）"
+							: status.mode === "time"
+								? `time（每 ${status.hours}h 要一次密码）`
+								: "session（每个会话一次）";
 					const lines = [
 						`store: ${cli.dir}/store.json`,
 						`session: ${status.requester}`,
 						"state: unlocked",
+						`mode: ${how}`,
 						`items: ${status.items}`,
-						`expires: ${Math.max(0, Math.round((status.expiresAt - Date.now()) / 1000))}s (idle lock ${Math.round(status.idleMs / 1000)}s)`,
+						`expires: ${expiry}`,
 					];
 					for (const [name, grant] of Object.entries(status.grants)) {
 						lines.push(`grant: ${name} (${Math.ceil(grant.leftMs / 1000)}s left)`);
 					}
 					note(ctx, lines.join("\n"));
-					setStatus(ctx, scope);
 				} catch (error) {
 					scope.token = undefined;
-					note(ctx, `ai-vault: ${describe(error)}`, "warning");
+					note(
+						ctx,
+						[
+							`store: ${cli.dir}/store.json`,
+							`session: ${label}`,
+							"state: locked",
+							`ai-vault: ${describe(error)}`,
+						].join("\n"),
+						"warning",
+					);
 					setStatus(ctx, scope);
+				}
+				return;
+			}
+			case "mode": {
+				const [sub, hoursArg] = rest;
+				if (!sub || sub === "get" || sub === "status") {
+					try {
+						const current = await cli.json<{ mode: string; hours: number; auto: boolean }>(["mode"]);
+						note(
+							ctx,
+							[
+								`mode: ${current.mode}`,
+								`hours: ${current.hours}（time 模式用）`,
+								`machine-wide session: ${current.auto ? "yes（免密）" : "no"}`,
+								"",
+								"/vault mode never|time|session [小时]   切换（要主密码）",
+							].join("\n"),
+						);
+					} catch (error) {
+						note(ctx, `ai-vault: ${describe(error)}`, "error");
+					}
+					return;
+				}
+				if (!["never", "time", "session", "no-password"].includes(sub)) {
+					note(ctx, "用法: /vault mode [never|time|session] [小时]", "warning");
+					return;
+				}
+				const args = ["mode", "set", sub];
+				if (hoursArg) args.push("--hours", hoursArg);
+				try {
+					const run = await cli.withPassword(args, () => promptSecret(dialogs(ctx), "ai-vault · 主密码", "切换解锁模式"));
+					const result = JSON.parse(run.stdout) as { mode: UnlockModeName; hours: number; auto: boolean };
+					await lockNow(scope);
+					scope.mode = result.mode;
+					scope.auto = result.auto;
+					setStatus(ctx, scope);
+					const how =
+						result.mode === "never"
+							? "以后免密（密钥已写盘，任何能读你文件的程序都能读到库里的密码）"
+							: result.mode === "time"
+								? `以后每 ${result.hours} 小时要一次密码`
+								: "以后每个会话要一次密码";
+					note(ctx, `mode → ${result.mode}，${how}`);
+				} catch (error) {
+					note(ctx, `ai-vault: ${error instanceof CliError && error.denied ? "已取消" : describe(error)}`, "warning");
 				}
 				return;
 			}
@@ -752,7 +956,7 @@ export default function aiVault(pi: ExtensionAPI): void {
 	const scope: Scope = { token: undefined, epoch: 0, items: 0, unlocking: undefined };
 	const bw = newBwState();
 	pi.registerTool(vaultListTool(scope));
-	pi.registerTool(vaultGetTool(scope));
+	pi.registerTool(vaultGetTool(scope, bw));
 	pi.registerTool(vaultAddTool(scope));
 	pi.registerTool(vaultImportTool(scope, bw));
 	registerBitwarden(pi, bw, omp);

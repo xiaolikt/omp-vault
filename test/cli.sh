@@ -113,6 +113,21 @@ assert not any("p1ssw0rd" in json.dumps(e) or "exp-pass" in json.dumps(e) for e 
 PY
 grep -q 'p1ssw0rd' "$AI_VAULT_DIR/audit.log" && bad "a secret reached the audit log" || ok "no secret in audit.log"
 
+echo "== unlock modes =="
+check "mode get works without a token" 0 "$BIN" mode --json
+check "switching the mode needs the password" 3 "$BIN" mode set never
+check "a wrong password does not switch it" 5 bash -c "printf 'wrong password' | '$BIN' mode set never --password-stdin"
+check "never mode is set with the password" 0 bash -c "printf 'correct horse' | '$BIN' mode set never --password-stdin --json"
+check "never mode needs no token" 0 "$BIN" status --json
+printf 'correct horse' | "$BIN" unlock --password-stdin --json >"$TMP/u2" 2>&1
+python3 - "$TMP/u2" <<'PY' && ok "unlock reports the mode" || bad "unlock output is wrong"
+import json,sys
+d = json.load(open(sys.argv[1]))
+assert d["mode"] == "never" and d["auto"] is True, d
+PY
+check "back to session mode" 0 bash -c "printf 'correct horse' | '$BIN' mode set session --password-stdin --json"
+check "session mode needs a token again" 5 "$BIN" status
+
 echo "== doctor =="
 check "doctor runs" 0 "$BIN" doctor --json
 

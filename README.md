@@ -91,7 +91,8 @@ ai-vault [--dir DIR] [--json] <命令>
 | `path` | 打印库、会话目录的位置 |
 | `doctor` | 路径、是否初始化、有没有桌面和 zenity、版本 |
 | `init [--password-stdin]` | 建库（弹窗两次设密码），成功后直接给一个令牌 |
-| `unlock [--password-stdin] [--requester ID] [--idle-min N]` | 解锁，stdout 一个令牌 |
+| `unlock [--password-stdin] [--requester ID]` | 按当前模式解锁，stdout 一个令牌 |
+| `mode [get]` / `mode set never\|time\|session [--hours N]` | 查看/切换解锁模式（切换要主密码） |
 | `status --token T` | 条目数、过期时间、还活着的读授权 |
 | `lock --token T \| --all` | 丢掉令牌（`--all` 清空本机所有会话） |
 | `list --token T` | 条目元数据（名称/用户名/URI），没有密码 |
@@ -123,7 +124,7 @@ ai-vault [--dir DIR] [--json] <命令>
 | 工具 | 作用 | 等级 | 模型看到密码？ |
 |---|---|---|---|
 | `vault_list` | 本地库元数据 | read | 否 |
-| `vault_get` | 读一条；弹窗授权，5 分钟内同一请求方可复用 | exec | 是，用户当场允许 |
+| `vault_get` | 读一条：**先本地库，再 Bitwarden**；Bitwarden 命中会问「读一次 / 导入」 | exec | 是，用户当场允许 |
 | `vault_add` | 存一条；密码在弹窗里输入 | write | 否 |
 | `vault_import` | 把 Bitwarden 登录项抄进本地库（先确认） | write | 否 |
 | `bw_list` | 查在线 Bitwarden 元数据 | read | 否 |
@@ -134,11 +135,47 @@ ai-vault [--dir DIR] [--json] <命令>
 
 字段选择：`password`（默认）· `totp`（种子）· `code`（动态验证码）· `notes` · `field:<自定义字段名>`。
 
+### 查询顺序：本地优先，Bitwarden 兜底
+
+`vault_get` 先问 `ai-vault`（这台机器共用的库），只有本地没有才去搜 Bitwarden：
+
+```
+vault_get "github"
+  └─ ai-vault 有 → 直接返回（按解锁模式决定要不要窗口）
+  └─ ai-vault 没有 → Bitwarden 搜索
+       ├─ 没命中 → 报「本地没有、Bitwarden 也没有」
+       └─ 命中 → ① 给你看这一条（名称/用户名），问读不读
+                 ② 读了再问：导入 ai-vault（以后免 Bitwarden）还是只用这一次
+```
+
+这样两者就隔离了：**只有你同意导入的密码才进 ai-vault**，ai-vault 里的就是「agent 可以自由使用」的那批；其余仍留在 Bitwarden 里，每次都要你点。
+
+### 解锁模式
+
+`ai-vault` 什么时候要主密码，由这台机器的模式决定（`~/.ai-vault/config.json`）：
+
+| 模式 | 行为 | 适合 |
+|---|---|---|
+| `never` | 永远不问。密钥写在 `~/.ai-vault/agent.session.json`（0600），**读取也不再弹确认窗** | 把一批「随便用」的密码交给 agent |
+| `time` | 解锁后 N 小时（默认 8，`--hours` 可改）再问一次 | 有边界的长任务 |
+| `session` | 每个会话问一次，会话结束就失效（默认） | 日常 |
+
+```bash
+ai-vault mode                      # 看当前模式
+ai-vault mode set never            # 切换要主密码
+ai-vault mode set time --hours 4
+ai-vault mode set session
+```
+插件里同样有：`/vault mode`、`/vault mode time 4`。**切换模式一定要输主密码**——尤其是切到 `never`，因为它把密钥落到磁盘上。
+
+`never` 不是「安全一点」而是「明确放弃这层保护」：任何能读你 home 目录的进程都能读出库里的全部密码。它存在的意义是把「可以让 AI 随便用」的密码和 Bitwarden 里那些「每次都要问」的分开。
+
 ## 插件里的命令
 
 ```
 /vault init                        创建本地库（弹窗设主密码）
 /vault unlock | lock               解锁 / 锁定本会话
+/vault mode [never|time|session]   查看/切换解锁模式（切换要主密码）
 /vault status                      状态、过期时间、授权剩余
 /vault list                        条目元数据
 /vault add [名称]                  新增（用户名、密码在弹窗里输入）
@@ -154,7 +191,7 @@ ai-vault [--dir DIR] [--json] <命令>
 ## 会话与隔离
 
 - 每个绑定（一个会话，或一个子代理）在第一次用到库时各自 `ai-vault unlock`，拿到**自己的令牌**。父会话的解锁和授权子代理继承不到；确认窗口里会写「请求方: 子代理 0-Explore」。
-- 令牌空闲 10 分钟自动失效（可以被 `--idle-min` 改，1–600 分钟）。`/new`、`/fork`、退出会让插件把自己的令牌删掉；`/resume` 保留。
+- 令牌寿命由解锁模式决定（见上）：`session` 到会话结束、`time` 到 N 小时、`never` 不过期。`/new`、`/fork`、退出会让插件把自己的令牌删掉；`/resume` 保留。
 - 读授权存在令牌里，所以天然按请求方隔离；`/vault grant`、`/vault revoke` 改的就是它。
 - 库文件本身共享：读改写有 `flock`，两个 agent 同时写不会丢更新（旧版是后写覆盖先写）。
 
@@ -171,7 +208,7 @@ ai-vault [--dir DIR] [--json] <命令>
 
 ## 安全
 
-- 主密码只经过弹窗或宿主输入框；`unlock` 派生出的 key 只写进令牌文件（0600，优先 tmpfs，登出即消失）。它和「agent 进程内存里有 key」是同一级别的暴露面，好处是换会话、reload、崩溃都会自然清掉。
+- 主密码只经过弹窗或宿主输入框；`unlock` 派生出的 key 只写进令牌文件（0600，优先 tmpfs，登出即消失）。`never` 模式例外：key 写在 `~/.ai-vault/agent.session.json`，跨重启存在——这是那个模式的定义，不是疏漏。它和「agent 进程内存里有 key」是同一级别的暴露面，好处是换会话、reload、崩溃都会自然清掉。
 - 会话令牌只是 id，不是 key：泄露令牌不等于泄露密码，但仍能读库，所以 `lock` 要真删文件。
 - 插件启动的子进程（`bw`、`bw_run` 的 bash、剪贴板工具）都会剔除宿主环境里的 `BW_*`，避免用户 shell 里导出的会话密钥漏进命令环境。
 - 审计：`~/.ai-vault/audit.log` 记录会话/子代理标签、条目名、允许/拒绝，从不记录值；写失败不影响主操作；1 MiB 轮转成 `.1`。

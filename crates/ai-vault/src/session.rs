@@ -30,6 +30,10 @@ pub struct Session {
     pub last_active: i64,
     #[serde(rename = "idleMs")]
     pub idle_ms: i64,
+    /// Absolute deadline, ms epoch. `None` means "no deadline": the token lives
+    /// until it is locked, its idle window passes, or the store changes.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "expiresAt")]
+    pub expires_at: Option<i64>,
     #[serde(rename = "storeId")]
     pub store_id: String,
     pub salt: String,
@@ -42,7 +46,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(requester: &str, idle_ms: i64, store: &crypto::StoreFile, key: &[u8; 32]) -> Self {
+    pub fn new(requester: &str, idle_ms: i64, expires_at: Option<i64>, store: &crypto::StoreFile, key: &[u8; 32]) -> Self {
         let now = now_ms();
         Session {
             token: crate::store::random_id() + &crate::store::random_id(),
@@ -50,6 +54,7 @@ impl Session {
             created_at: now,
             last_active: now,
             idle_ms,
+            expires_at,
             store_id: crypto::store_id(store),
             salt: store.salt.clone(),
             kdf: Some(store.kdf()),
@@ -68,12 +73,18 @@ impl Session {
         Some(key)
     }
 
+    /// A deadline beats the idle window; `idleMs: 0` with no deadline means
+    /// "never expires on its own".
     pub fn expired(&self, now: i64) -> bool {
-        now.saturating_sub(self.last_active) >= self.idle_ms
+        if let Some(deadline) = self.expires_at {
+            return now >= deadline;
+        }
+        self.idle_ms > 0 && now.saturating_sub(self.last_active) >= self.idle_ms
     }
 
-    pub fn expires_at(&self) -> i64 {
-        self.last_active + self.idle_ms
+    /// When this token stops working, if it does.
+    pub fn expiry(&self) -> Option<i64> {
+        self.expires_at.or_else(|| (self.idle_ms > 0).then_some(self.last_active + self.idle_ms))
     }
 
     /// Drop grants that ran out. Returns true when anything was removed.
@@ -165,6 +176,45 @@ pub fn sweep(paths: &Paths) -> usize {
         }
     }
     removed
+}
+
+/// The machine-wide token used by `never` mode: no deadline, stored next to
+/// the store so it survives reboots. Any process running as this user can read
+/// it — that is the whole point of the mode.
+pub fn load_auto(paths: &Paths) -> Result<Option<Session>, String> {
+    let path = paths.auto_session();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let session: Session = match serde_json::from_str(&text) {
+        Ok(session) => session,
+        Err(_) => {
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        }
+    };
+    if session.expired(now_ms()) {
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    }
+    if session.key().is_none() {
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    }
+    Ok(Some(session))
+}
+
+pub fn save_auto(paths: &Paths, session: &Session) -> Result<(), String> {
+    fs::create_dir_all(&paths.dir).map_err(|e| format!("cannot create {}: {e}", paths.dir.display()))?;
+    let _ = fs::set_permissions(&paths.dir, fs::Permissions::from_mode(0o700));
+    let bytes = serde_json::to_vec(session).map_err(|e| format!("cannot serialize session: {e}"))?;
+    crypto::write_atomic(&paths.auto_session(), &bytes)
+}
+
+pub fn delete_auto(paths: &Paths) -> bool {
+    fs::remove_file(paths.auto_session()).is_ok()
 }
 
 pub fn now_ms() -> i64 {

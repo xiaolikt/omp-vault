@@ -779,6 +779,38 @@ export async function pullBitwardenLogins(
 	return filterLogins(bitwardenLogins(raw), search);
 }
 
+export type BitwardenLoginHit = { id: string; name: string; username: string; password: string; uris: string[] };
+
+/**
+ * Look one login up by name/URI and return its password, with no window of its
+ * own: the caller shows the user what was found and asks whether to read it.
+ * `undefined` means "no such item"; an ambiguous reference throws with the
+ * candidates so the model can pick one.
+ */
+export async function lookupBitwardenLogin(
+	st: BwState,
+	ctx: ExtensionContext | undefined,
+	ref: string,
+	signal?: AbortSignal,
+): Promise<BitwardenLoginHit | undefined> {
+	const session = await ensureUnlocked(st, ctx, signal);
+	let item: LiteItem;
+	try {
+		item = await resolveItem(st, session, ref, signal);
+	} catch (e) {
+		if (e instanceof Error && /^No Bitwarden item matches/.test(e.message)) return undefined;
+		throw e;
+	}
+	const secret = await secretOf(session, item, "password", signal);
+	return {
+		id: item.id ?? "",
+		name: item.name || "unnamed",
+		username: item.username,
+		password: secret.value,
+		uris: item.uri ? [item.uri] : [],
+	};
+}
+
 function normalizeEnvName(raw: string): string {
 	const name = raw.trim().toUpperCase();
 	if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) {

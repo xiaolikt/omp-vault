@@ -1,5 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, subCtx, textOf, useMocks } from "./helpers.mjs";
@@ -128,4 +129,89 @@ test("a missing entry names what is available", async () => {
 	assert.equal(result.isError, true);
 	assert.match(textOf(result), /no such entry/);
 	assert.match(textOf(result), /GitHub/);
+});
+
+test("a local miss falls back to Bitwarden: read once, no import", async () => {
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	answers.master(dir, PW);
+	await b.cmd("unlock", ctx);
+	// The Bitwarden mock unlocks with "testmaster"; the two windows are the
+	// read approval (yes) and the import offer (no).
+	answers.master(dir, "testmaster");
+	answers.questions(dir, "y", "n");
+	const result = await b.tool("vault_get", { name: "TestService" }, ctx);
+	assert.equal(result.details.via, "bitwarden-once");
+	assert.match(textOf(result), /supersecret-value-123/);
+
+	answers.master(dir, PW);
+	const listed = await b.tool("vault_list", {}, ctx);
+	assert.equal(
+		JSON.parse(textOf(listed)).some((i) => i.name === "TestService"),
+		false,
+		"a one-off read must not write the entry",
+	);
+});
+
+test("a local miss can be imported from Bitwarden", async () => {
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	answers.master(dir, PW);
+	await b.cmd("unlock", ctx);
+	answers.master(dir, "testmaster");
+	answers.questions(dir, "y", "y");
+	const result = await b.tool("vault_get", { name: "TestService" }, ctx);
+	assert.equal(result.details.via, "imported-from-bitwarden");
+	assert.match(textOf(result), /supersecret-value-123/);
+
+	answers.master(dir, PW);
+	const listed = await b.tool("vault_list", {}, ctx);
+	assert.equal(
+		JSON.parse(textOf(listed)).some((i) => i.name === "TestService"),
+		true,
+		"the import must land in the local vault",
+	);
+});
+
+test("a denied Bitwarden read is not retried", async () => {
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	answers.master(dir, PW);
+	await b.cmd("unlock", ctx);
+	answers.master(dir, "testmaster");
+	answers.questions(dir, "n");
+	const result = await b.tool("vault_get", { name: "OtherService" }, ctx);
+	assert.equal(result.isError, true);
+	assert.match(textOf(result), /do not retry/);
+});
+
+test("never mode reads without any window, and the switch needs the password", async () => {
+	const bin = process.env.AI_VAULT_BIN;
+	const switchMode = (mode) =>
+		spawnSync(bin, ["mode", "set", mode, "--password-stdin"], {
+			input: `${PW}\n`,
+			env: process.env,
+			encoding: "utf8",
+		});
+	const toNever = switchMode("never");
+	assert.equal(toNever.status, 0, toNever.stderr);
+
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	const before = prompts("--question") + prompts("--password");
+	const result = await b.tool("vault_get", { name: "GitHub" }, ctx);
+	assert.equal(result.details.via, "no-password");
+	assert.match(textOf(result), /pw-one/);
+	assert.equal(prompts("--question") + prompts("--password"), before, "no window in never mode");
+
+	// A wrong password must not change the policy.
+	const wrong = spawnSync(bin, ["mode", "set", "session", "--password-stdin"], {
+		input: "definitely-wrong\n",
+		env: process.env,
+		encoding: "utf8",
+	});
+	assert.equal(wrong.status, 5);
+
+	const back = switchMode("session");
+	assert.equal(back.status, 0, back.stderr);
 });

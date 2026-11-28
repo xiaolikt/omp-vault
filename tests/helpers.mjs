@@ -58,6 +58,8 @@ export const answers = {
 	/** The dialog that types a new entry's password. */
 	entryPassword: (dir, password) => writeFileSync(join(dir, "entry-passwords"), `${password}\n`),
 	entries: (dir, ...lines) => writeFileSync(join(dir, "entries"), lines.map((l) => `${l}\n`).join("")),
+	/** --question answers, one per window ("y"/"n"). */
+	questions: (dir, ...lines) => writeFileSync(join(dir, "questions"), lines.map((l) => `${l}\n`).join("")),
 	deny: (dir, on = true) =>
 		on ? writeFileSync(join(dir, "deny"), "") : rmSync(join(dir, "deny"), { force: true }),
 };

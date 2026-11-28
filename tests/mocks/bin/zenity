@@ -6,7 +6,8 @@
 #                when that file is missing or empty; any other password dialog
 #                answers with the first line of $OMP_VAULT_MOCK/entry-passwords
 #   --entry      first line of $OMP_VAULT_MOCK/entries; empty when the file is gone
-#   --question   allow, unless $OMP_VAULT_MOCK/deny exists (then exit 1)
+#   --question   first line of $OMP_VAULT_MOCK/questions ("n" denies), else
+#                allow unless $OMP_VAULT_MOCK/deny exists (then exit 1)
 DIR="${OMP_VAULT_MOCK:-/tmp/omp-vault-mock}"
 mkdir -p "$DIR"
 printf '%s\n' "${*//$'\n'/⏎}" >> "$DIR/zenity.log"
@@ -36,6 +37,13 @@ for arg in "$@"; do
 			if [[ -f "$DIR/entries" ]]; then take_first "$DIR/entries"; else echo ""; fi
 			exit 0 ;;
 		--question)
+			# An explicit queue ("y"/"n" per line) wins, so a flow with two
+			# different questions can answer them differently.
+			if [[ -f "$DIR/questions" ]]; then
+				answer="$(take_first "$DIR/questions")"
+				[[ "$answer" == "n" || "$answer" == "no" ]] && exit 1
+				exit 0
+			fi
 			[[ -f "$DIR/deny" ]] && exit 1
 			exit 0 ;;
 	esac
