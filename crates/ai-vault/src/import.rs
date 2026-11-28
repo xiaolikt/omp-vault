@@ -7,17 +7,6 @@ use crate::store::{Draft, Field, ItemType, Source};
 
 const MAX_NAME: usize = 200;
 
-fn as_uris(login: &serde_json::Map<String, Value>) -> Vec<String> {
-    match login.get("uris").and_then(|u| u.as_array()) {
-        Some(list) => list
-            .iter()
-            .filter_map(|entry| entry.get("uri").and_then(|u| u.as_str()))
-            .filter(|uri| !uri.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => Vec::new(),
-    }
-}
 
 fn sanitized_name(raw: &str) -> String {
     let cleaned = raw.replace(['\r', '\n'], " ");

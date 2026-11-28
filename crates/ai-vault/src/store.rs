@@ -22,20 +22,6 @@ pub enum ItemType {
 }
 
 impl ItemType {
-    /// Bitwarden's `.type` number.
-    pub fn code(self) -> u8 {
-        match self {
-            ItemType::Login => 1,
-            ItemType::SecureNote => 2,
-            ItemType::Card => 3,
-            ItemType::Identity => 4,
-            ItemType::SshKey => 5,
-            ItemType::BankAccount => 6,
-            ItemType::DriversLicense => 7,
-            ItemType::Passport => 8,
-        }
-    }
-
     pub fn from_code(code: u8) -> Option<ItemType> {
         Some(match code {
             1 => ItemType::Login,
@@ -165,11 +151,6 @@ fn default_item_type() -> ItemType {
 }
 
 impl Item {
-    /// Read one of the type's own fields.
-    pub fn field(&self, name: &str) -> Option<&str> {
-        self.data.as_ref()?.get(name).and_then(|v| v.as_str())
-    }
-
     /// Keep the flat login mirrors and the typed block in step.
     pub fn sync_login_mirrors(&mut self) {
         if self.r#type == ItemType::Login {
@@ -293,12 +274,6 @@ impl Draft {
             self.password = String::new();
         }
         self
-    }
-
-    /// The one value "the secret of this entry" means for its type, if there is one.
-    pub fn primary_secret(&self) -> Option<String> {
-        let field = self.r#type.primary_field()?;
-        self.data.as_ref()?.get(field)?.as_str().map(str::to_string)
     }
 }
 

@@ -488,14 +488,6 @@ fn ask_field_password(field: &str, title: &str, label: &str) -> Result<String, F
     }
 }
 
-fn ask_text(title: &str, label: &str) -> Result<String, Fault> {
-    match dialog::prompt_text(title, label) {
-        Answer::Value(value) => Ok(value),
-        Answer::Cancelled => Err(Fault::Denied("cancelled".into())),
-        Answer::NoUi => Err(Fault::NeedsUi("text")),
-    }
-}
-
 // ---------------------------------------------------------------- store access
 
 fn open_store(paths: &Paths) -> Result<crypto::StoreFile, Fault> {
