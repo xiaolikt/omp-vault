@@ -55,6 +55,7 @@ import { Type } from "typebox";
 import { bitwardenLogins, filterLogins, type LoginDraft } from "./import-map.js";
 import { onSessionLeave, sessionLabel, withTier } from "./host.js";
 import { confirmWindow, hasDisplay, promptSecret } from "./prompt.js";
+import { getSettingsSafe, settingsCli } from "./settings.js";
 import { scrubDeep, scrubText } from "./scrub.js";
 
 // ---------------------------------------------------------------------------
@@ -492,6 +493,9 @@ function startAutoLock(st: BwState, ctx: ExtensionContext | undefined): void {
 /** Drop this binding's session key and injected variables, and the clipboard. */
 async function lock(st: BwState, reason: string): Promise<void> {
 	const hadSession = !!st.key;
+	// A key kept for `bitwarden.unlock = never | time` must go with an explicit
+	// lock, or the next call would silently unlock again.
+	void settingsCli().run(["bw-session", "clear"]).catch(() => undefined);
 	st.epoch++;
 	st.key = undefined;
 	st.verifiedAt = 0;
@@ -545,6 +549,27 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 
 	const epoch = st.epoch;
 	const pending = (async () => {
+		const policy = (await getSettingsSafe(signal)).bitwarden;
+		// `never` / `time`: the CLI keeps the session key (0600, in the store
+		// directory), so Bitwarden costs no window at all.
+		if (policy.unlock !== "session") {
+			try {
+				const saved = await settingsCli().json<{ key: string }>(["bw-session", "get"], { signal });
+				if (saved?.key) {
+					const verify = await bwStatus(saved.key, signal);
+					if (verify?.status === "unlocked") {
+						st.key = saved.key;
+						st.verifiedAt = Date.now();
+						acquireSessionKey();
+						startAutoLock(st, ctx);
+						return saved.key;
+					}
+				}
+			} catch {
+				/* absent or expired: fall through to the password */
+			}
+		}
+
 		const status = await bwStatus(undefined, signal); // no session env
 		if (status?.status === "unauthenticated") throw new Error(BW_LOGIN_HINT);
 
@@ -569,6 +594,11 @@ async function ensureUnlocked(st: BwState, ctx: ExtensionContext | undefined, si
 		st.verifiedAt = Date.now();
 		acquireSessionKey();
 		startAutoLock(st, ctx);
+		if (policy.unlock !== "session") {
+			// Keep the key where the CLI can hand it back; the file's expiry comes
+			// from the bitwarden.hours policy.
+			await settingsCli().run(["bw-session", "put"], { stdin: key }).catch(() => undefined);
+		}
 		await audit("unlock", "ok", st.sessionLabel);
 		// Refresh in the background: a full sync can take seconds on large vaults.
 		const lastSync = Date.parse(status?.lastSync ?? "");

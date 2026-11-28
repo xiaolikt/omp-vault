@@ -51,7 +51,15 @@ omp plugin install npm:pi-ai-vault  # omp，同一个包
 | `time` | 解锁后 N 小时（默认 8）再问一次 |
 | `session` | 每个会话一次，会话结束失效（默认） |
 
-`vault_get` 找不到本地条目时会去 Bitwarden 搜；命中后先给你看这一条并问是否读取，读了再问「导入 ai-vault（以后免 Bitwarden）还是只用这一次」。所以 **只有你同意导入的密码才会进 ai-vault**。
+`vault_get` 找不到本地条目时会去 Bitwarden 搜；命中后按 `bitwarden.import` 处理：
+
+| `bitwarden.import` | 行为 |
+|---|---|
+| `ask`（默认） | 给你看这一条 → 读一次 → 问「导入 ai-vault / 只用这一次」 |
+| `always` | 命中直接导入并返回，不开窗口 |
+| `never` | 只读一次，永不写入本地库 |
+
+所以默认情况下 **只有你同意导入的密码才会进 ai-vault**。Bitwarden 自己的主密码请求频率也有单独设置（`bitwarden.unlock`：`never` / `time` / `session`），用 `/vault settings` 查看和修改。
 
 ## 隔离
 

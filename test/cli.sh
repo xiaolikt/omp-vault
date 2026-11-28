@@ -128,6 +128,27 @@ PY
 check "back to session mode" 0 bash -c "printf 'correct horse' | '$BIN' mode set session --password-stdin --json"
 check "session mode needs a token again" 5 "$BIN" status
 
+echo "== settings =="
+check "settings prints everything" 0 "$BIN" settings --json
+check "set bitwarden.import" 0 "$BIN" settings bitwarden.import never --json
+"$BIN" settings bitwarden.import --json >"$TMP/set1"
+python3 - "$TMP/set1" <<'PY' && ok "the import policy was stored" || bad "the import policy was not stored"
+import json,sys
+assert json.load(open(sys.argv[1]))["value"] == "never"
+PY
+check "an unknown setting is a usage error" 2 "$BIN" settings nope.value 1
+check "bw-session put is refused in session mode" 1 bash -c "printf 'K' | '$BIN' bw-session put"
+check "switch bitwarden.unlock to never" 0 "$BIN" settings bitwarden.unlock never --json
+check "bw-session put stores the key" 0 bash -c "printf 'GOOD_SESSION' | '$BIN' bw-session put --json"
+[[ "$(stat -c %a "$AI_VAULT_DIR/bitwarden.session.json")" == "600" ]] && ok "the bw session file is 0600" || bad "the bw session file is not 0600"
+check "bw-session get returns it" 0 "$BIN" bw-session get --json
+check "switch back to session" 0 "$BIN" settings bitwarden.unlock session --json
+check "the stored key is gone" 5 "$BIN" bw-session get
+check "bitwarden.unlock time keeps an expiry" 0 "$BIN" settings bitwarden.unlock time --json
+check "bw-session put in time mode" 0 bash -c "printf 'K2' | '$BIN' bw-session put --json"
+grep -q '"expiresAt": *[0-9]' "$AI_VAULT_DIR/bitwarden.session.json" && ok "time mode writes a deadline" || bad "time mode wrote no deadline"
+"$BIN" settings bitwarden.unlock session --json >/dev/null
+
 echo "== doctor =="
 check "doctor runs" 0 "$BIN" doctor --json
 

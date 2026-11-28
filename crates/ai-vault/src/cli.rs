@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use crate::config::{self, UnlockMode, UnlockPolicy};
+use crate::bwsession;
+use crate::config::{self, ImportPolicy, UnlockMode, UnlockPolicy};
 use crate::crypto::{self, Kdf};
 use crate::dialog::{self, Answer};
 use crate::import;
@@ -66,6 +67,22 @@ enum Cmd {
         /// Idle minutes before the session locks itself
         #[arg(long, value_name = "MIN")]
         idle_min: Option<i64>,
+    },
+    /// Show or change machine-wide settings
+    Settings {
+        /// Dotted key (vault.unlock, vault.hours, bitwarden.unlock,
+        /// bitwarden.hours, bitwarden.import); omit to print everything
+        key: Option<String>,
+        /// New value; omit to print the current one
+        value: Option<String>,
+        /// Read the vault master password from stdin (changing vault.unlock)
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// The persisted `bw` session key (bitwarden.unlock = never | time)
+    BwSession {
+        /// get | put | clear
+        action: String,
     },
     /// Show or change how often the master password is asked for
     Mode {
@@ -285,6 +302,10 @@ fn dispatch(cmd: Cmd, paths: &Paths, json: bool) -> Outcome {
         Cmd::Unlock { password_stdin, requester, idle_min } => {
             unlock(paths, &out, password_stdin, &requester, idle_min)
         }
+        Cmd::Settings { key, value, password_stdin } => {
+            settings(paths, &out, key.as_deref(), value.as_deref(), None, password_stdin)
+        }
+        Cmd::BwSession { action } => bw_session(paths, &out, &action),
         Cmd::Mode { action, value, hours, password_stdin } => {
             mode(paths, &out, &action, value.as_deref(), hours, password_stdin)
         }
@@ -610,8 +631,163 @@ fn unlock(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_
     Ok(())
 }
 
-/// Show or change the password policy. Changing it always costs the master
-/// password: `never` writes the key to disk, so it must not be a drive-by act.
+/// Dotted setting names, with the aliases a human is likely to type.
+fn setting_key(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_lowercase().as_str() {
+        "vault.unlock" | "vault.mode" | "unlock" | "mode" => Some("vault.unlock"),
+        "vault.hours" | "hours" => Some("vault.hours"),
+        "bitwarden.unlock" | "bitwarden.mode" | "bw.unlock" | "bw.mode" => Some("bitwarden.unlock"),
+        "bitwarden.hours" | "bw.hours" => Some("bitwarden.hours"),
+        "bitwarden.import" | "bw.import" | "import" => Some("bitwarden.import"),
+        _ => None,
+    }
+}
+
+fn settings_value(config: &config::Config, paths: &Paths) -> serde_json::Value {
+    let bw_saved = bwsession::load(paths).ok().flatten();
+    json!({
+        "ok": true,
+        "vault": {
+            "unlock": config.unlock.mode.as_str(),
+            "hours": config.unlock.hours,
+            "auto": paths.auto_session().exists(),
+        },
+        "bitwarden": {
+            "unlock": config.bitwarden.unlock.as_str(),
+            "hours": config.bitwarden.hours,
+            "import": config.bitwarden.import.as_str(),
+            "persisted": bw_saved.is_some(),
+            "expiresAt": bw_saved.as_ref().and_then(|s| s.expires_at),
+        },
+    })
+}
+
+fn settings_human(config: &config::Config, paths: &Paths) -> String {
+    [
+        format!("vault.unlock: {}   (never | time | session)", config.unlock.mode.as_str()),
+        format!("vault.hours: {}   (time 模式)", config.unlock.hours),
+        format!(
+            "vault 机器级会话: {}",
+            if paths.auto_session().exists() { "有（免密）" } else { "无" }
+        ),
+        format!("bitwarden.unlock: {}   (never | time | session)", config.bitwarden.unlock.as_str()),
+        format!("bitwarden.hours: {}", config.bitwarden.hours),
+        format!("bitwarden.import: {}   (ask | always | never)", config.bitwarden.import.as_str()),
+        format!(
+            "bitwarden 已落盘的会话: {}",
+            match bwsession::load(paths).ok().flatten() {
+                Some(saved) => match saved.expires_at {
+                    Some(at) => format!("有（{} 后过期）", ((at - session::now_ms()) / 60_000).max(0)),
+                    None => "有（不过期）".to_string(),
+                },
+                None => "无".to_string(),
+            }
+        ),
+    ]
+    .join("\n")
+}
+
+fn settings(
+    paths: &Paths,
+    out: &Out,
+    key: Option<&str>,
+    value: Option<&str>,
+    hours: Option<i64>,
+    password_stdin: bool,
+) -> Outcome {
+    let mut config = config::load(paths);
+
+    let Some(raw_key) = key.filter(|k| !k.trim().is_empty()) else {
+        let value = settings_value(&config, paths);
+        out.value(value, || settings_human(&config, paths));
+        return Ok(());
+    };
+    let key = setting_key(raw_key).ok_or_else(|| {
+        Fault::Usage(format!(
+            "unknown setting \"{raw_key}\" — vault.unlock, vault.hours, bitwarden.unlock, bitwarden.hours, bitwarden.import"
+        ))
+    })?;
+
+    let Some(raw_value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        let shown = match key {
+            "vault.unlock" => config.unlock.mode.as_str().to_string(),
+            "vault.hours" => config.unlock.hours.to_string(),
+            "bitwarden.unlock" => config.bitwarden.unlock.as_str().to_string(),
+            "bitwarden.hours" => config.bitwarden.hours.to_string(),
+            _ => config.bitwarden.import.as_str().to_string(),
+        };
+        out.value(json!({ "ok": true, "key": key, "value": shown }), || format!("{key}: {shown}"));
+        return Ok(());
+    };
+
+    match key {
+        "vault.unlock" => {
+            let mode = UnlockMode::parse(raw_value)
+                .ok_or_else(|| Fault::Usage(format!("unknown mode \"{raw_value}\" — never, time or session")))?;
+            let store = open_store(paths)?;
+            // Changing when the vault opens is a security decision: always verify.
+            let password = if password_stdin {
+                read_password()?
+            } else {
+                ask_password("ai-vault · 主密码", "切换解锁模式")?
+            };
+            let (_, vault_key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
+                crypto::OpenError::WrongPassword => Fault::Auth("wrong master password".into()),
+                crypto::OpenError::Broken(message) => Fault::Error(message),
+            })?;
+            config.unlock = UnlockPolicy { mode, hours: hours.unwrap_or(config.unlock.hours).clamp(1, 24 * 90) };
+            config::save(paths, &config)?;
+            session::ensure_session_dir(paths)?;
+            if mode == UnlockMode::Never {
+                let auto = Session::new("mode", 0, None, &store, &vault_key);
+                session::save_auto(paths, &auto)?;
+            } else {
+                session::delete_auto(paths);
+            }
+            audit::append(&paths.audit(), "cli", "mode", None, Some(mode.as_str()));
+        }
+        "vault.hours" => {
+            let hours: i64 = raw_value
+                .parse()
+                .map_err(|_| Fault::Usage(format!("\"{raw_value}\" is not a number of hours")))?;
+            config.unlock.hours = hours.clamp(1, 24 * 90);
+            config::save(paths, &config)?;
+        }
+        "bitwarden.unlock" => {
+            let mode = UnlockMode::parse(raw_value)
+                .ok_or_else(|| Fault::Usage(format!("unknown mode \"{raw_value}\" — never, time or session")))?;
+            config.bitwarden.unlock = mode;
+            if let Some(hours) = hours {
+                config.bitwarden.hours = hours.clamp(1, 24 * 90);
+            }
+            config::save(paths, &config)?;
+            // Going back to per-session must not leave a key on disk.
+            if mode == UnlockMode::Session {
+                bwsession::clear(paths);
+            }
+        }
+        "bitwarden.hours" => {
+            let hours: i64 = raw_value
+                .parse()
+                .map_err(|_| Fault::Usage(format!("\"{raw_value}\" is not a number of hours")))?;
+            config.bitwarden.hours = hours.clamp(1, 24 * 90);
+            config::save(paths, &config)?;
+        }
+        _ => {
+            let import = ImportPolicy::parse(raw_value).ok_or_else(|| {
+                Fault::Usage(format!("unknown import policy \"{raw_value}\" — ask, always or never"))
+            })?;
+            config.bitwarden.import = import;
+            config::save(paths, &config)?;
+        }
+    }
+
+    let value = settings_value(&config, paths);
+    out.value(value, || settings_human(&config, paths));
+    Ok(())
+}
+
+/// `/vault mode` is a shortcut for the `vault.unlock` setting.
 fn mode(
     paths: &Paths,
     out: &Out,
@@ -621,74 +797,47 @@ fn mode(
     password_stdin: bool,
 ) -> Outcome {
     match action.trim() {
-        "" | "get" | "status" => {
-            let policy = config::load(paths).unlock;
-            let auto = paths.auto_session().exists();
-            out.value(
-                json!({
-                    "ok": true,
-                    "mode": policy.mode.as_str(),
-                    "hours": policy.hours,
-                    "auto": auto,
-                    "store": paths.store(),
-                }),
-                || {
-                    format!(
-                        "mode: {}\nhours: {}\nmachine-wide session: {}",
-                        policy.mode.as_str(),
-                        policy.hours,
-                        if auto { "yes (no password needed)" } else { "no" }
-                    )
-                },
-            );
-            Ok(())
-        }
-        "set" => {
-            let value = value.ok_or_else(|| {
-                Fault::Usage("usage: ai-vault mode set never|time|session [--hours N]".into())
-            })?;
-            let mode = UnlockMode::parse(value)
-                .ok_or_else(|| Fault::Usage(format!("unknown mode \"{value}\" — use never, time or session")))?;
-            let store = open_store(paths)?;
-            let password = if password_stdin {
-                read_password()?
-            } else {
-                ask_password("ai-vault · 主密码", "切换解锁模式")?
-            };
-            let (_, key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
-                crypto::OpenError::WrongPassword => Fault::Auth("wrong master password".into()),
-                crypto::OpenError::Broken(message) => Fault::Error(message),
-            })?;
-            let hours = hours.unwrap_or(config::load(paths).unlock.hours).clamp(1, 24 * 90);
-            config::save(paths, &config::Config { unlock: UnlockPolicy { mode, hours } })?;
-            session::ensure_session_dir(paths)?;
-            let auto = if mode == UnlockMode::Never {
-                let session = Session::new("mode", 0, None, &store, &key);
-                session::save_auto(paths, &session)?;
-                true
-            } else {
-                session::delete_auto(paths);
-                false
-            };
-            audit::append(&paths.audit(), "cli", "mode", None, Some(mode.as_str()));
-            let warn = if mode == UnlockMode::Never {
-                "\n注意: 密钥已写到磁盘（0600）。任何能读你文件的程序/人都能读出库里的密码。"
-            } else {
-                ""
-            };
-            out.value(
-                json!({ "ok": true, "mode": mode.as_str(), "hours": hours, "auto": auto }),
-                || {
-                    format!(
-                        "mode set to {}{}",
-                        mode.as_str(),
-                        if auto { " — no password needed from now on" } else { "" }
-                    ) + warn
-                },
-            );
-            Ok(())
-        }
+        "" | "get" | "status" => settings(paths, out, Some("vault.unlock"), None, None, password_stdin),
+        "set" => settings(paths, out, Some("vault.unlock"), value, hours, password_stdin),
         other => Err(Fault::Usage(format!("unknown mode action \"{other}\""))),
+    }
+}
+
+fn bw_session(paths: &Paths, out: &Out, action: &str) -> Outcome {
+    match action.trim() {
+        "" | "get" => {
+            let stored = bwsession::load(paths)?
+                .ok_or_else(|| Fault::Auth("no persisted Bitwarden session — unlock Bitwarden first".into()))?;
+            out.value(
+                json!({ "ok": true, "key": stored.key, "savedAt": stored.saved_at, "expiresAt": stored.expires_at }),
+                || stored.key.clone(),
+            );
+            Ok(())
+        }
+        "put" | "save" => {
+            let key = read_stdin_text()?.trim().to_string();
+            if key.is_empty() {
+                return Err(Fault::Usage("bw-session put expects the session key on stdin".into()));
+            }
+            let expires_at = bwsession::save(paths, &key)?;
+            audit::append(&paths.audit(), "cli", "bw_session", None, Some("put"));
+            out.value(json!({ "ok": true, "expiresAt": expires_at }), || {
+                match expires_at {
+                    Some(at) => format!("saved (expires in {} min)", ((at - session::now_ms()) / 60_000).max(0)),
+                    None => "saved (no expiry)".to_string(),
+                }
+            });
+            Ok(())
+        }
+        "clear" | "delete" => {
+            let removed = bwsession::clear(paths);
+            audit::append(&paths.audit(), "cli", "bw_session", None, Some("clear"));
+            out.value(json!({ "ok": true, "removed": removed }), || {
+                if removed { "cleared".to_string() } else { "nothing stored".to_string() }
+            });
+            Ok(())
+        }
+        other => Err(Fault::Usage(format!("unknown bw-session action \"{other}\""))),
     }
 }
 

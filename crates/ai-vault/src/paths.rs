@@ -42,6 +42,11 @@ impl Paths {
         self.dir.join("agent.session.json")
     }
 
+    /// The `bw` session key kept for `bitwarden.unlock = never | time`.
+    pub fn bw_session(&self) -> PathBuf {
+        self.dir.join("bitwarden.session.json")
+    }
+
     /// Shared advisory lock for read-modify-write of the store file.
     pub fn store_lock(&self) -> PathBuf {
         self.dir.join("store.lock")

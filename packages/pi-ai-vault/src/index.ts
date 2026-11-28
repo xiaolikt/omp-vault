@@ -25,6 +25,7 @@ import {
 import { CliError, VaultCli } from "./cli.js";
 import { isOmpHost, onSessionLeave, sessionLabel, subagentId, withTier } from "./host.js";
 import { confirmWindow, promptSecret, promptText, type PromptHost } from "./prompt.js";
+import { forgetSettings, getSettingsSafe, type Settings } from "./settings.js";
 
 type Ctx = ExtensionToolContext | ExtensionCommandContext;
 
@@ -309,22 +310,21 @@ async function bitwardenFallback(
 	}
 	if (!hit) return fail(`${missing} — not in Bitwarden either${reason ? ` (reason: ${reason})` : ""}`);
 
-	const label = `${hit.name}${hit.username ? `  user:${hit.username}` : ""}`;
-	const allow = await confirmWindow(
-		dialogs(ctx),
-		"pi-ai-vault · Bitwarden 里找到",
-		`本地库没有「${name}」，Bitwarden 里有：\n${label}\n\n读取这一次吗？`,
-		signal,
-	);
-	if (!allow) return fail(`user denied reading "${hit.name}" from Bitwarden — do not retry`, true);
+	const asValue = (via: string): ToolOutcome => ({
+		content: [
+			{
+				type: "text" as const,
+				text: JSON.stringify(
+					{ name: hit.name, username: hit.username || undefined, password: hit.password, uris: hit.uris, via },
+					null,
+					1,
+				),
+			},
+		],
+		details: { item: hit.name, via },
+	});
 
-	const importIt = await confirmWindow(
-		dialogs(ctx),
-		"pi-ai-vault · 导入到 ai-vault",
-		`把「${hit.name}」写进 ai-vault 吗？\n\n允许 → 以后直接读本地库（按当前解锁模式，可能免密）\n拒绝 → 只用这一次，不写入本地库`,
-		signal,
-	);
-	if (importIt) {
+	const importIt = async (): Promise<ToolOutcome> => {
 		try {
 			const saved = await cli.json<SaveResult>(["save", "--yes", ...tokenArgs(scope)], {
 				stdin: JSON.stringify([
@@ -343,34 +343,32 @@ async function bitwardenFallback(
 		} catch (error) {
 			return fail(`found "${hit.name}" in Bitwarden but could not import it: ${describe(error)}`);
 		}
-		return {
-			content: [
-				{
-					type: "text" as const,
-					text: JSON.stringify(
-						{ name: hit.name, username: hit.username || undefined, password: hit.password, uris: hit.uris, via: "imported-from-bitwarden" },
-						null,
-						1,
-					),
-				},
-			],
-			details: { item: hit.name, via: "imported-from-bitwarden" },
-		};
+		return asValue("imported-from-bitwarden");
+	};
+
+	const policy = (await getSettingsSafe(signal)).bitwarden.import;
+	if (policy === "always") {
+		// bitwarden.import = always: the user opted into pulling hits in silently.
+		return importIt();
 	}
 
-	return {
-		content: [
-			{
-				type: "text" as const,
-				text: JSON.stringify(
-					{ name: hit.name, username: hit.username || undefined, password: hit.password, uris: hit.uris, via: "bitwarden-once" },
-					null,
-					1,
-				),
-			},
-		],
-		details: { item: hit.name, via: "bitwarden-once" },
-	};
+	const label = `${hit.name}${hit.username ? `  user:${hit.username}` : ""}`;
+	const allow = await confirmWindow(
+		dialogs(ctx),
+		"pi-ai-vault · Bitwarden 里找到",
+		`本地库没有「${name}」，Bitwarden 里有：\n${label}\n\n读取这一次吗？`,
+		signal,
+	);
+	if (!allow) return fail(`user denied reading "${hit.name}" from Bitwarden — do not retry`, true);
+	if (policy === "never") return asValue("bitwarden-once");
+
+	const confirmed = await confirmWindow(
+		dialogs(ctx),
+		"pi-ai-vault · 导入到 ai-vault",
+		`把「${hit.name}」写进 ai-vault 吗？\n\n允许 → 以后直接读本地库（按当前解锁模式，可能免密）\n拒绝 → 只用这一次，不写入本地库`,
+		signal,
+	);
+	return confirmed ? importIt() : asValue("bitwarden-once");
 }
 
 function vaultGetTool(scope: Scope, bw: BwState): ToolDefinition<typeof vaultGetParams, VaultGetDetails> {
@@ -628,6 +626,7 @@ const HELP = [
 	"/vault init                        创建全机共享的本地加密库（弹出窗口设置主密码）",
 	"/vault unlock | lock               解锁 / 锁定（清空本会话的授权）",
 	"/vault mode [never|time|session]   查看/切换解锁模式（切换要主密码）",
+	"/vault settings [键 值]            查看/修改设置（vault.unlock、bitwarden.unlock、bitwarden.import …）",
 	"/vault status                      状态与授权剩余时间",
 	"/vault list                        本地条目元数据",
 	"/vault add [名称]                  新增本地条目（用户名、密码在弹窗里输入）",
@@ -686,6 +685,23 @@ async function initStore(scope: Scope, ctx: Ctx, label: string): Promise<void> {
 	} catch (error) {
 		note(ctx, `ai-vault: ${error instanceof CliError ? error.message : describe(error)}`, "error");
 	}
+}
+
+function settingsText(s: Settings): string {
+	const persisted = s.bitwarden.persisted
+		? s.bitwarden.expiresAt
+			? `有（${Math.max(0, Math.round((s.bitwarden.expiresAt - Date.now()) / 60_000))} 分钟后过期）`
+			: "有（不过期）"
+		: "无";
+	return [
+		`vault.unlock: ${s.vault.unlock}    (never | time | session)`,
+		`vault.hours: ${s.vault.hours}    (time 模式用)`,
+		`vault 机器级会话: ${s.vault.auto ? "有（免密）" : "无"}`,
+		`bitwarden.unlock: ${s.bitwarden.unlock}    (never | time | session)`,
+		`bitwarden.hours: ${s.bitwarden.hours}`,
+		`bitwarden.import: ${s.bitwarden.import}    (ask | always | never)`,
+		`bitwarden 已落盘的会话: ${persisted}`,
+	].join("\n");
 }
 
 function commandHandler(scope: Scope, bw: BwState) {
@@ -756,6 +772,33 @@ function commandHandler(scope: Scope, bw: BwState) {
 				}
 				return;
 			}
+			case "settings": {
+				const [key, ...valueParts] = rest;
+				const value = valueParts.join(" ").trim();
+				try {
+					if (!key) {
+						note(ctx, settingsText(await cli.json<Settings>(["settings"])));
+						return;
+					}
+					if (!value) {
+						const one = await cli.json<{ key: string; value: string }>(["settings", key]);
+						note(ctx, `${one.key}: ${one.value}`);
+						return;
+					}
+					// `vault.unlock` opens its own password window (or answers
+					// needs-ui); the other keys do not prompt at all.
+					const run = await cli.withPassword(["settings", key, value], () =>
+						promptSecret(dialogs(ctx), "ai-vault · 主密码", "改变解锁模式需要验证"),
+					);
+					forgetSettings();
+					const updated = JSON.parse(run.stdout) as Settings;
+					if (key.startsWith("vault.")) await lockNow(scope);
+					note(ctx, settingsText(updated));
+				} catch (error) {
+					note(ctx, `ai-vault: ${error instanceof CliError && error.denied ? "已取消" : describe(error)}`, "warning");
+				}
+				return;
+			}
 			case "mode": {
 				const [sub, hoursArg] = rest;
 				if (!sub || sub === "get" || sub === "status") {
@@ -785,6 +828,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 				try {
 					const run = await cli.withPassword(args, () => promptSecret(dialogs(ctx), "ai-vault · 主密码", "切换解锁模式"));
 					const result = JSON.parse(run.stdout) as { mode: UnlockModeName; hours: number; auto: boolean };
+					forgetSettings();
 					await lockNow(scope);
 					scope.mode = result.mode;
 					scope.auto = result.auto;

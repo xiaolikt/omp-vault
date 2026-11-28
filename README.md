@@ -93,6 +93,8 @@ ai-vault [--dir DIR] [--json] <命令>
 | `init [--password-stdin]` | 建库（弹窗两次设密码），成功后直接给一个令牌 |
 | `unlock [--password-stdin] [--requester ID]` | 按当前模式解锁，stdout 一个令牌 |
 | `mode [get]` / `mode set never\|time\|session [--hours N]` | 查看/切换解锁模式（切换要主密码） |
+| `settings [键] [值]` | 全部设置：`vault.unlock` `vault.hours` `bitwarden.unlock` `bitwarden.hours` `bitwarden.import` |
+| `bw-session get\|put\|clear` | Bitwarden 会话密钥的落盘副本（`bitwarden.unlock != session` 时用） |
 | `status --token T` | 条目数、过期时间、还活着的读授权 |
 | `lock --token T \| --all` | 丢掉令牌（`--all` 清空本机所有会话） |
 | `list --token T` | 条目元数据（名称/用户名/URI），没有密码 |
@@ -124,7 +126,7 @@ ai-vault [--dir DIR] [--json] <命令>
 | 工具 | 作用 | 等级 | 模型看到密码？ |
 |---|---|---|---|
 | `vault_list` | 本地库元数据 | read | 否 |
-| `vault_get` | 读一条：**先本地库，再 Bitwarden**；Bitwarden 命中会问「读一次 / 导入」 | exec | 是，用户当场允许 |
+| `vault_get` | 读一条：**先本地库，再 Bitwarden**；命中后按 `bitwarden.import` 处理（问 / 直接导入 / 只读一次） | exec | 是，用户当场允许 |
 | `vault_add` | 存一条；密码在弹窗里输入 | write | 否 |
 | `vault_import` | 把 Bitwarden 登录项抄进本地库（先确认） | write | 否 |
 | `bw_list` | 查在线 Bitwarden 元数据 | read | 否 |
@@ -170,12 +172,36 @@ ai-vault mode set session
 
 `never` 不是「安全一点」而是「明确放弃这层保护」：任何能读你 home 目录的进程都能读出库里的全部密码。它存在的意义是把「可以让 AI 随便用」的密码和 Bitwarden 里那些「每次都要问」的分开。
 
+### Bitwarden 也是同样三种模式（独立设置）
+
+| 设置 | 值 | 行为 |
+|---|---|---|
+| `bitwarden.unlock` | `never` | `bw` 会话密钥落盘（`~/.ai-vault/bitwarden.session.json`，0600），**不再问 Bitwarden 主密码** |
+| | `time` | 同上，但 `bitwarden.hours` 小时后失效，重新要密码 |
+| | `session` | 密钥只在 agent 进程内存里，每个会话问一次（默认） |
+| `bitwarden.import` | `ask` | `vault_get` 本地没命中 → 显示 Bitwarden 命中项 → 读一次 → 问是否导入（默认） |
+| | `always` | 命中就直接导入并返回，**一个窗口都不开**（完全自动，慎用） |
+| | `never` | 只读一次，问一次，永不写入本地库 |
+
+```bash
+ai-vault settings                                   # 全部设置
+ai-vault settings bitwarden.unlock never
+ai-vault settings bitwarden.import always
+ai-vault settings bitwarden.hours 24
+```
+插件里：`/vault settings`、`/vault settings bitwarden.import always`。
+
+> `bitwarden.import = always` 配合 `bitwarden.unlock = never`，等于「Bitwarden 里任何一条被问到就自动进库、以后免密随便读」。这是最快也是最不设防的组合，只在完全信任 agent 时用。
+
+`bw-session put/get/clear` 就是那个落盘密钥的读写口：插件在主密码解锁成功后写入，切回 `session` 模式时自动清掉，`/bw lock` 也会清掉。
+
 ## 插件里的命令
 
 ```
 /vault init                        创建本地库（弹窗设主密码）
 /vault unlock | lock               解锁 / 锁定本会话
 /vault mode [never|time|session]   查看/切换解锁模式（切换要主密码）
+/vault settings [键 值]            查看/修改设置（bitwarden.* 也在这里）
 /vault status                      状态、过期时间、授权剩余
 /vault list                        条目元数据
 /vault add [名称]                  新增（用户名、密码在弹窗里输入）
@@ -208,7 +234,7 @@ ai-vault mode set session
 
 ## 安全
 
-- 主密码只经过弹窗或宿主输入框；`unlock` 派生出的 key 只写进令牌文件（0600，优先 tmpfs，登出即消失）。`never` 模式例外：key 写在 `~/.ai-vault/agent.session.json`，跨重启存在——这是那个模式的定义，不是疏漏。它和「agent 进程内存里有 key」是同一级别的暴露面，好处是换会话、reload、崩溃都会自然清掉。
+- 主密码只经过弹窗或宿主输入框；`unlock` 派生出的 key 只写进令牌文件（0600，优先 tmpfs，登出即消失）。`never` 模式例外：key 写在 `~/.ai-vault/agent.session.json`，跨重启存在——这是那个模式的定义，不是疏漏。Bitwarden 侧同理：`bitwarden.unlock = never|time` 会把 `bw` 会话密钥写到 `~/.ai-vault/bitwarden.session.json`（0600），它是 bearer token，丢了等于丢了那次登录。它和「agent 进程内存里有 key」是同一级别的暴露面，好处是换会话、reload、崩溃都会自然清掉。
 - 会话令牌只是 id，不是 key：泄露令牌不等于泄露密码，但仍能读库，所以 `lock` 要真删文件。
 - 插件启动的子进程（`bw`、`bw_run` 的 bash、剪贴板工具）都会剔除宿主环境里的 `BW_*`，避免用户 shell 里导出的会话密钥漏进命令环境。
 - 审计：`~/.ai-vault/audit.log` 记录会话/子代理标签、条目名、允许/拒绝，从不记录值；写失败不影响主操作；1 MiB 轮转成 `.1`。

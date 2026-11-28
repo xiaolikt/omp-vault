@@ -9,6 +9,7 @@ import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, subCtx, textOf, use
 // by `npm test`) plus the mock zenity, with a throwaway store.
 const dir = useMocks();
 const { default: aiVault } = await import("../packages/pi-ai-vault/src/index.ts");
+const { forgetSettings } = await import("../packages/pi-ai-vault/src/settings.ts");
 cleanUpOnExit(dir);
 
 const PW = "correct horse battery";
@@ -214,4 +215,68 @@ test("never mode reads without any window, and the switch needs the password", a
 
 	const back = switchMode("session");
 	assert.equal(back.status, 0, back.stderr);
+});
+
+test("bitwarden.import=never reads once with a single window", async () => {
+	const bin = process.env.AI_VAULT_BIN;
+	spawnSync(bin, ["settings", "bitwarden.import", "never"], { env: process.env });
+	forgetSettings();
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	answers.master(dir, PW);
+	await b.cmd("unlock", ctx);
+	answers.master(dir, "testmaster");
+	const before = prompts("--question");
+	answers.questions(dir, "y");
+	const result = await b.tool("vault_get", { name: "OtherService" }, ctx);
+	assert.equal(result.details.via, "bitwarden-once");
+	assert.equal(prompts("--question"), before + 1, "never: read approval only, no import question");
+});
+
+test("bitwarden.import=always pulls the entry in without a window", async () => {
+	const bin = process.env.AI_VAULT_BIN;
+	spawnSync(bin, ["settings", "bitwarden.import", "always"], { env: process.env });
+	forgetSettings();
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	answers.master(dir, PW);
+	await b.cmd("unlock", ctx);
+	answers.master(dir, "testmaster");
+	const before = prompts("--question");
+	const result = await b.tool("vault_get", { name: "OtherService" }, ctx);
+	assert.equal(result.details.via, "imported-from-bitwarden");
+	assert.equal(prompts("--question"), before, "always: no window at all");
+
+	answers.master(dir, PW);
+	const listed = await b.tool("vault_list", {}, ctx);
+	assert.equal(
+		JSON.parse(textOf(listed)).some((i) => i.name === "OtherService"),
+		true,
+	);
+	spawnSync(bin, ["settings", "bitwarden.import", "ask"], { env: process.env });
+	forgetSettings();
+});
+
+test("a persisted Bitwarden session costs no password", async () => {
+	const bin = process.env.AI_VAULT_BIN;
+	const set = (key, value) => spawnSync(bin, ["settings", key, value], { env: process.env, encoding: "utf8" });
+	assert.equal(set("bitwarden.unlock", "never").status, 0);
+	forgetSettings();
+	const put = spawnSync(bin, ["bw-session", "put"], { input: "GOOD_SESSION", env: process.env, encoding: "utf8" });
+	assert.equal(put.status, 0, put.stderr);
+
+	const b = bind(aiVault, true);
+	const ctx = makeCtx().ctx;
+	answers.master(dir, PW);
+	answers.master(dir, PW); // would be consumed only by a Bitwarden prompt
+	const before = prompts("--password");
+	const listed = await b.tool("bw_list", {}, ctx);
+	assert.equal(listed.isError, undefined);
+	assert.equal(prompts("--password"), before, "the stored bw session must be used silently");
+
+	// Restoring the session policy drops the key from disk.
+	assert.equal(set("bitwarden.unlock", "session").status, 0);
+	forgetSettings();
+	const get = spawnSync(bin, ["bw-session", "get"], { env: process.env, encoding: "utf8" });
+	assert.equal(get.status, 5, "switching back to session must remove the stored key");
 });
