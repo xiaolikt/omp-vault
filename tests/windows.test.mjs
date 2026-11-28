@@ -117,7 +117,10 @@ async function withoutEnv(names, fn) {
 
 // ---------------------------------------------------------------- parsing the wrapper
 
-test("an npm .cmd wrapper is read, not run: it names a script for this Node, or a program", async (t) => {
+// The fixture is npm's Windows wrapper, backslashes and all: on a POSIX host
+// `join` keeps those inside one file name, so nothing it names can exist.
+test("an npm .cmd wrapper is read, not run: it names a script for this Node, or a program", windowsOnly, async (t) => {
+	if (!WIN32) return t.skip();
 	const dir = scratch();
 	const sep = WIN32 ? "\\" : "/";
 	const shim = join(dir, "tool.cmd");
