@@ -123,9 +123,14 @@ enum Cmd {
         /// Why the secret is needed (shown in the confirm window)
         #[arg(long)]
         reason: Option<String>,
-        /// Read the approve/deny answer from stdin (host UI already asked)
+        /// Read the approve/deny answer from stdin (host UI already asked).
+        /// Requires AI_VAULT_HOST=1 and a matching --approval.
         #[arg(long)]
         answer_stdin: bool,
+        /// HMAC-SHA256(hex) of "allow:<token>:<entry>:y|n" under the host
+        /// secret, proving a host that holds the secret relayed the answer.
+        #[arg(long, value_name = "HEX")]
+        approval: Option<String>,
     },
     /// Create or update an entry; the password is typed in a dialog
     Add {
@@ -193,6 +198,11 @@ enum Cmd {
         #[arg(long, env = "AI_VAULT_TOKEN")]
         token: Option<String>,
     },
+    /// Re-encrypt the store under the current default KDF (asks the master password)
+    Rekey {
+        #[arg(long)]
+        password_stdin: bool,
+    },
     /// Diagnose paths, session directory and desktop availability
     Doctor,
 }
@@ -237,6 +247,11 @@ pub fn run() -> i32 {
     };
     let paths = Paths::resolve(cli.dir.clone());
     migrate_legacy(&paths);
+    // Dead token files (expired, unsigned, from an older store) carry keys
+    // that open nothing; drop them on sight rather than after a week.
+    if paths.sessions().is_dir() {
+        session::sweep(&paths);
+    }
     let json = cli.json;
     match dispatch(cli.cmd, &paths, json) {
         Ok(()) => 0,
@@ -295,6 +310,7 @@ fn dispatch(cmd: Cmd, paths: &Paths, json: bool) -> Outcome {
             out.text(paths.store().display().to_string());
             Ok(())
         }
+        Cmd::Rekey { password_stdin } => rekey(paths, &out, password_stdin),
         Cmd::Doctor => doctor(paths, &out),
         Cmd::Init { password_stdin, requester, idle_min } => {
             init(paths, &out, password_stdin, &requester, idle_min)
@@ -312,8 +328,8 @@ fn dispatch(cmd: Cmd, paths: &Paths, json: bool) -> Outcome {
         Cmd::Status { token } => status(paths, &out, token),
         Cmd::Lock { token, all } => lock(paths, &out, token, all),
         Cmd::List { token } => list(paths, &out, token),
-        Cmd::Get { name, token, reason, answer_stdin } => {
-            get(paths, &out, token, &name, reason.as_deref(), answer_stdin)
+        Cmd::Get { name, token, reason, answer_stdin, approval } => {
+            get(paths, &out, token, &name, reason.as_deref(), answer_stdin, approval)
         }
         Cmd::Add { name, username, uri, notes, password_stdin, yes, token } => {
             add(paths, &out, token, AddRequest { name, username, uri, notes, password_stdin, yes })
@@ -405,6 +421,21 @@ fn read_stdin_text() -> Result<String, Fault> {
 }
 
 /// A yes/no answer from stdin, used when the host UI already asked the user.
+/// The answer a host relays is bound to this token, this entry and this
+/// yes/no, under the host secret: a replay against another entry, or a
+/// flipped answer, fails.
+fn approval_ok(secret: &str, token: &str, entry: &str, answer: bool, hex_mac: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    let message = format!("allow:{token}:{}:{}", entry.to_lowercase(), if answer { "y" } else { "n" });
+    let Ok(mut hasher) = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    hasher.update(message.as_bytes());
+    let expected: String = hasher.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    expected.len() == hex_mac.len()
+        && expected.bytes().zip(hex_mac.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
+}
+
 fn read_approval() -> Result<bool, Fault> {
     let answer = read_line()?.trim().to_lowercase();
     Ok(matches!(answer.as_str(), "y" | "yes" | "allow" | "允许" | "1" | "true"))
@@ -444,6 +475,31 @@ fn items_with(session: &Session, store: &crypto::StoreFile) -> Result<Vec<Item>,
     })
 }
 
+/// The secret the host process (pi/omp extension) holds and passes to each
+/// CLI call through the environment. A bare `ai-vault` typed by a human has
+/// none, which is fine: that caller never needs to relay an approval.
+fn host_secret() -> Option<String> {
+    std::env::var("AI_VAULT_HOST_SECRET").ok().filter(|s| !s.is_empty())
+}
+
+/// What session files are signed with: the host's memory-only secret when
+/// there is one, else the store's wrap key (a human at a terminal).
+fn signing_key(paths: &Paths) -> Result<Option<String>, String> {
+    if let Some(secret) = host_secret() {
+        return Ok(Some(secret));
+    }
+    bwsession::wrap_key_hex(paths).map(Some)
+}
+
+/// The host integration (the extension) is recognised by the secret it
+/// presents: `AI_VAULT_HOST=1` alone only says "I would like to be a host"
+/// and is treated like a human caller until it has a secret to sign with.
+/// This keeps a half-configured host from getting a session it can neither
+/// verify nor relay for.
+fn is_host() -> bool {
+    std::env::var_os("AI_VAULT_HOST").is_some_and(|v| v == "1") && host_secret().is_some()
+}
+
 /// The auto session is the `never` mode token: no deadline, no password, and
 /// it belongs to the machine rather than to one agent.
 fn auto_session(paths: &Paths) -> Option<Session> {
@@ -459,7 +515,7 @@ fn auto_session(paths: &Paths) -> Option<Session> {
 /// An explicit token, else the machine-wide auto session.
 fn load_session(paths: &Paths, token: Option<&str>) -> Result<Session, Fault> {
     if let Some(token) = token.filter(|t| !t.is_empty()) {
-        return session::load(paths, token).map_err(Fault::Auth);
+        return session::load(paths, token, signing_key(paths)?.as_deref()).map_err(Fault::Auth);
     }
     auto_session(paths).ok_or_else(|| {
         Fault::Auth("vault is locked (no session token) — unlock first".into())
@@ -473,7 +529,16 @@ fn persist(paths: &Paths, session: &Session) {
         .ok()
         .flatten()
         .is_some_and(|saved| saved.token == session.token);
-    let _ = if auto { session::save_auto(paths, session) } else { session.save(paths) };
+    let _ = if auto {
+        session::save_auto(paths, session)
+    } else {
+        // Best-effort like the rest of this helper; a failed sign means the
+        // next call simply asks to unlock again.
+        match signing_key(paths) {
+            Ok(key) => session.save(paths, key.as_deref()),
+            Err(e) => Err(e),
+        }
+    };
 }
 
 fn touch(paths: &Paths, session: &mut Session) {
@@ -505,6 +570,42 @@ where
 
 // ---------------------------------------------------------------- commands
 
+/// Bring an older store up to the current KDF cost. Re-derives the key from
+/// the password under the new parameters and re-seals; a `never`-mode
+/// machine session, which holds the old key, is re-minted.
+fn rekey(paths: &Paths, out: &Out, password_stdin: bool) -> Outcome {
+    let store = open_store(paths)?;
+    let password = if password_stdin {
+        read_password()?
+    } else {
+        ask_password("ai-vault · 升级密钥参数", "主密码")?
+    };
+    let (items, _old_key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
+        crypto::OpenError::WrongPassword => Fault::Auth("wrong master password".into()),
+        crypto::OpenError::Broken(message) => Fault::Error(message),
+    })?;
+    let salt = crypto::hex_to_bytes(&store.salt).ok_or_else(|| Fault::Error("vault salt is corrupt".into()))?;
+    let kdf = Kdf::default();
+    let new_key = crypto::derive_key(&password, &salt, kdf).map_err(|e| Fault::Error(e.to_string()))?;
+    let sealed = crypto::seal(&salt, kdf, &new_key, &items)?;
+    {
+        let _guard = StoreLock::acquire(paths)?;
+        let bytes = serde_json::to_vec(&sealed).map_err(|e| Fault::Error(format!("cannot serialize store: {e}")))?;
+        crypto::write_atomic(&paths.store(), &bytes)?;
+    }
+    // Other live sessions hold the old key; they cannot open the new file and
+    // will be told to unlock again. The machine session is simply re-minted.
+    let _ = session::delete_auto(paths);
+    if config::load(paths).unlock.mode == UnlockMode::Never {
+        let auto = Session::new("rekey", 0, None, &sealed, &new_key);
+        session::save_auto(paths, &auto)?;
+    }
+    audit::append(&paths.audit(), "cli", "rekey", None, Some(&format!("N={}", kdf.n)));
+    let value = json!({ "ok": true, "kdf": { "N": kdf.n, "r": kdf.r, "p": kdf.p }, "was": { "N": store.kdf().n, "r": store.kdf().r, "p": store.kdf().p } });
+    out.value(value, || format!("rekeyed: scrypt N {} -> {}", store.kdf().n, kdf.n));
+    Ok(())
+}
+
 fn doctor(paths: &Paths, out: &Out) -> Outcome {
     session::ensure_session_dir(paths)?;
     let value = json!({
@@ -518,6 +619,7 @@ fn doctor(paths: &Paths, out: &Out) -> Outcome {
         "zenity": which("zenity"),
         "mode": config::load(paths).unlock.mode.as_str(),
         "auto": paths.auto_session().exists(),
+        "kdf": crypto::read_store(&paths.store()).ok().flatten().map(|s| s.kdf().n),
     });
     out.value(value.clone(), || {
         let mut lines = Vec::new();
@@ -573,17 +675,19 @@ fn init(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_mi
     }
     session::ensure_session_dir(paths)?;
     let (idle, deadline, policy) = policy(paths, idle_min);
+    let secret = signing_key(paths)?;
     let session = Session::new(requester, idle, deadline, &sealed, &key);
     if policy.mode == UnlockMode::Never {
         session::save_auto(paths, &session)?;
     } else {
-        session.save(paths)?;
+        session.save(paths, secret.as_deref())?;
     }
     audit::append(&paths.audit(), requester, "init", None, None);
     let value = json!({
         "ok": true,
         "path": paths.store(),
         "token": session.token,
+        "hostSecret": if policy.mode == UnlockMode::Never || !is_host() { None } else { host_secret() },
         "expiresAt": session.expiry(),
         "items": 0,
         "mode": policy.mode.as_str(),
@@ -610,16 +714,22 @@ fn unlock(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_
     session::ensure_session_dir(paths)?;
     session::sweep(paths);
     let (idle, deadline, policy) = policy(paths, idle_min);
+    // A host that did not pass a secret gets a fresh one to keep for this
+    // session: it is the only thing that can sign later edits to the file.
+    // The host brings its own secret (so the same process can sign later
+    // calls); everyone else is signed with the wrap key.
+    let secret = signing_key(paths)?;
     let session = Session::new(requester, idle, deadline, &store, &key);
     if policy.mode == UnlockMode::Never {
         session::save_auto(paths, &session)?;
     } else {
-        session.save(paths)?;
+        session.save(paths, secret.as_deref())?;
     }
     audit::append(&paths.audit(), requester, "unlock", None, Some(policy.mode.as_str()));
     let value = json!({
         "ok": true,
         "token": session.token,
+        "hostSecret": if policy.mode == UnlockMode::Never || !is_host() { None } else { host_secret() },
         "expiresAt": session.expiry(),
         "items": items.len(),
         "requester": requester,
@@ -808,9 +918,10 @@ fn bw_session(paths: &Paths, out: &Out, action: &str) -> Outcome {
         "" | "get" => {
             let stored = bwsession::load(paths)?
                 .ok_or_else(|| Fault::Auth("no persisted Bitwarden session — unlock Bitwarden first".into()))?;
+            let key = bwsession::key(paths)?.ok_or_else(|| Fault::Auth("no persisted Bitwarden session".into()))?;
             out.value(
-                json!({ "ok": true, "key": stored.key, "savedAt": stored.saved_at, "expiresAt": stored.expires_at }),
-                || stored.key.clone(),
+                json!({ "ok": true, "key": key, "savedAt": stored.saved_at, "expiresAt": stored.expires_at }),
+                || key,
             );
             Ok(())
         }
@@ -945,6 +1056,7 @@ fn get(
     name: &str,
     reason: Option<&str>,
     answer_stdin: bool,
+    approval: Option<String>,
 ) -> Outcome {
     let mut session = load_session(paths, token.as_deref())?;
     let store = open_store(paths)?;
@@ -963,14 +1075,32 @@ fn get(
     } else if session.grant(&item.name, now).is_some() {
         "existing-grant"
     } else {
+        // The window is what the user approves: no caller-supplied text may
+        // break out of its own line here.
         let message = format!(
             "条目: {}\n请求方: {}\n原因: {}\n\n允许后 5 分钟内同一请求方可再次读取。密码会进入对话。",
-            item.name,
-            session.requester,
-            reason.unwrap_or("(未说明)")
+            dialog::for_dialog(&item.name, 80),
+            dialog::for_dialog(&session.requester, 40),
+            dialog::for_dialog(reason.unwrap_or("(未说明)"), 120)
         );
         let approved = if answer_stdin {
-            read_approval()?
+            // Relaying an answer is a host privilege: it must be signed with the
+            // host secret, so the model's own bash cannot answer "y" for the user.
+            let Some(secret) = host_secret().filter(|_| is_host()) else {
+                audit::append(&paths.audit(), &session.requester, "read_deny", Some(&item.name), Some("unsigned-relay"));
+                return Err(Fault::Usage(
+                    "--answer-stdin is only for a host that holds AI_VAULT_HOST_SECRET and signs the answer with --approval".into(),
+                ));
+            };
+            let answer = read_approval()?;
+            let Some(approval) = approval else {
+                return Err(Fault::Usage("--answer-stdin needs --approval <hmac of the answer>".into()));
+            };
+            if !approval_ok(&secret, &session.token, &item.name, answer, &approval) {
+                audit::append(&paths.audit(), &session.requester, "read_deny", Some(&item.name), Some("bad-approval"));
+                return Err(Fault::Denied(format!("approval signature mismatch for \"{}\"", item.name)));
+            }
+            answer
         } else {
             match dialog::confirm("ai-vault · 读取本地密码", &message) {
                 Answer::Value(ok) => ok,
@@ -1031,18 +1161,19 @@ fn add(paths: &Paths, out: &Out, token: Option<String>, req: AddRequest) -> Outc
     if !req.yes {
         let mut meta = Vec::new();
         if let Some(user) = req.username.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-            meta.push(format!("用户名: {user}"));
+            meta.push(format!("用户名: {}", dialog::for_dialog(user, 60)));
         }
         if let Some(uri) = req.uri.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-            meta.push(format!("URI: {uri}"));
+            meta.push(format!("URI: {}", dialog::for_dialog(uri, 120)));
         }
         if let Some(notes) = req.notes.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            meta.push(format!("备注: {notes}"));
+            meta.push(format!("备注: {}", dialog::for_dialog(notes, 120)));
         }
+        let shown = dialog::for_dialog(&name, 80);
         let action = if existing.is_some() {
-            format!("更新已有条目「{name}」。")
+            format!("更新已有条目「{shown}」。")
         } else {
-            format!("新建条目「{name}」。")
+            format!("新建条目「{shown}」。")
         };
         let message = format!(
             "{action}{}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。",
@@ -1140,7 +1271,7 @@ fn remove(paths: &Paths, out: &Out, token: Option<String>, name: &str, yes: bool
         return Err(Fault::Error(format!("no such entry: \"{name}\"")));
     }
     if !yes {
-        match dialog::confirm("ai-vault · 删除条目", &format!("删除「{name}」？删除后无法恢复。")) {
+        match dialog::confirm("ai-vault · 删除条目", &format!("删除「{}」？删除后无法恢复。", dialog::for_dialog(name, 80))) {
             Answer::Value(true) => {}
             Answer::Value(false) | Answer::Cancelled => return Err(Fault::Denied("cancelled".into())),
             Answer::NoUi => return Err(Fault::NeedsUi("confirm")),
@@ -1159,9 +1290,28 @@ fn remove(paths: &Paths, out: &Out, token: Option<String>, name: &str, yes: bool
     Ok(())
 }
 
+/// A grant is "no window for N minutes": it is a standing approval, so it
+/// costs the master password — the same as changing the unlock mode. The
+/// interactive `/vault grant` asks through the window; a non-host caller
+/// without the password cannot mint one.
 fn grant(paths: &Paths, out: &Out, token: Option<String>, name: &str, minutes: Option<i64>) -> Outcome {
     let mut session = load_session(paths, token.as_deref())?;
     let store = open_store(paths)?;
+    {
+        // Only the host may use --password-stdin here (it just asked the user);
+        // anyone else gets the window.
+        let password = if is_host() {
+            read_password()?
+        } else {
+            ask_password("ai-vault · 授权读取", "主密码（给一条条目免确认读取）")?
+        };
+        if let Err(e) = crypto::open_with_passphrase(&store, &password) {
+            return Err(match e {
+                crypto::OpenError::WrongPassword => Fault::Auth("wrong master password".into()),
+                crypto::OpenError::Broken(message) => Fault::Error(message),
+            });
+        }
+    }
     let items = items_with(&session, &store)?;
     let item = store::find(&items, name).ok_or_else(|| Fault::Error(format!("no such entry: \"{name}\"")))?;
     let minutes = minutes.unwrap_or(GRANT_MS_DEFAULT / 60_000).clamp(1, GRANT_MS_MAX / 60_000);
@@ -1226,7 +1376,13 @@ fn import_file(paths: &Paths, out: &Out, token: Option<String>, file: &PathBuf, 
         let shown = drafts
             .iter()
             .take(15)
-            .map(|d| format!("• {}{}", d.name, d.username.as_ref().map(|u| format!("  user:{u}")).unwrap_or_default()))
+            .map(|d| {
+                format!(
+                    "• {}{}",
+                    dialog::for_dialog(&d.name, 80),
+                    d.username.as_ref().map(|u| format!("  user:{}", dialog::for_dialog(u, 40))).unwrap_or_default()
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let more = if drafts.len() > 15 { format!("\n… 还有 {} 条", drafts.len() - 15) } else { String::new() };

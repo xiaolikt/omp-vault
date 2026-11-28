@@ -24,7 +24,7 @@ import {
 } from "./bitwarden.js";
 import { CliError, VaultCli } from "./cli.js";
 import { isOmpHost, onSessionLeave, sessionLabel, subagentId, withTier } from "./host.js";
-import { confirmWindow, promptSecret, promptText, type PromptHost } from "./prompt.js";
+import { confirmWindow, forDialog, promptSecret, promptText, type PromptHost } from "./prompt.js";
 import { forgetSettings, getSettingsSafe, type Settings } from "./settings.js";
 
 type Ctx = ExtensionToolContext | ExtensionCommandContext;
@@ -53,6 +53,8 @@ interface UnlockResult {
 	items: number;
 	mode?: UnlockModeName;
 	auto?: boolean;
+	/** Minted by the CLI for a host; kept in memory only, signs approvals. */
+	hostSecret?: string;
 }
 
 interface ListResult {
@@ -200,9 +202,9 @@ async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Pro
 			}
 		}
 		const attempt = async (password?: string): Promise<UnlockResult> => {
-			const args = ["unlock", "--requester", sessionLabel(ctx)];
+			const args = ["--requester", sessionLabel(ctx)];
 			if (password !== undefined) args.push("--password-stdin");
-			return cli.json<UnlockResult>(args, {
+			return cli.open<UnlockResult>("unlock", args, {
 				stdin: password === undefined ? undefined : `${password}\n`,
 				signal,
 			});
@@ -356,7 +358,7 @@ async function bitwardenFallback(
 	const allow = await confirmWindow(
 		dialogs(ctx),
 		"pi-ai-vault · Bitwarden 里找到",
-		`本地库没有「${name}」，Bitwarden 里有：\n${label}\n\n读取这一次吗？`,
+		`本地库没有「${forDialog(name)}」，Bitwarden 里有：\n${forDialog(label)}\n\n读取这一次吗？`,
 		signal,
 	);
 	if (!allow) return fail(`user denied reading "${hit.name}" from Bitwarden — do not retry`, true);
@@ -365,7 +367,7 @@ async function bitwardenFallback(
 	const confirmed = await confirmWindow(
 		dialogs(ctx),
 		"pi-ai-vault · 导入到 ai-vault",
-		`把「${hit.name}」写进 ai-vault 吗？\n\n允许 → 以后直接读本地库（按当前解锁模式，可能免密）\n拒绝 → 只用这一次，不写入本地库`,
+		`把「${forDialog(hit.name)}」写进 ai-vault 吗？\n\n允许 → 以后直接读本地库（按当前解锁模式，可能免密）\n拒绝 → 只用这一次，不写入本地库`,
 		signal,
 	);
 	return confirmed ? importIt() : asValue("bitwarden-once");
@@ -405,11 +407,18 @@ function vaultGetTool(scope: Scope, bw: BwState): ToolDefinition<typeof vaultGet
 						const allowed = await confirmWindow(
 							dialogs(ctx),
 							"ai-vault · 读取本地密码",
-							`条目: ${params.name}\n请求方: ${sub ? `子代理 ${sub}` : "主会话"}\n原因: ${params.reason ?? "(未说明)"}\n\n` +
+							`条目: ${forDialog(params.name)}\n请求方: ${sub ? `子代理 ${forDialog(sub, 32)}` : "主会话"}\n原因: ${forDialog(params.reason ?? "(未说明)", 120)}\n\n` +
 								"允许后 5 分钟内同一请求方可再次读取。密码会进入对话。",
 							signal,
 						);
-						const run = await cli.run([...base, "--json", "--answer-stdin"], {
+						// Relaying is our privilege as the host: sign the answer under the
+						// host secret so the CLI can tell us from the model's own bash.
+						const token = scope.token ?? "";
+						const approval = cli.host.approve(token, params.name, allowed);
+						if (!approval) {
+							return fail("cannot relay an approval: no host secret for this session — run /vault unlock again");
+						}
+						const run = await cli.run([...base, "--json", "--answer-stdin", "--approval", approval], {
 							stdin: allowed ? "y\n" : "n\n",
 							signal,
 						});
@@ -532,16 +541,16 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 			}
 			if (error.needsUi === "confirm") {
 				const meta = [
-					req.username?.trim() ? `用户名: ${req.username.trim()}` : "",
-					req.uri?.trim() ? `URI: ${req.uri.trim()}` : "",
-					req.notes?.trim() ? `备注: ${req.notes.trim()}` : "",
+					req.username?.trim() ? `用户名: ${forDialog(req.username, 60)}` : "",
+					req.uri?.trim() ? `URI: ${forDialog(req.uri, 120)}` : "",
+					req.notes?.trim() ? `备注: ${forDialog(req.notes, 120)}` : "",
 				]
 					.filter(Boolean)
 					.join("\n");
 				const ok = await confirmWindow(
 					dialogs(ctx),
 					"ai-vault · 保存到本地库",
-					`保存条目「${name}」。${meta ? `\n${meta}` : ""}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`,
+					`保存条目「${forDialog(name)}」。${meta ? `\n${meta}` : ""}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`,
 					req.signal,
 				);
 				if (!ok) return `user denied saving "${name}"`;
@@ -658,7 +667,7 @@ async function initStore(scope: Scope, ctx: Ctx, label: string): Promise<void> {
 		note(ctx, `ai-vault 已创建: ${cli.dir}/store.json`);
 	};
 	try {
-		finish(await cli.json<UnlockResult>(["init", "--requester", label]));
+		finish(await cli.open<UnlockResult>("init", ["--requester", label]));
 		return;
 	} catch (error) {
 		if (!(error instanceof CliError)) {
@@ -681,7 +690,7 @@ async function initStore(scope: Scope, ctx: Ctx, label: string): Promise<void> {
 		return;
 	}
 	try {
-		finish(await cli.json<UnlockResult>(["init", "--requester", label, "--password-stdin"], { stdin: `${pass}\n` }));
+		finish(await cli.open<UnlockResult>("init", ["--requester", label, "--password-stdin"], { stdin: `${pass}\n` }));
 	} catch (error) {
 		note(ctx, `ai-vault: ${error instanceof CliError ? error.message : describe(error)}`, "error");
 	}
@@ -880,7 +889,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 						note(ctx, `ai-vault: ${describe(error)}`, error instanceof CliError && error.denied ? "warning" : "error");
 						return;
 					}
-					const sure = await confirmWindow(dialogs(ctx), "ai-vault · 删除条目", `删除「${name}」？删除后无法恢复。`);
+					const sure = await confirmWindow(dialogs(ctx), "ai-vault · 删除条目", `删除「${forDialog(name)}」？删除后无法恢复。`);
 					if (!sure) return;
 					try {
 						const result = await cli.json<RemovingResult>([...args, "--yes"]);
@@ -906,7 +915,11 @@ function commandHandler(scope: Scope, bw: BwState) {
 				const args = ["grant", name, "--token", scope.token!];
 				if (minutes) args.push("--minutes", minutes);
 				try {
-					const result = await cli.json<{ name: string; minutes: number }>(args);
+					// A standing grant costs the master password, like a mode change.
+					const run = await cli.withPassword(args, () =>
+						promptSecret(dialogs(ctx), "ai-vault · 授权读取", "主密码（给这条条目 N 分钟免确认）"),
+					);
+					const result = JSON.parse(run.stdout) as { name: string; minutes: number };
 					setStatus(ctx, scope, "·granted");
 					note(ctx, `granted "${result.name}" for ${result.minutes}m`);
 				} catch (error) {

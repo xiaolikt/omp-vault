@@ -61,6 +61,10 @@ omp plugin install npm:pi-ai-vault  # omp，同一个包
 
 所以默认情况下 **只有你同意导入的密码才会进 ai-vault**。Bitwarden 自己的主密码请求频率也有单独设置（`bitwarden.unlock`：`never` / `time` / `session`），用 `/vault settings` 查看和修改。
 
+## 安全边界（一句话版）
+
+模型的 `bash` 能找到会话令牌、能 `list`，但**签不出读取确认**（签名密钥只在插件进程内存里）、**改不了令牌文件**（带 HMAC，改了就作废）、**免费拿不到 `grant`**（要主密码）。详见仓库 README「安全」一节。
+
 ## 隔离
 
 每个会话、每个子代理各自 `ai-vault unlock`，拿自己的令牌和读授权；父会话的解锁子代理继承不到。空闲 10 分钟自动失效，`/new`、`/fork`、退出会清掉本绑定的令牌。

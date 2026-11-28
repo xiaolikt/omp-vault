@@ -42,9 +42,16 @@ impl Paths {
         self.dir.join("agent.session.json")
     }
 
-    /// The `bw` session key kept for `bitwarden.unlock = never | time`.
+    /// The `bw` session key kept for `bitwarden.unlock = never | time`,
+    /// sealed under `wrap_key`.
     pub fn bw_session(&self) -> PathBuf {
         self.dir.join("bitwarden.session.json")
+    }
+
+    /// Random 256-bit key that seals the Bitwarden session at rest, so that
+    /// file alone is not a bearer token. Same exposure as the store itself.
+    pub fn wrap_key(&self) -> PathBuf {
+        self.dir.join(".wrap")
     }
 
     /// Shared advisory lock for read-modify-write of the store file.

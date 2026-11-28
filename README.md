@@ -94,7 +94,8 @@ ai-vault [--dir DIR] [--json] <命令>
 | `unlock [--password-stdin] [--requester ID]` | 按当前模式解锁，stdout 一个令牌 |
 | `mode [get]` / `mode set never\|time\|session [--hours N]` | 查看/切换解锁模式（切换要主密码） |
 | `settings [键] [值]` | 全部设置：`vault.unlock` `vault.hours` `bitwarden.unlock` `bitwarden.hours` `bitwarden.import` |
-| `bw-session get\|put\|clear` | Bitwarden 会话密钥的落盘副本（`bitwarden.unlock != session` 时用） |
+| `bw-session get\|put\|clear` | Bitwarden 会话密钥的落盘副本（`bitwarden.unlock != session` 时用，加密封存） |
+| `rekey` | 把旧库的 scrypt 参数升到当前默认（要主密码） |
 | `status --token T` | 条目数、过期时间、还活着的读授权 |
 | `lock --token T \| --all` | 丢掉令牌（`--all` 清空本机所有会话） |
 | `list --token T` | 条目元数据（名称/用户名/URI），没有密码 |
@@ -119,7 +120,18 @@ ai-vault [--dir DIR] [--json] <命令>
 | 4 | 用户拒绝/取消 | **不要重试**，问用户 |
 | 5 | 未解锁 / 密码错 | 重新 `unlock`，或提示主密码错误 |
 
-所以「没有桌面的机器」也能用：`unlock --password-stdin`、`get --answer-stdin`、`add --password-stdin --yes`、`save --yes` 就是无界面路径。
+所以「没有桌面的机器」也能用：`unlock --password-stdin`、`add --password-stdin --yes`、`save --yes` 就是无界面路径。
+
+**转发确认是宿主特权**，需要三样东西同时成立：
+
+```bash
+AI_VAULT_HOST=1 \
+AI_VAULT_HOST_SECRET=<unlock 时返回的 hostSecret> \
+ai-vault get <条目> --token <T> --answer-stdin --approval <hex> <<< 'y'
+# approval = HMAC-SHA256(hostSecret, "allow:<T>:<条目小写>:y")
+```
+
+`unlock`/`init` 只在 `AI_VAULT_HOST=1` 时返回 `hostSecret`；它只存在于宿主进程内存里，CLI 用它给会话文件签名、用它核对转发。少了任何一样，`--answer-stdin` 都是退出码 2。这就是为什么模型的 `bash` 即使拿到令牌也签不出「允许」。
 
 ## 插件里的工具
 
@@ -217,7 +229,7 @@ ai-vault settings bitwarden.hours 24
 ## 会话与隔离
 
 - 每个绑定（一个会话，或一个子代理）在第一次用到库时各自 `ai-vault unlock`，拿到**自己的令牌**。父会话的解锁和授权子代理继承不到；确认窗口里会写「请求方: 子代理 0-Explore」。
-- 令牌寿命由解锁模式决定（见上）：`session` 到会话结束、`time` 到 N 小时、`never` 不过期。`/new`、`/fork`、退出会让插件把自己的令牌删掉；`/resume` 保留。
+- 令牌寿命由解锁模式决定（见上）：`session` 最长 24 小时、`time` 到 N 小时、`never` 不过期。`/new`、`/fork`、退出会让插件把自己的令牌删掉；`/resume` 保留。失效、被改、属于旧库的令牌文件在**每次** CLI 调用时都会被清掉。
 - 读授权存在令牌里，所以天然按请求方隔离；`/vault grant`、`/vault revoke` 改的就是它。
 - 库文件本身共享：读改写有 `flock`，两个 agent 同时写不会丢更新（旧版是后写覆盖先写）。
 
@@ -234,14 +246,38 @@ ai-vault settings bitwarden.hours 24
 
 ## 安全
 
-- 主密码只经过弹窗或宿主输入框；`unlock` 派生出的 key 只写进令牌文件（0600，优先 tmpfs，登出即消失）。`never` 模式例外：key 写在 `~/.ai-vault/agent.session.json`，跨重启存在——这是那个模式的定义，不是疏漏。Bitwarden 侧同理：`bitwarden.unlock = never|time` 会把 `bw` 会话密钥写到 `~/.ai-vault/bitwarden.session.json`（0600），它是 bearer token，丢了等于丢了那次登录。它和「agent 进程内存里有 key」是同一级别的暴露面，好处是换会话、reload、崩溃都会自然清掉。
-- 会话令牌只是 id，不是 key：泄露令牌不等于泄露密码，但仍能读库，所以 `lock` 要真删文件。
-- 插件启动的子进程（`bw`、`bw_run` 的 bash、剪贴板工具）都会剔除宿主环境里的 `BW_*`，避免用户 shell 里导出的会话密钥漏进命令环境。
-- 审计：`~/.ai-vault/audit.log` 记录会话/子代理标签、条目名、允许/拒绝，从不记录值；写失败不影响主操作；1 MiB 轮转成 `.1`。
-- `bw_reveal` 默认关闭；要明文通道得在配置里显式打开。
-- 擦洗只在值长度 ≥ 6 时生效（更短的会误伤正常输出）；网络外传、单向哈希防不住——`bw_run` / `bw_inject` 的价值是值不进对话，不是防住被注入的 agent。
-- 原子写：临时文件（0600、唯一命名）+ `fsync` + `rename` + 目录 `fsync`；KDF 参数写在文件头，以后调参不会毁老库。
-- 库格式和旧版 `omp-vault` 完全一致（`v:1`、`salt`、`kdf{N,r,p}`、`ct = base64(iv‖ct‖tag)`），主密码不变，Node 和 Rust 两边都验证过互读。
+### 威胁模型：谁能做什么
+
+所有东西都跑在**你的用户**下，所以边界不是「用户 vs 别人」，而是**你（人）vs 跑在你账号下的 agent**。设计目标是：agent 可以*用*密码，但不能*绕过你*去拿。
+
+| 角色 | 能 | 不能 |
+|---|---|---|
+| **你**（终端里手敲 `ai-vault`） | 一切 | — |
+| **宿主**（pi/omp 扩展进程，持 `AI_VAULT_HOST=1` + 内存里的 host secret） | 替你转发确认（要签名）、改设置 | 不知道主密码（除非你输了） |
+| **agent**（模型的 `bash`，同一用户，能读 `~/.ai-vault`） | 读到会话令牌文件（但插件开的会话没有 secret 用不了，一用就作废） | **伪造一次读取确认、给令牌加授权、改确认窗里的请求方、`list` 插件会话、拿到 Bitwarden 主密码** |
+| **别的用户 / 离线拿到文件的人** | 读到密文 | 解密（scrypt + ChaCha20-Poly1305） |
+
+### 怎么做到的
+
+- **确认窗不能被绕过。** `vault_get` 的确认要么是 CLI 自己开的 zenity 窗口，要么是宿主转发的答案。转发的答案必须带 `--approval`：用**宿主进程内存里的 secret** 对 `allow:<token>:<条目>:<y|n>` 做 HMAC。模型的 bash 能找到令牌文件，但没有 secret，签不出来；拿别的条目的签名重放、把 `n` 改成 `y`，都会对不上。
+- **令牌文件不能改。** 每个会话文件带 HMAC（宿主会话用 host secret，手敲 CLI 的会话用库目录的 wrap key）。改了 `grants`、改了 `requester`、哪怕只改一个字节，CLI 都报 `session file was modified outside ai-vault` 并删掉文件。
+- **`grant` 不再是免费的。** 给一条条目「N 分钟免确认」是一次长期授权，现在要主密码（和切模式同一级别）。
+- **`never` 模式是明确放弃上面这些。** 密钥写在 `~/.ai-vault/agent.session.json`，读取不再有任何窗口。它的意义是把「可以让 AI 随便用」和「每次都要问我」分开；开了它，就等于信任 agent 的输出渠道，不只是 agent。
+- **Bitwarden 会话密钥加密封存。** `bitwarden.unlock = never|time` 时，`bw` 的会话密钥用 ChaCha20-Poly1305 封在 `~/.ai-vault/bitwarden.session.json` 下，密钥是 `~/.ai-vault/.wrap`（0600）。单独拷走那个文件什么都打不开。`bw unlock --raw` 的会话密钥等价于**整个** Bitwarden 保险库的读权限，所以这个文件的敏感度 ≥ 库本身。
+- **确认窗里的字不是模型写的。** 条目名、原因、用户名、URI 进窗口前都压成一行、去掉控制字符、截到 80–120 字符，模型没法在名字里塞换行伪造第二条「已授权」。
+- **KDF。** 新库 scrypt `N=2^17`（128 MiB）；文件头记着参数，旧库（`N=2^15`）照常打开，`ai-vault rekey` 升级。低于 `2^15` 的参数一律拒收（防降级）。
+- **主密码**只经过弹窗或宿主输入框；`unlock` 派生的 key 只写进令牌文件（0600，优先 tmpfs）。`BW_*` 在所有子进程环境里剔除。
+- **审计**：`~/.ai-vault/audit.log` 记录会话、条目、允许/拒绝/原因、以及 `unsigned-relay`、`bad-approval`、`modified-outside` 这类尝试，从不记值；1 MiB 轮转。
+- **原子写 + flock**：临时文件（0600）→ fsync → rename → 目录 fsync；多进程读改写有文件锁。失效/被改/旧库的令牌文件每次调用都会被清掉。
+- `bw_reveal` 默认关闭；擦洗只在值长度 ≥ 6 时生效，防不住网络外传和单向哈希——`bw_run` / `bw_inject` 的价值是值不进对话，不是防住被注入的 agent。
+- `notes` 只在 `get`（授权之后）里出现，`list` 不输出它。
+
+### 已知边界
+
+- `session` 模式下，模型的 bash **能**读到令牌文件，但拿到也没用：插件开的会话用宿主内存里的 secret 签名，bash 没有 secret，第一次用就会被判「文件被改」而作废（连 `list` 都做不了，还会把那个文件删掉）。只有**你在终端手敲** `ai-vault unlock` 开出来的会话（用 wrap key 签名）才能被同用户进程 `list`——那种会话本来就没有窗口可以绕，这是「同一用户」的固有暴露面。真正收紧要靠不同的用户或容器。
+- 一个 `AI_VAULT_HOST=1` 但没带 secret 的调用方，会被当成普通用户对待：拿不到 secret、签不了转发。
+- `bitwarden.import = always` + `bitwarden.unlock = never` 等于「Bitwarden 里任何一条被问到就自动进免费库」。README 不建议，但它能开。
+- zenity 窗口的标题栏属于窗口管理器；全屏伪造窗口不在防护范围内。
 
 ## 开发
 

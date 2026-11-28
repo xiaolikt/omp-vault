@@ -6,6 +6,13 @@
 //! token; the key is read from that file, never from the command line. A token
 //! dies on `lock`, after `idleMs` without use, or when the store file changes
 //! underneath it.
+//!
+//! Two things a same-user process must NOT be able to do by editing these
+//! files: mint a grant, and change who the confirm window says is asking.
+//! Every session file therefore carries an HMAC over its whole body, keyed
+//! with a secret that lives in the host process only (`hostSecret`, handed
+//! back once at unlock time, never written to disk). A file that fails the
+//! check is deleted and reported as locked.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -43,6 +50,22 @@ pub struct Session {
     /// entry name (lowercase) -> grant expiry epoch ms
     #[serde(default)]
     pub grants: BTreeMap<String, i64>,
+    /// HMAC-SHA256 over every field above (canonical JSON), keyed with the
+    /// host secret. Absent only for the machine-wide `never` session, which is
+    /// by definition not protected from this user.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "mac")]
+    pub mac: Option<String>,
+}
+
+
+fn mac_body(session: &Session) -> Vec<u8> {
+    // Same struct, `mac` blanked, canonical key order: serde_json::Value sorts
+    // object keys, so the encoding is stable across runs.
+    let mut value = serde_json::to_value(session).expect("session serializes");
+    if let Some(record) = value.as_object_mut() {
+        record.remove("mac");
+    }
+    value.to_string().into_bytes()
 }
 
 impl Session {
@@ -60,7 +83,36 @@ impl Session {
             kdf: Some(store.kdf()),
             key: B64.encode(key),
             grants: BTreeMap::new(),
+            mac: None,
         }
+    }
+
+    /// (Re)sign this session with the host's secret. Called before every save.
+    pub fn sign(&mut self, host_secret: Option<&str>) {
+        self.mac = host_secret.map(|secret| {
+            use hmac::{Hmac, Mac};
+            let mut hasher = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes())
+                .expect("HMAC takes any key length");
+            hasher.update(&mac_body(self));
+            hasher.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
+        });
+    }
+
+    /// True when the file was written by a process holding `host_secret`.
+    /// A session with no mac at all is only valid as the `never`-mode session.
+    pub fn verifies(&self, host_secret: Option<&str>) -> bool {
+        let (Some(secret), Some(mac)) = (host_secret, self.mac.as_deref()) else {
+            // The only legitimate unsigned session is the machine-wide one.
+            return self.mac.is_none() && host_secret.is_none();
+        };
+        use hmac::{Hmac, Mac};
+        let Ok(mut hasher) = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()) else {
+            return false;
+        };
+        hasher.update(&mac_body(self));
+        let expected: String = hasher.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        // Constant-time compare is not required for a 256-bit tag, but cheap.
+        expected.len() == mac.len() && expected.bytes().zip(mac.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
     }
 
     pub fn key(&self) -> Option<Zeroizing<[u8; 32]>> {
@@ -101,18 +153,20 @@ impl Session {
             .filter(|until| *until > now)
     }
 
-    pub fn save(&self, paths: &Paths) -> Result<(), String> {
+    pub fn save(&self, paths: &Paths, host_secret: Option<&str>) -> Result<(), String> {
+        let mut signed = self.clone();
+        signed.sign(host_secret);
         let dir = paths.sessions();
         fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-        let text = serde_json::to_vec(self).map_err(|e| format!("cannot serialize session: {e}"))?;
-        crypto::write_atomic(&paths.session_file(&self.token), &text)
+        let text = serde_json::to_vec(&signed).map_err(|e| format!("cannot serialize session: {e}"))?;
+        crypto::write_atomic(&paths.session_file(&signed.token), &text)
     }
 }
 
 /// Load a token for the given store. Missing, expired, or stale tokens are
 /// removed and reported as locked so the caller unlocks again.
-pub fn load(paths: &Paths, token: &str) -> Result<Session, String> {
+pub fn load(paths: &Paths, token: &str, host_secret: Option<&str>) -> Result<Session, String> {
     let path = paths.session_file(token);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -126,7 +180,13 @@ pub fn load(paths: &Paths, token: &str) -> Result<Session, String> {
     let now = now_ms();
     if session.expired(now) {
         let _ = fs::remove_file(&path);
-        return Err("vault locked itself after 10 minutes idle — unlock again".into());
+        return Err("this session expired — unlock again".into());
+    }
+    // Edited on disk (a grant minted, a requester renamed): treat as a break-in
+    // attempt, say so, and drop it.
+    if !session.verifies(host_secret) {
+        let _ = fs::remove_file(&path);
+        return Err("session file was modified outside ai-vault — unlock again".into());
     }
     let store = crypto::read_store(&paths.store())?.ok_or_else(|| "vault is not initialized".to_string())?;
     if crypto::store_id(&store) != session.store_id || session.key().is_none() {
@@ -154,9 +214,14 @@ pub fn delete_all(paths: &Paths) -> usize {
     removed
 }
 
-/// Remove tokens that already expired, so a tmpfs-less machine does not keep
-/// dead keys around. Called on unlock and lock.
+/// Remove token files **of this store** that can no longer open anything:
+/// expired, corrupt, or unsigned. Files naming another store are left alone:
+/// several stores may share the sessions directory (two agents, two `--dir`s),
+/// and one store's housekeeping must not lock the other's agents out.
 pub fn sweep(paths: &Paths) -> usize {
+    let Some(current) = crypto::read_store(&paths.store()).ok().flatten().map(|store| crypto::store_id(&store)) else {
+        return 0;
+    };
     let dir = paths.sessions();
     let mut removed = 0;
     if let Ok(entries) = fs::read_dir(&dir) {
@@ -165,12 +230,16 @@ pub fn sweep(paths: &Paths) -> usize {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let stale = fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| serde_json::from_str::<Session>(&text).ok())
-                .map(|s| s.expired(now_ms()))
-                .unwrap_or(true);
-            if stale && fs::remove_file(&path).is_ok() {
+            let dead = match fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str::<Session>(&text).ok()) {
+                // Unparseable junk opens nothing; drop it.
+                None => true,
+                // Only this store's files are ours to judge. Another store's
+                // live token is none of our business.
+                Some(session) => {
+                    session.store_id == current && (session.expired(now_ms()) || session.mac.is_none())
+                }
+            };
+            if dead && fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
         }

@@ -130,6 +130,37 @@ fn is_gtk_diagnostic(line: &str) -> bool {
     rest.starts_with("Gtk-") || rest.starts_with("Gdk-") || rest.starts_with("GLib-")
 }
 
+/// Make a caller-supplied value safe to put in a window: one line, bounded,
+/// no control characters. A name or reason that carries newlines could
+/// otherwise forge a second message inside the confirm dialog.
+pub fn for_dialog(value: &str, max: usize) -> String {
+    let flat: String = value
+        .chars()
+        .map(|c| if c.is_control() || c == '\u{2028}' || c == '\u{2029}' { ' ' } else { c })
+        .collect();
+    let mut out = String::with_capacity(flat.len());
+    let mut last_space = false;
+    for c in flat.chars() {
+        let is_space = c.is_whitespace();
+        if is_space {
+            if !last_space && !out.is_empty() {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+        last_space = is_space;
+    }
+    let trimmed = out.trim();
+    if trimmed.chars().count() > max {
+        let mut cut: String = trimmed.chars().take(max.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Secret entry. Empty and cancel are both "no value".
 pub fn prompt_secret(title: &str, label: &str) -> Answer<String> {
     if !has_display() {
@@ -201,6 +232,20 @@ pub fn confirm(title: &str, message: &str) -> Answer<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_text_cannot_forge_a_second_line() {
+        let forged = "github\n\n条目: nothing\n请求方: 主会话\n（已授权）";
+        let clean = for_dialog(forged, 80);
+        assert!(!clean.contains('\n'));
+        assert!(clean.starts_with("github 条目: nothing"));
+        assert_eq!(clean.chars().filter(|c| *c == '…').count(), 0);
+        assert_eq!(for_dialog("   a   b  ", 80), "a b");
+        let long = "x".repeat(100);
+        let cut = for_dialog(&long, 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with('…'));
+    }
 
     #[test]
     fn gtk_diagnostics_are_not_failures() {

@@ -7,6 +7,7 @@
  * windows; a headless machine answers exit code 3 ("needs-ui") and the host
  * dialog takes over here.
  */
+import { createHmac, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -91,8 +92,54 @@ function message(stderr: string, fallback: string): string {
 	return lines[0]?.replace(/^ai-vault:\s*/, "") ?? fallback;
 }
 
+/**
+ * The secret this process keeps for the sessions it unlocked. It never reaches
+ * disk: the CLI writes it into the HMAC on each session file, and uses it to
+ * check the approvals we relay. A model-driven `bash` that finds a session
+ * token can therefore `list`, but can neither forge a read approval nor edit
+ * the token's grants.
+ */
+export class HostSecret {
+	#value: string | undefined;
+
+	get present(): boolean {
+		return this.#value !== undefined;
+	}
+
+	/** Use the one the CLI echoed back at unlock time (it is ours already). */
+	adopt(secret: string | undefined): void {
+		if (secret && secret.length >= 32) this.#value = secret;
+	}
+
+	/** 32 fresh bytes, hex — minted once per process, before the first unlock. */
+	rotate(): string {
+		this.#value = randomBytes(32).toString("hex");
+		return this.#value;
+	}
+
+	/** The secret, minting it on first use. */
+	get value(): string {
+		return (this.#value ??= randomBytes(32).toString("hex"));
+	}
+
+	/** Environment for a CLI child: marks us as the host and passes the secret. */
+	env(): Record<string, string> {
+		return { AI_VAULT_HOST: "1", AI_VAULT_HOST_SECRET: this.value };
+	}
+
+	/** HMAC over "allow:<token>:<entry>:<y|n>", what `get --answer-stdin` expects. */
+	approve(token: string, entry: string, answer: boolean): string | undefined {
+		if (!this.#value) return undefined;
+		return createHmac("sha256", this.#value)
+			.update(`allow:${token}:${entry.toLowerCase()}:${answer ? "y" : "n"}`)
+			.digest("hex");
+	}
+}
+
 export class VaultCli {
 	readonly bin = resolveBinary();
+	/** Set by the extension at startup; the same secret for every binding. */
+	host = new HostSecret();
 
 	get available(): boolean {
 		return this.bin !== undefined;
@@ -112,7 +159,7 @@ export class VaultCli {
 			throw new CliError(EXIT.denied, undefined, "aborted", "");
 		}
 		const run = await new Promise<CliRun>((resolve, reject) => {
-			const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
+			const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...this.host.env() } });
 			let stdout = "";
 			let stderr = "";
 			const onAbort = () => child.kill("SIGKILL");
@@ -141,6 +188,16 @@ export class VaultCli {
 			throw new CliError(run.code, step, message(run.stderr, `ai-vault exited with ${run.code}`), run.stderr);
 		}
 		return run;
+	}
+
+	/**
+	 * `init` or `unlock`: returns the parsed result with the token, and keeps
+	 * the host secret the CLI minted (or used ours) for later signing.
+	 */
+	async open<T extends { hostSecret?: string }>(subcommand: "init" | "unlock", args: string[], opts: { stdin?: string; signal?: AbortSignal } = {}): Promise<T> {
+		const result = await this.json<T>([subcommand, ...args], opts);
+		this.host.adopt(result.hostSecret);
+		return result;
 	}
 
 	/** One CLI call whose output is a JSON object. */

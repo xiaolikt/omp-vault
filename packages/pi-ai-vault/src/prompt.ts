@@ -105,6 +105,19 @@ function failedToOpen(result: ZenityResult): boolean {
 	return result.stderr.split(/\r?\n/).some((line) => line.trim() !== "" && !gtkDiagnostic.test(line));
 }
 
+/**
+ * Make a model-supplied value safe to put in a confirm window.
+ *
+ * The window is the one place the user reads what they are approving, so an
+ * entry name or reason that carries newlines could otherwise forge a whole
+ * second message ("请求方: 主会话 / 已授权, 点允许"). One line, bounded
+ * length, control characters gone.
+ */
+export function forDialog(value: string, max = 80): string {
+	const oneLine = value.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+	return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
 /** Secret entry. Empty and cancel are both "no value". */
 export async function promptSecret(
 	ctx: PromptHost | undefined,

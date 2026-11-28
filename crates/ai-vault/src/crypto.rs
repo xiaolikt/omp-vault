@@ -32,9 +32,20 @@ pub struct Kdf {
 }
 
 impl Default for Kdf {
+    /// 128 MiB of scrypt memory per guess. Files written before this carried
+    /// N=2^15 (32 MiB); they open unchanged because the parameters travel in
+    /// the file header, and `ai-vault rekey` moves them up.
     fn default() -> Self {
-        Kdf { n: 1 << 15, r: 8, p: 1 }
+        Kdf { n: 1 << 17, r: 8, p: 1 }
     }
+}
+
+/// The weakest KDF a file may carry and still be accepted: the old default.
+/// Anything below it is a downgrade, not a legacy file.
+pub const KDF_FLOOR: Kdf = Kdf { n: 1 << 15, r: 8, p: 1 };
+
+fn at_or_above_floor(kdf: Kdf) -> bool {
+    kdf.n >= KDF_FLOOR.n && kdf.r >= KDF_FLOOR.r && kdf.p >= KDF_FLOOR.p
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +90,9 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 
 /// scrypt(passphrase, salt, N/r/p) -> 32-byte key.
 pub fn derive_key(passphrase: &str, salt: &[u8], kdf: Kdf) -> Result<Key, OpenError> {
+    if !at_or_above_floor(kdf) {
+        return Err(OpenError::Broken("vault KDF parameters are below the supported minimum".into()));
+    }
     let log_n = u8::try_from(kdf.n.trailing_zeros()).map_err(|_| OpenError::Broken("bad KDF parameters".into()))?;
     if kdf.n == 0 || (1u32 << log_n) != kdf.n {
         return Err(OpenError::Broken("bad KDF parameters".into()));
@@ -221,10 +235,15 @@ mod tests {
         items
     }
 
+    /// The old cost, so the tests below stay fast; correctness is the same.
+    fn fast() -> Kdf {
+        KDF_FLOOR
+    }
+
     #[test]
     fn round_trip() {
         let salt = random_bytes::<16>();
-        let kdf = Kdf::default();
+        let kdf = fast();
         let key = derive_key("correct horse", &salt, kdf).unwrap();
         let sealed = seal(&salt, kdf, &key, &sample()).unwrap();
         let opened = open_with_key(&sealed, &key).unwrap();
@@ -237,7 +256,7 @@ mod tests {
     #[test]
     fn wrong_password_is_distinguishable() {
         let salt = random_bytes::<16>();
-        let kdf = Kdf::default();
+        let kdf = fast();
         let key = derive_key("right", &salt, kdf).unwrap();
         let sealed = seal(&salt, kdf, &key, &sample()).unwrap();
         assert!(matches!(open_with_passphrase(&sealed, "wrong"), Err(OpenError::WrongPassword)));
@@ -246,18 +265,25 @@ mod tests {
     #[test]
     fn each_seal_uses_a_fresh_iv() {
         let salt = random_bytes::<16>();
-        let key = derive_key("pw", &salt, Kdf::default()).unwrap();
-        let a = seal(&salt, Kdf::default(), &key, &sample()).unwrap();
-        let b = seal(&salt, Kdf::default(), &key, &sample()).unwrap();
+        let key = derive_key("pw", &salt, fast()).unwrap();
+        let a = seal(&salt, fast(), &key, &sample()).unwrap();
+        let b = seal(&salt, fast(), &key, &sample()).unwrap();
         assert_ne!(a.ct, b.ct);
+    }
+
+    #[test]
+    fn refuses_a_downgraded_kdf() {
+        let weak = Kdf { n: 1 << 12, r: 8, p: 1 };
+        assert!(matches!(derive_key("pw", &random_bytes::<16>(), weak), Err(OpenError::Broken(_))));
+        assert_eq!(Kdf::default().n, 1 << 17);
     }
 
     #[test]
     fn parses_the_typescript_format() {
         // Written by the TS release, with the default KDF.
         let salt = "00112233445566778899aabbccddeeff";
-        let key = derive_key("pw", &hex_to_bytes(salt).unwrap(), Kdf::default()).unwrap();
-        let sealed = seal(&hex_to_bytes(salt).unwrap(), Kdf::default(), &key, &sample()).unwrap();
+        let key = derive_key("pw", &hex_to_bytes(salt).unwrap(), fast()).unwrap();
+        let sealed = seal(&hex_to_bytes(salt).unwrap(), fast(), &key, &sample()).unwrap();
         let json = serde_json::json!({ "v": 1, "salt": salt, "kdf": { "N": 32768, "r": 8, "p": 1 }, "ct": sealed.ct });
         let store: StoreFile = serde_json::from_value(json).unwrap();
         assert_eq!(open_with_passphrase(&store, "pw").unwrap().0[0].name, "GitHub");

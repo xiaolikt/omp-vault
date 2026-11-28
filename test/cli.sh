@@ -49,7 +49,26 @@ echo "== unlock =="
 check "unlock without a window asks the host" 3 "$BIN" unlock
 check "a wrong password is an auth failure" 5 bash -c "printf 'wrong password' | '$BIN' unlock --password-stdin"
 check "the right password opens it" 0 bash -c "printf 'correct horse' | '$BIN' unlock --password-stdin --json"
-TOKEN=$(printf 'correct horse' | "$BIN" unlock --password-stdin --json | json token)
+# The extension is the host: it mints its own secret before the first unlock
+# and presents it on every call. A caller that only says AI_VAULT_HOST=1
+# without a secret is treated as a human (see the attacker block).
+HS=$(python3 -c "import secrets;print(secrets.token_hex(32))")
+export AI_VAULT_HOST=1 AI_VAULT_HOST_SECRET="$HS"
+check "a host that presents no secret is not handed one" 0 bash -c "printf 'correct horse' | env -u AI_VAULT_HOST_SECRET '$BIN' unlock --password-stdin --json >'$TMP/nosec'"
+python3 - "$TMP/nosec" <<'PY' && ok "AI_VAULT_HOST=1 alone yields no hostSecret" || bad "a secret was handed to a caller without one"
+import json,sys
+assert json.load(open(sys.argv[1])).get("hostSecret") is None
+PY
+HOST_JSON=$(printf 'correct horse' | "$BIN" unlock --password-stdin --json)
+ECHOED=$(printf '%s' "$HOST_JSON" | python3 -c "import json,sys;print(json.load(sys.stdin).get('hostSecret',''))")
+[[ "$ECHOED" == "$HS" ]] && ok "the host's own secret is echoed back" || bad "hostSecret echo mismatch"
+TOKEN=$(printf '%s' "$HOST_JSON" | json token)
+# relay <entry> <y|n>: a signed approval for the host's token.
+relay() {
+	local ap
+	ap=$(python3 -c "import hmac,hashlib;print(hmac.new('$HS'.encode(),('allow:$TOKEN:$1:$2'.lower()).encode(),hashlib.sha256).hexdigest())")
+	printf '%s\n' "$2" | "$BIN" get "$1" --token "$TOKEN" --answer-stdin --approval "$ap" --json
+}
 [[ ${#TOKEN} -ge 32 ]] && ok "a session token is printed" || bad "no token"
 SESS="$XDG_RUNTIME_DIR/ai-vault/sessions/$TOKEN.json"
 [[ -f "$SESS" ]] && ok "the token file lives under XDG_RUNTIME_DIR" || bad "token file missing"
@@ -70,9 +89,9 @@ grep -q 'p1ssw0rd' "$AI_VAULT_DIR/store.json" && bad "the password is in plainte
 
 echo "== read approval =="
 check "get without a window asks the host" 3 bash -c "'$BIN' get GitHub --token '$TOKEN'"
-check "a denied window is not a lock" 4 bash -c "printf 'n\n' | '$BIN' get GitHub --token '$TOKEN' --answer-stdin"
-printf 'y\n' | "$BIN" get GitHub --token "$TOKEN" --answer-stdin --json >"$TMP/get" 2>"$TMP/err"
-[[ $? -eq 0 ]] && ok "an approved window reveals the entry" || bad "an approved window failed"
+relay GitHub n >"$TMP/deny" 2>"$TMP/denyerr"; [[ $? -eq 4 ]] && ok "a denied relay is not a lock (exit 4)" || bad "a denied relay was not exit 4"
+relay GitHub y >"$TMP/get" 2>"$TMP/err"
+[[ $? -eq 0 ]] && ok "an approved relay reveals the entry" || bad "an approved relay failed"
 python3 - "$TMP/get" <<'PY' && ok "the approved entry carries the password" || bad "get output is wrong"
 import json,sys
 item = json.load(open(sys.argv[1]))
@@ -99,6 +118,50 @@ grep -q 'exp-pass' "$AI_VAULT_DIR/store.json" && bad "an imported password is on
 check "save requires the caller's --yes" 2 bash -c "printf '[]' | '$BIN' save --token '$TOKEN'"
 check "save inserts drafts" 0 bash -c "printf '[{\"name\":\"Draft\",\"password\":\"dr-pw\",\"uris\":[\"https://d\"]}]' | '$BIN' save --yes --token '$TOKEN' --json"
 
+echo "== tamper resistance (H1 / H2) =="
+# A fresh, non-host session for the attacker tests.
+# The attacker: a valid token, but no host identity and no secret (the model's bash).
+T2=$(printf 'correct horse' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET "$BIN" unlock --password-stdin --json | json token)
+check "attacker: --answer-stdin without a host secret is refused" 2 bash -c "printf 'y\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' get Draft --token '$T2' --answer-stdin"
+check "attacker: a guessed approval with no secret is refused" 2 bash -c "printf 'y\n' | env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET '$BIN' get Draft --token '$T2' --answer-stdin --approval 00"
+check "attacker: grant now costs the password (window -> needs-ui)" 3 env -u AI_VAULT_HOST -u AI_VAULT_HOST_SECRET "$BIN" grant Draft --token "$T2"
+T3="$TOKEN"
+"$BIN" revoke Draft --token "$T3" --json >/dev/null
+AP=$(python3 -c "import hmac,hashlib;print(hmac.new('$HS'.encode(),b'allow:$T3:draft:y',hashlib.sha256).hexdigest())")
+check "host: a signed relay is accepted" 0 bash -c "printf 'y\n' | '$BIN' get Draft --token '$T3' --answer-stdin --approval '$AP' --json"
+AP_N=$(python3 -c "import hmac,hashlib;print(hmac.new('$HS'.encode(),b'allow:$T3:draft:n',hashlib.sha256).hexdigest())")
+"$BIN" revoke Draft --token "$T3" --json >/dev/null
+check "a signature for 'n' with stdin 'y' is a mismatch" 4 bash -c "printf 'y\n' | '$BIN' get Draft --token '$T3' --answer-stdin --approval '$AP_N' --json"
+# H2: edit the token file (mint a grant, rename the requester)
+F="$XDG_RUNTIME_DIR/ai-vault/sessions/$T3.json"
+python3 - "$F" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1])); d['grants']={'draft':9999999999999}; d['requester']='主会话'
+json.dump(d,open(sys.argv[1],'w'))
+PY
+check "an edited token file is rejected" 5 bash -c "'$BIN' get Draft --token '$T3' --json"
+[[ -f "$F" ]] && bad "the tampered file survived" || ok "the tampered file is deleted"
+check "M1: a junk file in the sessions dir is swept on the next call" 0 "$BIN" path --json
+
+echo "== sealed Bitwarden session (M4) =="
+check "switch bitwarden.unlock to never" 0 "$BIN" settings bitwarden.unlock never --json
+check "store a bw session key" 0 bash -c "printf 'BW_BEARER_TOKEN_PLAINTEXT' | '$BIN' bw-session put --json"
+grep -q 'BW_BEARER_TOKEN_PLAINTEXT' "$AI_VAULT_DIR/bitwarden.session.json" && bad "the bw key is plaintext on disk" || ok "the bw key is not plaintext on disk"
+[[ -f "$AI_VAULT_DIR/.wrap" ]] && ok "a wrap key exists" || bad "no wrap key"
+[[ "$(stat -c %a "$AI_VAULT_DIR/.wrap")" == "600" ]] && ok "the wrap key is 0600" || bad "the wrap key is not 0600"
+"$BIN" bw-session get --json | grep -q 'BW_BEARER_TOKEN_PLAINTEXT' && ok "bw-session get unseals it" || bad "bw-session get cannot unseal"
+mv "$AI_VAULT_DIR/.wrap" "$TMP/wrap.bak"
+check "without the wrap key the session does not open" 1 "$BIN" bw-session get
+mv "$TMP/wrap.bak" "$AI_VAULT_DIR/.wrap"
+"$BIN" settings bitwarden.unlock session --json >/dev/null
+
+echo "== rekey (L2) =="
+OLD_N=$(python3 -c "import json;print(json.load(open('$AI_VAULT_DIR/store.json'))['kdf']['N'])")
+check "rekey with the password" 0 bash -c "printf 'correct horse' | '$BIN' rekey --password-stdin --json"
+NEW_N=$(python3 -c "import json;print(json.load(open('$AI_VAULT_DIR/store.json'))['kdf']['N'])")
+[[ "$NEW_N" == "131072" ]] && ok "scrypt N raised ($OLD_N -> $NEW_N)" || bad "kdf N is $NEW_N after rekey"
+check "the store still opens with the same password" 0 bash -c "printf 'correct horse' | '$BIN' unlock --password-stdin --json"
+
 echo "== lock / audit =="
 check "lock drops the token" 0 "$BIN" lock --token "$TOKEN" --json
 check "a dropped token no longer works" 5 "$BIN" list --token "$TOKEN"
@@ -107,7 +170,7 @@ python3 - "$TMP/audit" <<'PY' && ok "the audit log records events without values
 import json,sys
 entries = json.load(open(sys.argv[1]))["entries"]
 events = {e["event"] for e in entries}
-for want in ("init", "unlock", "unlock_failed", "add", "grant", "read_deny", "read_allow", "remove", "import", "lock"):
+for want in ("init", "unlock", "unlock_failed", "add", "grant", "read_deny", "read_allow", "remove", "import", "lock", "rekey", "bw_session"):
     assert want in events, (want, events)
 assert not any("p1ssw0rd" in json.dumps(e) or "exp-pass" in json.dumps(e) for e in entries)
 PY
@@ -148,6 +211,23 @@ check "bitwarden.unlock time keeps an expiry" 0 "$BIN" settings bitwarden.unlock
 check "bw-session put in time mode" 0 bash -c "printf 'K2' | '$BIN' bw-session put --json"
 grep -q '"expiresAt": *[0-9]' "$AI_VAULT_DIR/bitwarden.session.json" && ok "time mode writes a deadline" || bad "time mode wrote no deadline"
 "$BIN" settings bitwarden.unlock session --json >/dev/null
+
+echo "== two stores share the sessions dir =="
+# A second store in another directory uses the same XDG_RUNTIME_DIR sessions
+# directory. Housekeeping of one must not delete the other's live token.
+TA=$(printf 'correct horse' | "$BIN" unlock --password-stdin --json | json token)
+check "store A: token works" 0 "$BIN" list --token "$TA" --json
+export AI_VAULT_DIR="$TMP/store2"
+printf 'other horse' | "$BIN" init --password-stdin --json >/dev/null
+TOK2=$(printf 'other horse' | "$BIN" unlock --password-stdin --json | json token)
+# B's init and unlock each ran a sweep; A's token must still be there.
+export AI_VAULT_DIR="$TMP/store"
+check "store A's token survives store B's init/unlock" 0 "$BIN" list --token "$TA" --json
+# A's calls just ran A's sweep; B's token must still be there.
+export AI_VAULT_DIR="$TMP/store2"
+check "store B's token survives store A's calls" 0 "$BIN" list --token "$TOK2" --json
+"$BIN" lock --token "$TOK2" >/dev/null
+export AI_VAULT_DIR="$TMP/store"
 
 echo "== doctor =="
 check "doctor runs" 0 "$BIN" doctor --json

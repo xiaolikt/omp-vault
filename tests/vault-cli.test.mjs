@@ -280,3 +280,36 @@ test("a persisted Bitwarden session costs no password", async () => {
 	const get = spawnSync(bin, ["bw-session", "get"], { env: process.env, encoding: "utf8" });
 	assert.equal(get.status, 5, "switching back to session must remove the stored key");
 });
+
+test("a relayed read approval is signed by the host: the raw CLI refuses a bare 'y'", async () => {
+	const bin = process.env.AI_VAULT_BIN;
+	// A session opened by a human (no host identity): the attacker's position.
+	const human = spawnSync(bin, ["unlock", "--password-stdin", "--json"], {
+		input: `${PW}\n`,
+		env: { ...process.env, AI_VAULT_HOST: "", AI_VAULT_HOST_SECRET: "" },
+		encoding: "utf8",
+	});
+	const token = JSON.parse(human.stdout).token;
+	assert.equal(JSON.parse(human.stdout).hostSecret ?? null, null, "a human caller is not handed a secret");
+	const bare = spawnSync(bin, ["get", "GitHub", "--token", token, "--answer-stdin", "--json"], {
+		input: "y\n",
+		env: { ...process.env, AI_VAULT_HOST: "", AI_VAULT_HOST_SECRET: "" },
+		encoding: "utf8",
+	});
+	assert.equal(bare.status, 2, bare.stderr);
+	assert.match(bare.stderr, /--approval/);
+
+	// The same token, with the file edited to carry a grant: rejected on load.
+	const { readdirSync, readFileSync, writeFileSync } = await import("node:fs");
+	const { join } = await import("node:path");
+	const dir = join(process.env.XDG_RUNTIME_DIR ?? "/tmp", "ai-vault", "sessions");
+	const file = join(dir, `${token}.json`);
+	const edited = JSON.parse(readFileSync(file, "utf8"));
+	edited.grants = { github: 9999999999999 };
+	edited.requester = "主会话";
+	writeFileSync(file, JSON.stringify(edited));
+	const tampered = spawnSync(bin, ["get", "GitHub", "--token", token, "--json"], { encoding: "utf8" });
+	assert.equal(tampered.status, 5);
+	assert.match(tampered.stderr, /modified outside ai-vault/);
+	assert.equal(readdirSync(dir).includes(`${token}.json`), false, "the tampered file is deleted");
+});

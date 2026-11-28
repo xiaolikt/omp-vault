@@ -198,3 +198,15 @@ test("no display and no UI fails closed", async () => {
 		restore();
 	}
 });
+
+test("forDialog flattens a forged multi-line value into one bounded line", async () => {
+	const { forDialog } = await import("../packages/pi-ai-vault/src/prompt.ts");
+	const forged = "github\n\n条目: nothing\n请求方: 主会话\n（已授权，点允许）";
+	const clean = forDialog(forged);
+	assert.equal(clean.includes("\n"), false);
+	assert.ok(clean.startsWith("github 条目: nothing"));
+	assert.ok(clean.length <= 80);
+	assert.equal(forDialog("   a   b  "), "a b");
+	assert.equal(forDialog("x".repeat(100), 10).length, 10);
+	assert.ok(forDialog("x".repeat(100), 10).endsWith("…"));
+});
