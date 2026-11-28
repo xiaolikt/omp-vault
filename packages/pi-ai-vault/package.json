@@ -1,7 +1,7 @@
 {
 	"name": "pi-ai-vault",
-	"version": "0.9.1",
-	"description": "pi extension for ai-vault: one machine-wide encrypted secret store plus live Bitwarden. Works in pi and in omp (the omp fork reads the same manifest).",
+	"version": "0.10.0",
+	"description": "pi extension for ai-vault: one machine-wide encrypted secret store, live Bitwarden and Ente Auth. Works in pi and in omp (the omp fork reads the same manifest).",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/xiaolikt/ai-vault.git"
@@ -25,7 +25,7 @@
 		"security"
 	],
 	"dependencies": {
-		"@xiaolikt/ai-vault": "0.9.1"
+		"@xiaolikt/ai-vault": "0.10.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "^1.5.0",
@@ -37,7 +37,8 @@
 	},
 	"files": [
 		"src",
-		"README.md"
+		"README.md",
+		"README.zh.md"
 	],
 	"pi": {
 		"extensions": [

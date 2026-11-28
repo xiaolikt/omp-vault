@@ -1,3 +1,4 @@
+import { tr } from "./i18n.js";
 /**
  * ai-vault — the pi/omp extension.
  *
@@ -100,8 +101,8 @@ interface Scope {
 const cli = new VaultCli();
 
 const CLI_MISSING =
-	"ai-vault CLI 没找到。装一次就有全机共享的库：cargo install --path <repo>/crates/ai-vault（或用 AI_VAULT_BIN 指向编译好的二进制）";
-const NOT_INITIALIZED = "本地库还没初始化 — 运行 /vault init";
+	tr("ai-vault CLI not found. Install it once for a machine-wide store: cargo install --path <repo>/crates/ai-vault (or point AI_VAULT_BIN at a compiled binary)", "ai-vault CLI 没找到。装一次就有全机共享的库：cargo install --path <repo>/crates/ai-vault（或用 AI_VAULT_BIN 指向编译好的二进制）");
+const NOT_INITIALIZED = tr("the local store is not initialised — run /vault init", "本地库还没初始化 — 运行 /vault init");
 const LOCKED = "local vault is locked (no master password entered, or the window was cancelled)";
 
 const dialogs = (ctx: Ctx): PromptHost => ctx as unknown as PromptHost;
@@ -216,9 +217,9 @@ async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Pro
 				result = await attempt();
 			} catch (error) {
 				if (!(error instanceof CliError) || !error.needsUi) throw error;
-				const password = await promptSecret(dialogs(ctx), "ai-vault · 解锁", "本地库主密码", signal);
+				const password = await promptSecret(dialogs(ctx), tr("ai-vault · unlock", "ai-vault · 解锁"), tr("local store master password", "本地库主密码"), signal);
 				if (!password) {
-					if (!signal?.aborted) note(ctx, "没有输入主密码（窗口已取消，或没有桌面/界面）", "warning");
+					if (!signal?.aborted) note(ctx, tr("no master password entered (the window was cancelled, or there is no desktop/UI)", "没有输入主密码（窗口已取消，或没有桌面/界面）"), "warning");
 					return false;
 				}
 				result = await attempt(password);
@@ -237,7 +238,7 @@ async function ensureUnlocked(scope: Scope, ctx: Ctx, signal?: AbortSignal): Pro
 			return true;
 		} catch (error) {
 			if (error instanceof CliError && error.auth) {
-				note(ctx, "ai-vault: 主密码错误", "error");
+				note(ctx, tr("ai-vault: wrong master password", "ai-vault: 主密码错误"), "error");
 				return false;
 			}
 			if (error instanceof CliError && /not initialized/i.test(error.message)) {
@@ -358,8 +359,8 @@ async function bitwardenFallback(
 	const label = `${hit.name}${hit.username ? `  user:${hit.username}` : ""}`;
 	const allow = await confirmWindow(
 		dialogs(ctx),
-		"pi-ai-vault · Bitwarden 里找到",
-		`本地库没有「${forDialog(name)}」，Bitwarden 里有：\n${forDialog(label)}\n\n读取这一次吗？`,
+		tr("pi-ai-vault · found in Bitwarden", "pi-ai-vault · Bitwarden 里找到"),
+		tr(`Not in the local store as "${forDialog(name)}」，Bitwarden 里yes：\n${forDialog(label)}\n\n读取这一次吗？`, `本地库没有「${forDialog(name)}」，Bitwarden 里有：\n${forDialog(label)}\n\n读取这一次吗？`),
 		signal,
 	);
 	if (!allow) return fail(`user denied reading "${hit.name}" from Bitwarden — do not retry`, true);
@@ -367,8 +368,8 @@ async function bitwardenFallback(
 
 	const confirmed = await confirmWindow(
 		dialogs(ctx),
-		"pi-ai-vault · 导入到 ai-vault",
-		`把「${forDialog(hit.name)}」写进 ai-vault 吗？\n\n允许 → 以后直接读本地库（按当前解锁模式，可能免密）\n拒绝 → 只用这一次，不写入本地库`,
+		tr("pi-ai-vault · import into ai-vault", "pi-ai-vault · 导入到 ai-vault"),
+		tr(`Write "${forDialog(hit.name)}」写进 ai-vault 吗？\n\nAllow → read from the local store from now on (no password under the current unlock policy)\nDeny → use it once only; nothing is written to the local store`, `把「${forDialog(hit.name)}」写进 ai-vault 吗？\n\n允许 → 以后直接读本地库（按当前解锁模式，可能免密）\n拒绝 → 只用这一次，不写入本地库`),
 		signal,
 	);
 	return confirmed ? importIt() : asValue("bitwarden-once");
@@ -407,9 +408,9 @@ function vaultGetTool(scope: Scope, bw: BwState): ToolDefinition<typeof vaultGet
 						const sub = subagentId(ctx);
 						const allowed = await confirmWindow(
 							dialogs(ctx),
-							"ai-vault · 读取本地密码",
-							`条目: ${forDialog(params.name)}\n请求方: ${sub ? `子代理 ${forDialog(sub, 32)}` : "主会话"}\n原因: ${forDialog(params.reason ?? "(未说明)", 120)}\n\n` +
-								"允许后 5 分钟内同一请求方可再次读取。密码会进入对话。",
+							tr("ai-vault · read local password", "ai-vault · 读取本地密码"),
+							tr(`Entry: ${forDialog(params.name)}\nRequester: ${sub ? `subagent ${forDialog(sub, 32)}` : "main session"}\nReason: ${forDialog(params.reason ?? "(none given)", 120)}\n\n`, `条目: ${forDialog(params.name)}\n请求方: ${sub ? `子代理 ${forDialog(sub, 32)}` : "主会话"}\n原因: ${forDialog(params.reason ?? "(未说明)", 120)}\n\n`) +
+								tr("Allowing lets the same requester read it again for 5 minutes. The password enters the conversation.", "允许后 5 分钟内同一请求方可再次读取。密码会进入对话。"),
 							signal,
 						);
 						// Relaying is our privilege as the host: sign the answer under the
@@ -518,7 +519,7 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 	if (!(await ensureUnlocked(scope, ctx, req.signal))) return LOCKED;
 	let name = req.name?.trim() ?? "";
 	if (!name) {
-		const entered = await promptText(dialogs(ctx), "ai-vault · 新条目", "名称", req.signal);
+		const entered = await promptText(dialogs(ctx), tr("ai-vault · new entry", "ai-vault · 新条目"), tr("name", "名称"), req.signal);
 		name = entered?.trim() ?? "";
 	}
 	if (!name) return "cancelled: no entry name";
@@ -542,16 +543,16 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 			}
 			if (error.needsUi === "confirm") {
 				const meta = [
-					req.username?.trim() ? `用户名: ${forDialog(req.username, 60)}` : "",
+					req.username?.trim() ? tr(`Username: ${forDialog(req.username, 60)}`, `用户名: ${forDialog(req.username, 60)}`) : "",
 					req.uri?.trim() ? `URI: ${forDialog(req.uri, 120)}` : "",
-					req.notes?.trim() ? `备注: ${forDialog(req.notes, 120)}` : "",
+					req.notes?.trim() ? tr(`Notes: ${forDialog(req.notes, 120)}`, `备注: ${forDialog(req.notes, 120)}`) : "",
 				]
 					.filter(Boolean)
 					.join("\n");
 				const ok = await confirmWindow(
 					dialogs(ctx),
-					"ai-vault · 保存到本地库",
-					`保存条目「${forDialog(name)}」。${meta ? `\n${meta}` : ""}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`,
+					tr("ai-vault · save to local store", "ai-vault · 保存到本地库"),
+					tr(`Save the entry "${forDialog(name)}".${meta ? `\n${meta}` : ""}\nA window opens next for you to type the password. It never enters the conversation.`, `保存条目「${forDialog(name)}」。${meta ? `\n${meta}` : ""}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。`),
 					req.signal,
 				);
 				if (!ok) return `user denied saving "${name}"`;
@@ -559,12 +560,12 @@ async function saveLocalEntry(scope: Scope, ctx: Ctx, req: SaveRequest): Promise
 				continue;
 			}
 			if (error.needsUi === "text") {
-				const entered = await promptText(dialogs(ctx), `ai-vault · ${name}`, "用户名（可留空）", req.signal);
+				const entered = await promptText(dialogs(ctx), `ai-vault · ${name}`, tr("username (optional)", "用户名（可留空）"), req.signal);
 				if (entered === undefined) return "cancelled";
 				args.push("--username", entered);
 				continue;
 			}
-			const password = await promptSecret(dialogs(ctx), "ai-vault · 密码", name, req.signal);
+			const password = await promptSecret(dialogs(ctx), tr("ai-vault · password", "ai-vault · 密码"), name, req.signal);
 			if (!password) return "cancelled: no password entered";
 			args.push("--password-stdin");
 			stdin = `${password}\n`;
@@ -594,11 +595,11 @@ async function importBitwarden(
 		.slice(0, 15)
 		.map((item) => `• ${item.name}${item.username ? `  user:${item.username}` : ""}${item.uri ? `  ${item.uri}` : ""}`)
 		.join("\n");
-	const more = meta.length > 15 ? `\n… 还有 ${meta.length - 15} 条` : "";
+	const more = meta.length > 15 ? tr(`\n… 还yes ${meta.length - 15} 条`, `\n… 还有 ${meta.length - 15} 条`) : "";
 	const allowed = await confirmWindow(
 		dialogs(ctx),
-		"ai-vault · 从 Bitwarden 导入",
-		`匹配 ${meta.length} 条。其中带密码的登录项会写入本地加密库，同名条目会被更新。\n\n${shown}${more}\n\n允许导入？`,
+		tr("ai-vault · import from Bitwarden", "ai-vault · 从 Bitwarden 导入"),
+		tr(`Matched ${meta.length} 条。其中带密码的登录项会写入本地加密库，同名条目会被更新。\n\n${shown}${more}\n\nImport?`, `匹配 ${meta.length} 条。其中带密码的登录项会写入本地加密库，同名条目会被更新。\n\n${shown}${more}\n\n允许导入？`),
 		signal,
 	);
 	if (!allowed) return { text: "user denied the Bitwarden import", ok: false, count: 0 };
@@ -633,21 +634,21 @@ async function importBitwarden(
 // ---------------------------------------------------------------- commands
 
 const HELP = [
-	"/vault init                        创建全机共享的本地加密库（弹出窗口设置主密码）",
-	"/vault unlock | lock               解锁 / 锁定（清空本会话的授权）",
-	"/vault mode [never|time|session]   查看/切换解锁模式（切换要主密码）",
-	"/vault settings [键 值]            查看/修改设置（vault.unlock、bitwarden.*、ente.* …）",
-	"/vault ente-key                    保存 ente 的 ENTE_CLI_VAULT_KEY（免钥匙串/免登录）",
-	"/vault status                      状态与授权剩余时间",
-	"/vault list                        本地条目元数据",
-	"/vault add [名称]                  新增本地条目（用户名、密码在弹窗里输入）",
-	'/vault remove <名称>               删除本地条目（带空格的名称加引号："GitHub (2)"）',
-	"/vault grant <名称> [分钟]         手动授权读取（默认 5 分钟，上限 60）",
-	"/vault revoke <名称|all>           撤销授权",
-	"/vault audit [n]                   最近 n 条审计（默认 30）",
-	"/vault import <bitwarden.json>     从 Bitwarden 未加密 JSON 导出导入",
-	"/vault import-bw [搜索词]          直接从 bw CLI 导入登录项（先弹窗确认）",
-	"/bw status|unlock|lock|clear       在线 Bitwarden 会话（见 bw_* 工具）",
+	tr("/vault init                        create the machine-wide encrypted store (a dialog sets the master password)", "/vault init                        创建全机共享的本地加密库（弹出窗口设置主密码）"),
+	tr("/vault unlock | lock               unlock / lock (clears this session's grants)", "/vault unlock | lock               解锁 / 锁定（清空本会话的授权）"),
+	tr("/vault mode [never|time|session]   show/switch the unlock policy (switching needs the master password)", "/vault mode [never|time|session]   查看/切换解锁模式（切换要主密码）"),
+	tr("/vault settings [key value]        show/change settings (vault.unlock, bitwarden.*, ente.* …)", "/vault settings [键 值]            查看/修改设置（vault.unlock、bitwarden.*、ente.* …）"),
+	tr("/vault ente-key                    save Ente's ENTE_CLI_VAULT_KEY (no keychain, no login)", "/vault ente-key                    保存 ente 的 ENTE_CLI_VAULT_KEY（免钥匙串/免登录）"),
+	tr("/vault status                      state and grants left", "/vault status                      状态与授权剩余时间"),
+	tr("/vault list                        local entry metadata", "/vault list                        本地条目元数据"),
+	tr("/vault add [name]                  add a local entry (username and password typed in a dialog)", "/vault add [名称]                  新增本地条目（用户名、密码在弹窗里输入）"),
+	tr('/vault remove <name>               delete an entry (quote names with spaces: "GitHub (2)")', '/vault remove <名称>               删除本地条目（带空格的名称加引号："GitHub (2)"）'),
+	tr("/vault grant <name> [minutes]      a standing read grant (default 5 min, max 60)", "/vault grant <名称> [分钟]         手动授权读取（默认 5 分钟，上限 60）"),
+	tr("/vault revoke <name|all>           revoke grants", "/vault revoke <名称|all>           撤销授权"),
+	tr("/vault audit [n]                   the last n audit lines (default 30)", "/vault audit [n]                   最近 n 条审计（默认 30）"),
+	tr("/vault import <bitwarden.json>     import an unencrypted Bitwarden JSON export", "/vault import <bitwarden.json>     从 Bitwarden 未加密 JSON 导出导入"),
+	tr("/vault import-bw [search]          import logins straight from the bw CLI (asks first)", "/vault import-bw [搜索词]          直接从 bw CLI 导入登录项（先弹窗确认）"),
+	tr("/bw status|unlock|lock|clear       the live Bitwarden session (see the bw_* tools)", "/bw status|unlock|lock|clear       在线 Bitwarden 会话（见 bw_* 工具）"),
 ].join("\n");
 
 /** Split a command line into words; quotes keep a name such as "GitHub (2)" intact. */
@@ -666,7 +667,7 @@ async function initStore(scope: Scope, ctx: Ctx, label: string): Promise<void> {
 		scope.token = result.token;
 		scope.items = 0;
 		setStatus(ctx, scope);
-		note(ctx, `ai-vault 已创建: ${cli.dir}/store.json`);
+		note(ctx, tr(`ai-vault created: ${cli.dir}/store.json`, `ai-vault 已创建: ${cli.dir}/store.json`));
 	};
 	try {
 		finish(await cli.open<UnlockResult>("init", ["--requester", label]));
@@ -681,14 +682,14 @@ async function initStore(scope: Scope, ctx: Ctx, label: string): Promise<void> {
 			return;
 		}
 	}
-	const pass = await promptSecret(dialogs(ctx), "ai-vault · 创建主密码", "至少 8 位");
+	const pass = await promptSecret(dialogs(ctx), tr("ai-vault · set master password", "ai-vault · 创建主密码"), tr("at least 8 characters", "至少 8 位"));
 	if (!pass || pass.length < 8) {
-		note(ctx, "已取消，或密码短于 8 位", "warning");
+		note(ctx, tr("cancelled, or the password is shorter than 8 characters", "已取消，或密码短于 8 位"), "warning");
 		return;
 	}
-	const again = await promptSecret(dialogs(ctx), "ai-vault · 确认主密码", "再输入一次");
+	const again = await promptSecret(dialogs(ctx), tr("ai-vault · confirm master password", "ai-vault · 确认主密码"), tr("type it again", "再输入一次"));
 	if (again !== pass) {
-		note(ctx, "两次主密码不一致，已取消", "warning");
+		note(ctx, tr("the two passwords do not match; cancelled", "两次主密码不一致，已取消"), "warning");
 		return;
 	}
 	try {
@@ -701,20 +702,20 @@ async function initStore(scope: Scope, ctx: Ctx, label: string): Promise<void> {
 function settingsText(s: Settings): string {
 	const persisted = s.bitwarden.persisted
 		? s.bitwarden.expiresAt
-			? `有（${Math.max(0, Math.round((s.bitwarden.expiresAt - Date.now()) / 60_000))} 分钟后过期）`
-			: "有（不过期）"
-		: "无";
+			? tr(`yes（${Math.max(0, Math.round((s.bitwarden.expiresAt - Date.now()) / 60_000))} 分钟后过期）`, `有（${Math.max(0, Math.round((s.bitwarden.expiresAt - Date.now()) / 60_000))} 分钟后过期）`)
+			: tr("yes (no expiry)", "有（不过期）")
+		: tr("no", "无");
 	return [
 		`vault.unlock: ${s.vault.unlock}    (never | time | session)`,
-		`vault.hours: ${s.vault.hours}    (time 模式用)`,
-		`vault 机器级会话: ${s.vault.auto ? "有（免密）" : "无"}`,
+		tr(`vault.hours: ${s.vault.hours}    (time mode)`, `vault.hours: ${s.vault.hours}    (time 模式用)`),
+		tr(`vault machine-wide session: ${s.vault.auto ? "yes (no password)" : "no"}`, `vault 机器级会话: ${s.vault.auto ? "有（免密）" : "无"}`),
 		`bitwarden.unlock: ${s.bitwarden.unlock}    (never | time | session)`,
 		`bitwarden.hours: ${s.bitwarden.hours}`,
 		`bitwarden.import: ${s.bitwarden.import}    (ask | always | never)`,
-		`bitwarden 已落盘的会话: ${persisted}`,
+		tr(`bitwarden persisted session: ${persisted}`, `bitwarden 已落盘的会话: ${persisted}`),
 		`ente.unlock: ${s.ente.unlock}    (never | time | session)`,
 		`ente.hours: ${s.ente.hours}`,
-		`ente 已落盘的密钥: ${s.ente.persisted ? "有" : "无"}`,
+		tr(`ente persisted key: ${s.ente.persisted ? "yes" : "no"}`, `ente 已落盘的密钥: ${s.ente.persisted ? "有" : "无"}`),
 	].join("\n");
 }
 
@@ -739,7 +740,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 			case "lock": {
 				await lockNow(scope);
 				setStatus(ctx, scope);
-				note(ctx, "本地库已锁定，授权已清空");
+				note(ctx, tr("the local store is locked; grants cleared", "本地库已锁定，授权已清空"));
 				return;
 			}
 			case "status": {
@@ -754,10 +755,10 @@ function commandHandler(scope: Scope, bw: BwState) {
 						: "never";
 					const how =
 						status.mode === "never"
-							? "never（免密）"
+							? tr("never (no password)", "never（免密）")
 							: status.mode === "time"
-								? `time（每 ${status.hours}h 要一次密码）`
-								: "session（每个会话一次）";
+								? tr(`time (the password every ${status.hours}h)`, `time（每 ${status.hours}h 要一次密码）`)
+								: tr("session (once per session)", "session（每个会话一次）");
 					const lines = [
 						`store: ${cli.dir}/store.json`,
 						`session: ${status.requester}`,
@@ -789,16 +790,16 @@ function commandHandler(scope: Scope, bw: BwState) {
 			case "ente-key": {
 				// Ente's unattended key: generated by `ente vault key generate`.
 				// Saved sealed, so `ente.unlock = never | time` can use it.
-				const key = await promptSecret(dialogs(ctx), "ai-vault · Ente 密钥", "ente vault key generate 输出的密钥");
+				const key = await promptSecret(dialogs(ctx), tr("ai-vault · Ente key", "ai-vault · Ente 密钥"), tr("the key printed by ente vault key generate", "ente vault key generate 输出的密钥"));
 				if (!key) {
-					note(ctx, "已取消", "warning");
+					note(ctx, tr("cancelled", "已取消"), "warning");
 					return;
 				}
 				try {
 					const args = ["ente-session", "put"];
 					await cli.run(args, { stdin: key });
 					forgetSettings();
-					note(ctx, "已保存（封存）。现在可以设置 /vault settings ente.unlock never");
+					note(ctx, tr("saved (sealed). You can now set /vault settings ente.unlock never", "已保存（封存）。现在可以设置 /vault settings ente.unlock never"));
 				} catch (error) {
 					note(ctx, `ai-vault: ${describe(error)}`, "error");
 				}
@@ -820,14 +821,14 @@ function commandHandler(scope: Scope, bw: BwState) {
 					// `vault.unlock` opens its own password window (or answers
 					// needs-ui); the other keys do not prompt at all.
 					const run = await cli.withPassword(["settings", key, value], () =>
-						promptSecret(dialogs(ctx), "ai-vault · 主密码", "改变解锁模式需要验证"),
+						promptSecret(dialogs(ctx), tr("ai-vault · master password", "ai-vault · 主密码"), tr("changing the unlock policy needs verification", "改变解锁模式需要验证")),
 					);
 					forgetSettings();
 					const updated = JSON.parse(run.stdout) as Settings;
 					if (key.startsWith("vault.")) await lockNow(scope);
 					note(ctx, settingsText(updated));
 				} catch (error) {
-					note(ctx, `ai-vault: ${error instanceof CliError && error.denied ? "已取消" : describe(error)}`, "warning");
+					note(ctx, `ai-vault: ${error instanceof CliError && error.denied ? tr("cancelled", "已取消") : describe(error)}`, "warning");
 				}
 				return;
 			}
@@ -840,10 +841,10 @@ function commandHandler(scope: Scope, bw: BwState) {
 							ctx,
 							[
 								`mode: ${current.mode}`,
-								`hours: ${current.hours}（time 模式用）`,
-								`machine-wide session: ${current.auto ? "yes（免密）" : "no"}`,
+								tr(`hours: ${current.hours}(time mode)`, `hours: ${current.hours}（time 模式用）`),
+								`machine-wide session: ${current.auto ? tr("yes (no password)", "yes（免密）") : "no"}`,
 								"",
-								"/vault mode never|time|session [小时]   切换（要主密码）",
+								tr("/vault mode never|time|session [hours]   switch (needs the master password)", "/vault mode never|time|session [小时]   切换（要主密码）"),
 							].join("\n"),
 						);
 					} catch (error) {
@@ -852,13 +853,13 @@ function commandHandler(scope: Scope, bw: BwState) {
 					return;
 				}
 				if (!["never", "time", "session", "no-password"].includes(sub)) {
-					note(ctx, "用法: /vault mode [never|time|session] [小时]", "warning");
+					note(ctx, tr("usage: /vault mode [never|time|session] [hours]", "用法: /vault mode [never|time|session] [小时]"), "warning");
 					return;
 				}
 				const args = ["mode", "set", sub];
 				if (hoursArg) args.push("--hours", hoursArg);
 				try {
-					const run = await cli.withPassword(args, () => promptSecret(dialogs(ctx), "ai-vault · 主密码", "切换解锁模式"));
+					const run = await cli.withPassword(args, () => promptSecret(dialogs(ctx), tr("ai-vault · master password", "ai-vault · 主密码"), tr("switch the unlock policy", "切换解锁模式")));
 					const result = JSON.parse(run.stdout) as { mode: UnlockModeName; hours: number; auto: boolean };
 					forgetSettings();
 					await lockNow(scope);
@@ -867,13 +868,13 @@ function commandHandler(scope: Scope, bw: BwState) {
 					setStatus(ctx, scope);
 					const how =
 						result.mode === "never"
-							? "以后免密（密钥已写盘，任何能读你文件的程序都能读到库里的密码）"
+							? tr("no password from now on (the key is on disk: anything that can read your files can read every password in the store)", "以后免密（密钥已写盘，任何能读你文件的程序都能读到库里的密码）")
 							: result.mode === "time"
-								? `以后每 ${result.hours} 小时要一次密码`
-								: "以后每个会话要一次密码";
+								? tr(`the password is asked again every ${result.hours} hours from now on`, `以后每 ${result.hours} 小时要一次密码`)
+								: tr("the password is asked once per session from now on", "以后每个会话要一次密码");
 					note(ctx, `mode → ${result.mode}，${how}`);
 				} catch (error) {
-					note(ctx, `ai-vault: ${error instanceof CliError && error.denied ? "已取消" : describe(error)}`, "warning");
+					note(ctx, `ai-vault: ${error instanceof CliError && error.denied ? tr("cancelled", "已取消") : describe(error)}`, "warning");
 				}
 				return;
 			}
@@ -898,7 +899,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 				const name = rest.join(" ");
 				if (!(await ensureUnlocked(scope, ctx))) return;
 				if (!name) {
-					note(ctx, "用法: /vault remove <名称>", "warning");
+					note(ctx, tr("usage: /vault remove <name>", "用法: /vault remove <名称>"), "warning");
 					return;
 				}
 				const args = ["remove", name, "--token", scope.token!];
@@ -912,7 +913,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 						note(ctx, `ai-vault: ${describe(error)}`, error instanceof CliError && error.denied ? "warning" : "error");
 						return;
 					}
-					const sure = await confirmWindow(dialogs(ctx), "ai-vault · 删除条目", `删除「${forDialog(name)}」？删除后无法恢复。`);
+					const sure = await confirmWindow(dialogs(ctx), tr("ai-vault · delete entry", "ai-vault · 删除条目"), tr(`Delete "${forDialog(name)}"? This cannot be undone.`, `删除「${forDialog(name)}」？删除后无法恢复。`));
 					if (!sure) return;
 					try {
 						const result = await cli.json<RemovingResult>([...args, "--yes"]);
@@ -932,7 +933,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 				const minutes = rest.length > 1 && /^\d+$/.test(last) ? rest.pop() : undefined;
 				const name = rest.join(" ");
 				if (!(await ensureUnlocked(scope, ctx)) || !name) {
-					note(ctx, "先解锁；用法: /vault grant <名称> [分钟]（带空格的名称加引号）", "warning");
+					note(ctx, tr("unlock first; usage: /vault grant <name> [minutes] (quote names with spaces)", "先解锁；用法: /vault grant <名称> [分钟]（带空格的名称加引号）"), "warning");
 					return;
 				}
 				const args = ["grant", name, "--token", scope.token!];
@@ -940,7 +941,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 				try {
 					// A standing grant costs the master password, like a mode change.
 					const run = await cli.withPassword(args, () =>
-						promptSecret(dialogs(ctx), "ai-vault · 授权读取", "主密码（给这条条目 N 分钟免确认）"),
+						promptSecret(dialogs(ctx), tr("ai-vault · grant read", "ai-vault · 授权读取"), tr("master password (lets this entry be read without confirmation for N minutes)", "主密码（给这条条目 N 分钟免确认）")),
 					);
 					const result = JSON.parse(run.stdout) as { name: string; minutes: number };
 					setStatus(ctx, scope, "·granted");
@@ -957,7 +958,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 				if (target === "all") args.push("--all");
 				else if (target) args.push(target);
 				else {
-					note(ctx, "用法: /vault revoke <名称|all>", "warning");
+					note(ctx, tr("usage: /vault revoke <name|all>", "用法: /vault revoke <名称|all>"), "warning");
 					return;
 				}
 				try {
@@ -986,7 +987,7 @@ function commandHandler(scope: Scope, bw: BwState) {
 			case "import": {
 				const path = rest.join(" ");
 				if (!path) {
-					note(ctx, "用法: /vault import <bitwarden-export.json>", "warning");
+					note(ctx, tr("usage: /vault import <bitwarden-export.json>", "用法: /vault import <bitwarden-export.json>"), "warning");
 					return;
 				}
 				if (!(await ensureUnlocked(scope, ctx))) return;
@@ -1003,8 +1004,8 @@ function commandHandler(scope: Scope, bw: BwState) {
 					}
 					const sure = await confirmWindow(
 						dialogs(ctx),
-						"ai-vault · 从 Bitwarden 导入",
-						`导入 ${path} 里的 Bitwarden 登录项？同名条目会被更新。`,
+						tr("ai-vault · import from Bitwarden", "ai-vault · 从 Bitwarden 导入"),
+						tr(`Import ${path} Bitwarden logins? Same-name entries are updated.`, `导入 ${path} 里的 Bitwarden 登录项？同名条目会被更新。`),
 					);
 					if (!sure) return;
 					try {
@@ -1043,7 +1044,7 @@ export default function aiVault(pi: ExtensionAPI): void {
 	// Ente Auth: the `ente` CLI keeps its own login; these tools only read codes.
 	registerEnte(pi);
 	pi.registerCommand("vault", {
-		description: "本地密码库 + Bitwarden 导入（/vault help）",
+		description: tr("local secret store + Bitwarden import (/vault help)", "本地密码库 + Bitwarden 导入（/vault help）"),
 		handler: commandHandler(scope, bw),
 	});
 	// A transcript that starts fresh (/new, /fork) must not inherit this unlock

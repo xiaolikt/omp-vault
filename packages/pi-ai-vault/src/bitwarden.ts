@@ -56,6 +56,7 @@ import { bitwardenLogins, filterLogins, type LoginDraft } from "./import-map.js"
 import { onSessionLeave, sessionLabel, withTier } from "./host.js";
 import { confirmWindow, hasDisplay, promptSecret } from "./prompt.js";
 import { getSettingsSafe, settingsCli } from "./settings.js";
+import { tr } from "./i18n.js";
 import { scrubDeep, scrubText } from "./scrub.js";
 
 // ---------------------------------------------------------------------------
@@ -450,7 +451,7 @@ async function bwStatus(session?: string, signal?: AbortSignal): Promise<any> {
 
 /** The Bitwarden master password, in a window or the host's input dialog. */
 async function askMasterPassword(ctx: ExtensionContext | undefined, signal?: AbortSignal): Promise<string> {
-	const pw = await promptSecret(ctx, "Bitwarden · 主密码", "解锁 Bitwarden 保险库", signal);
+	const pw = await promptSecret(ctx, tr("Bitwarden · master password", "Bitwarden · 主密码"), tr("unlock the Bitwarden vault", "解锁 Bitwarden 保险库"), signal);
 	if (pw) return pw;
 	if (signal?.aborted) throw new Error("Cancelled.");
 	if (!hasDisplay() && !ctx?.hasUI) {

@@ -12,6 +12,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { lang } from "./i18n.js";
 import { fileURLToPath } from "node:url";
 
 export const EXIT = {
@@ -133,7 +134,7 @@ export class HostSecret {
 
 	/** Environment for a CLI child: marks us as the host and passes the secret. */
 	env(): Record<string, string> {
-		return { AI_VAULT_HOST: "1", AI_VAULT_HOST_SECRET: this.value };
+		return { AI_VAULT_HOST: "1", AI_VAULT_HOST_SECRET: this.value, AI_VAULT_LANG: lang() };
 	}
 
 	/** HMAC over "allow:<token>:<entry>:<y|n>", what `get --answer-stdin` expects. */

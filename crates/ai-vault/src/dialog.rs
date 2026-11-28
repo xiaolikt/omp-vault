@@ -87,9 +87,10 @@ mod mac {
 
     pub fn prompt_secret(title: &str, label: &str) -> Answer<String> {
         let script = format!(
-            "tell application \"System Events\" to display dialog \"{}\" with title \"{}\" default answer \"\" with hidden answer buttons {{\"取消\", \"OK\"}} default button \"OK\" giving up after {}",
+            "tell application \"System Events\" to display dialog \"{}\" with title \"{}\" default answer \"\" with hidden answer buttons {{\"{}\", \"OK\"}} default button \"OK\" giving up after {}",
             quote(label),
             quote(title),
+            crate::i18n::tr("Cancel", "取消"),
             DIALOG_SECONDS
         );
         let out = osascript(&script);
@@ -115,9 +116,10 @@ mod mac {
 
     pub fn prompt_text(title: &str, label: &str) -> Answer<String> {
         let script = format!(
-            "tell application \"System Events\" to display dialog \"{}\" with title \"{}\" default answer \"\" buttons {{\"取消\", \"OK\"}} default button \"OK\" giving up after {}",
+            "tell application \"System Events\" to display dialog \"{}\" with title \"{}\" default answer \"\" buttons {{\"{}\", \"OK\"}} default button \"OK\" giving up after {}",
             quote(label),
             quote(title),
+            crate::i18n::tr("Cancel", "取消"),
             DIALOG_SECONDS
         );
         let out = osascript(&script);
@@ -139,16 +141,20 @@ mod mac {
 
     pub fn confirm(title: &str, message: &str) -> Answer<bool> {
         let script = format!(
-            "tell application \"System Events\" to display dialog \"{}\" with title \"{}\" buttons {{\"拒绝\", \"允许\"}} default button \"拒绝\" giving up after {}",
+            "tell application \"System Events\" to display dialog \"{}\" with title \"{}\" buttons {{\"{}\", \"{}\"}} default button \"{}\" giving up after {}",
             quote(message),
             quote(title),
+            crate::i18n::tr("Deny", "拒绝"),
+            crate::i18n::tr("Allow", "允许"),
+            crate::i18n::tr("Deny", "拒绝"),
             DIALOG_SECONDS
         );
         let out = osascript(&script);
         if failed(&out) {
             return Answer::NoUi;
         }
-        Answer::Value(out.code == 0 && out.stdout.contains("button returned:允许"))
+        let allow = crate::i18n::tr("Allow", "允许");
+        Answer::Value(out.code == 0 && out.stdout.contains(&format!("button returned:{allow}")))
     }
 }
 
@@ -177,7 +183,7 @@ $f.Controls.Add($box)
 $ok = New-Object System.Windows.Forms.Button
 $ok.Text = 'OK'; $ok.DialogResult = 'OK'; $ok.Left = 280; $ok.Top = 115; $f.AcceptButton = $ok
 $cancel = New-Object System.Windows.Forms.Button
-$cancel.Text = '取消'; $cancel.DialogResult = 'Cancel'; $cancel.Left = 370; $cancel.Top = 115; $f.CancelButton = $cancel
+$cancel.Text = $env:AI_VAULT_DLG_CANCEL; $cancel.DialogResult = 'Cancel'; $cancel.Left = 370; $cancel.Top = 115; $f.CancelButton = $cancel
 $f.Controls.Add($ok); $f.Controls.Add($cancel)
 $f.Add_Shown({ $box.Focus() })
 if ($f.ShowDialog() -eq 'OK') { [Console]::Out.Write($box.Text); exit 0 } else { exit 1 }
@@ -203,6 +209,7 @@ if ($r -eq 'Yes') { exit 0 } else { exit 1 }
             .env("AI_VAULT_DLG_TITLE", title)
             .env("AI_VAULT_DLG_TEXT", text)
             .env("AI_VAULT_DLG_SECRET", if secret { "1" } else { "0" })
+            .env("AI_VAULT_DLG_CANCEL", crate::i18n::tr("Cancel", "取消"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -497,8 +504,8 @@ fn confirm_zenity(title: &str, message: &str) -> Answer<bool> {
         arg("--no-markup"),
         arg("--width=520"),
         arg("--default-cancel"),
-        arg("--ok-label=允许"),
-        arg("--cancel-label=拒绝"),
+        arg(format!("--ok-label={}", crate::i18n::tr("Allow", "允许"))),
+        arg(format!("--cancel-label={}", crate::i18n::tr("Deny", "拒绝"))),
         timeout_arg(),
     ]);
     if failed_to_open(&z) {

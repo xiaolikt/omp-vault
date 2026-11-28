@@ -1,3 +1,4 @@
+import { tr } from "./i18n.js";
 /**
  * Ente CLI client.
  *
@@ -48,7 +49,7 @@ export class EnteError extends Error {
 }
 
 const ENTE_MISSING =
-	"ente CLI 没找到（要的是 ente.com 的 `ente`，0.4+）。装好后先 `ente account login --app auth` 登录一次；也可以用 ENTE_BIN 指到二进制。";
+	tr("ente CLI not found (that is ente.com's `ente`, 0.4+). After installing it, run `ente account login --app auth` once; ENTE_BIN can point at the binary.", "ente CLI 没找到（要的是 ente.com 的 `ente`，0.4+）。装好后先 `ente account login --app auth` 登录一次；也可以用 ENTE_BIN 指到二进制。");
 
 /** `ENTE_BIN`, then PATH, then the usual install spots. */
 export function resolveEnte(): string | undefined {
@@ -256,8 +257,8 @@ export function registerEnte(pi: ExtensionAPI): void {
 				}
 				const ok = await confirmWindow(
 					ctx as unknown as Parameters<typeof confirmWindow>[0],
-					"pi-ai-vault · Ente Auth 验证码",
-					`条目: ${item.name}\n签发方: ${item.issuer || "-"}\n账号: ${item.accountName || "-"}\n\n读取当前验证码？（会进入对话）`,
+					tr("pi-ai-vault · Ente Auth code", "pi-ai-vault · Ente Auth 验证码"),
+					tr(`Entry: ${item.name}\n签发方: ${item.issuer || "-"}\n账号: ${item.accountName || "-"}\n\nRead the current code? (It enters the conversation.)`, `条目: ${item.name}\n签发方: ${item.issuer || "-"}\n账号: ${item.accountName || "-"}\n\n读取当前验证码？（会进入对话）`),
 					signal,
 				);
 				if (!ok) {

@@ -8,6 +8,7 @@
  * instead. Upstream pi shows typed text in the clear; OMP masks it.
  */
 import { spawn, spawnSync } from "node:child_process";
+import { tr } from "./i18n.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -190,8 +191,8 @@ export async function confirmWindow(
 				"--no-markup",
 				"--width=520",
 				"--default-cancel",
-				"--ok-label=允许",
-				"--cancel-label=拒绝",
+				`--ok-label=${tr("Allow", "允许")}`,
+				`--cancel-label=${tr("Deny", "拒绝")}`,
 				`--timeout=${DIALOG_MS / 1000}`,
 			],
 			signal,

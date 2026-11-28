@@ -12,6 +12,7 @@ mod cli;
 mod config;
 mod crypto;
 mod dialog;
+mod i18n;
 mod import;
 mod paths;
 mod perms;

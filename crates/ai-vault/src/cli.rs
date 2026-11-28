@@ -12,6 +12,7 @@ use crate::sealed::{self, Kind};
 use crate::config::{self, ImportPolicy, UnlockMode, UnlockPolicy};
 use crate::crypto::{self, Kdf};
 use crate::dialog::{self, Answer};
+use crate::i18n::{tr, tr_owned};
 use crate::import;
 use crate::paths::{Paths, GRANT_MS_DEFAULT, GRANT_MS_MAX, IDLE_MS_DEFAULT};
 use crate::session::{self, Session, StoreLock};
@@ -590,7 +591,7 @@ fn rekey(paths: &Paths, out: &Out, password_stdin: bool) -> Outcome {
     let password = if password_stdin {
         read_password()?
     } else {
-        ask_password("ai-vault · 升级密钥参数", "主密码")?
+        ask_password(tr("ai-vault · upgrade key parameters", "ai-vault · 升级密钥参数"), tr("master password", "主密码"))?
     };
     let (items, _old_key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
         crypto::OpenError::WrongPassword => Fault::Auth("wrong master password".into()),
@@ -659,11 +660,11 @@ fn init(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_mi
     let password = if password_stdin {
         read_password()?
     } else {
-        let first = ask_password("ai-vault · 创建主密码", "至少 8 位")?;
+        let first = ask_password(tr("ai-vault · set master password", "ai-vault · 创建主密码"), tr("at least 8 characters", "至少 8 位"))?;
         if first.len() < 8 {
             return Err(Fault::Usage("the master password must be at least 8 characters".into()));
         }
-        let again = ask_password("ai-vault · 确认主密码", "再输入一次")?;
+        let again = ask_password(tr("ai-vault · confirm master password", "ai-vault · 确认主密码"), tr("type it again", "再输入一次"))?;
         if again != first {
             return Err(Fault::Denied("the two passwords do not match".into()));
         }
@@ -714,7 +715,7 @@ fn unlock(paths: &Paths, out: &Out, password_stdin: bool, requester: &str, idle_
     let password = if password_stdin {
         read_password()?
     } else {
-        ask_password("ai-vault · 解锁", "本地库主密码")?
+        ask_password(tr("ai-vault · unlock", "ai-vault · 解锁"), tr("local store master password", "本地库主密码"))?
     };
     let (items, key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
         crypto::OpenError::WrongPassword => {
@@ -794,29 +795,30 @@ fn settings_value(config: &config::Config, paths: &Paths) -> serde_json::Value {
 }
 
 fn settings_human(config: &config::Config, paths: &Paths) -> String {
+    let yes_no = |yes: bool| tr(if yes { "yes" } else { "no" }, if yes { "有" } else { "无" });
     [
         format!("vault.unlock: {}   (never | time | session)", config.unlock.mode.as_str()),
-        format!("vault.hours: {}   (time 模式)", config.unlock.hours),
-        format!(
-            "vault 机器级会话: {}",
-            if paths.auto_session().exists() { "有（免密）" } else { "无" }
-        ),
+        format!("vault.hours: {}{}", config.unlock.hours, tr("   (time mode)", "   (time 模式)")),
+        format!("{} {}", tr("vault machine-wide session:", "vault 机器级会话:"), if paths.auto_session().exists() { tr("yes (no password)", "有（免密）") } else { tr("no", "无") }),
         format!("bitwarden.unlock: {}   (never | time | session)", config.bitwarden.store.unlock.as_str()),
         format!("bitwarden.hours: {}", config.bitwarden.store.hours),
         format!("bitwarden.import: {}   (ask | always | never)", config.bitwarden.import.as_str()),
+        {
+            let bw = match sealed::load(paths, Kind::Bitwarden).ok().flatten() {
+                Some(saved) => match saved.expires_at {
+                    Some(at) => tr_owned(
+                        format!("yes (expires in {} min)", ((at - session::now_ms()) / 60_000).max(0)),
+                        format!("有（{} 分钟后过期）", ((at - session::now_ms()) / 60_000).max(0)),
+                    ),
+                    None => tr("yes (no expiry)", "有（不过期）").to_string(),
+                },
+                None => tr("no", "无").to_string(),
+            };
+            format!("{} {}", tr("bitwarden persisted session:", "bitwarden 已落盘的会话:"), bw)
+        },
         format!("ente.unlock: {}   (never | time | session)", config.ente.unlock.as_str()),
         format!("ente.hours: {}", config.ente.hours),
-        format!("ente 已落盘的密钥: {}", if sealed::load(paths, Kind::Ente).ok().flatten().is_some() { "有" } else { "无" }),
-        format!(
-            "bitwarden 已落盘的会话: {}",
-            match sealed::load(paths, Kind::Bitwarden).ok().flatten() {
-                Some(saved) => match saved.expires_at {
-                    Some(at) => format!("有（{} 后过期）", ((at - session::now_ms()) / 60_000).max(0)),
-                    None => "有（不过期）".to_string(),
-                },
-                None => "无".to_string(),
-            }
-        ),
+        format!("{} {}", tr("ente persisted key:", "ente 已落盘的密钥:"), yes_no(sealed::load(paths, Kind::Ente).ok().flatten().is_some())),
     ]
     .join("\n")
 }
@@ -865,7 +867,7 @@ fn settings(
             let password = if password_stdin {
                 read_password()?
             } else {
-                ask_password("ai-vault · 主密码", "切换解锁模式")?
+                ask_password(tr("ai-vault · master password", "ai-vault · 主密码"), tr("switching the unlock policy", "切换解锁模式"))?
             };
             let (_, vault_key) = crypto::open_with_passphrase(&store, &password).map_err(|e| match e {
                 crypto::OpenError::WrongPassword => Fault::Auth("wrong master password".into()),
@@ -1124,10 +1126,17 @@ fn get(
         // The window is what the user approves: no caller-supplied text may
         // break out of its own line here.
         let message = format!(
-            "条目: {}\n请求方: {}\n原因: {}\n\n允许后 5 分钟内同一请求方可再次读取。密码会进入对话。",
+            "{} {}\n{} {}\n{} {}\n\n{}",
+            tr("Entry:", "条目:"),
             dialog::for_dialog(&item.name, 80),
+            tr("Requester:", "请求方:"),
             dialog::for_dialog(&session.requester, 40),
-            dialog::for_dialog(reason.unwrap_or("(未说明)"), 120)
+            tr("Reason:", "原因:"),
+            dialog::for_dialog(reason.unwrap_or(&tr("(none given)", "(未说明)").to_string()), 120),
+            tr(
+                "Allowing lets the same requester read it again for 5 minutes. The password enters the conversation.",
+                "允许后 5 分钟内同一请求方可再次读取。密码会进入对话。"
+            )
         );
         let approved = if answer_stdin {
             // Relaying an answer is a host privilege: it must be signed with the
@@ -1148,7 +1157,7 @@ fn get(
             }
             answer
         } else {
-            match dialog::confirm("ai-vault · 读取本地密码", &message) {
+            match dialog::confirm(tr("ai-vault · read local password", "ai-vault · 读取本地密码"), &message) {
                 Answer::Value(ok) => ok,
                 Answer::Cancelled => false,
                 Answer::NoUi => {
@@ -1207,25 +1216,29 @@ fn add(paths: &Paths, out: &Out, token: Option<String>, req: AddRequest) -> Outc
     if !req.yes {
         let mut meta = Vec::new();
         if let Some(user) = req.username.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-            meta.push(format!("用户名: {}", dialog::for_dialog(user, 60)));
+            meta.push(format!("{} {}", tr("Username:", "用户名:"), dialog::for_dialog(user, 60)));
         }
         if let Some(uri) = req.uri.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
             meta.push(format!("URI: {}", dialog::for_dialog(uri, 120)));
         }
         if let Some(notes) = req.notes.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            meta.push(format!("备注: {}", dialog::for_dialog(notes, 120)));
+            meta.push(format!("{} {}", tr("Notes:", "备注:"), dialog::for_dialog(notes, 120)));
         }
         let shown = dialog::for_dialog(&name, 80);
         let action = if existing.is_some() {
-            format!("更新已有条目「{shown}」。")
+            tr_owned(format!("Update the existing entry \"{shown}\"."), format!("更新已有条目「{shown}」。"))
         } else {
-            format!("新建条目「{shown}」。")
+            tr_owned(format!("Create the entry \"{shown}\"."), format!("新建条目「{shown}」。"))
         };
         let message = format!(
-            "{action}{}\n下一步会弹出窗口，由你输入密码。密码不会进入对话。",
-            if meta.is_empty() { String::new() } else { format!("\n{}", meta.join("\n")) }
+            "{action}{}\n{}",
+            if meta.is_empty() { String::new() } else { format!("\n{}", meta.join("\n")) },
+            tr(
+                "A window opens next for you to type the password. It never enters the conversation.",
+                "下一步会弹出窗口，由你输入密码。密码不会进入对话。"
+            )
         );
-        match dialog::confirm("ai-vault · 保存到本地库", &message) {
+        match dialog::confirm(tr("ai-vault · save to local store", "ai-vault · 保存到本地库"), &message) {
             Answer::Value(true) => {}
             Answer::Value(false) | Answer::Cancelled => return Err(Fault::Denied(format!("user denied saving \"{name}\""))),
             Answer::NoUi => return Err(Fault::NeedsUi("confirm")),
@@ -1236,9 +1249,9 @@ fn add(paths: &Paths, out: &Out, token: Option<String>, req: AddRequest) -> Outc
         Some(user) => user,
         None => {
             let hint = if existing.as_ref().and_then(|i| i.username.as_ref()).is_some() {
-                "用户名（留空保持不变）"
+                tr("username (leave blank to keep)", "用户名（留空保持不变）")
             } else {
-                "用户名（可留空）"
+                tr("username (optional)", "用户名（可留空）")
             };
             ask_text(&format!("ai-vault · {name}"), hint)?
         }
@@ -1246,7 +1259,7 @@ fn add(paths: &Paths, out: &Out, token: Option<String>, req: AddRequest) -> Outc
     let password = if req.password_stdin {
         read_password()?
     } else {
-        ask_password("ai-vault · 密码", &name)?
+        ask_password(tr("ai-vault · password", "ai-vault · 密码"), &name)?
     };
     if password.is_empty() {
         return Err(Fault::Denied("cancelled: no password entered".into()));
@@ -1317,7 +1330,7 @@ fn remove(paths: &Paths, out: &Out, token: Option<String>, name: &str, yes: bool
         return Err(Fault::Error(format!("no such entry: \"{name}\"")));
     }
     if !yes {
-        match dialog::confirm("ai-vault · 删除条目", &format!("删除「{}」？删除后无法恢复。", dialog::for_dialog(name, 80))) {
+        match dialog::confirm(tr("ai-vault · delete entry", "ai-vault · 删除条目"), &tr_owned(format!("Delete \"{}\"? This cannot be undone.", dialog::for_dialog(name, 80)), format!("删除「{}」？删除后无法恢复。", dialog::for_dialog(name, 80)))) {
             Answer::Value(true) => {}
             Answer::Value(false) | Answer::Cancelled => return Err(Fault::Denied("cancelled".into())),
             Answer::NoUi => return Err(Fault::NeedsUi("confirm")),
@@ -1349,7 +1362,7 @@ fn grant(paths: &Paths, out: &Out, token: Option<String>, name: &str, minutes: O
         let password = if is_host() {
             read_password()?
         } else {
-            ask_password("ai-vault · 授权读取", "主密码（给一条条目免确认读取）")?
+            ask_password(tr("ai-vault · grant read", "ai-vault · 授权读取"), tr("master password (lets one entry be read without confirmation)", "主密码（给一条条目免确认读取）"))?
         };
         if let Err(e) = crypto::open_with_passphrase(&store, &password) {
             return Err(match e {
@@ -1431,12 +1444,15 @@ fn import_file(paths: &Paths, out: &Out, token: Option<String>, file: &PathBuf, 
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let more = if drafts.len() > 15 { format!("\n… 还有 {} 条", drafts.len() - 15) } else { String::new() };
+        let more = if drafts.len() > 15 { tr_owned(format!("\n… {} more", drafts.len() - 15), format!("\n… 还有 {} 条", drafts.len() - 15)) } else { String::new() };
         let message = format!(
-            "匹配 {} 条。其中带密码的登录项会写入本地加密库，同名条目会被更新。\n\n{shown}{more}\n\n允许导入？",
+            "{} {} {}\n\n{shown}{more}\n\n{}",
+        tr("Matched", "匹配"),
+        drafts.len(),
+        tr("items. Login items with a password are written to the local encrypted store; same-name entries are updated. Import?", "条。其中带密码的登录项会写入本地加密库，同名条目会被更新。允许导入？"),
             drafts.len()
         );
-        match dialog::confirm("ai-vault · 从 Bitwarden 导入", &message) {
+        match dialog::confirm(tr("ai-vault · import from Bitwarden", "ai-vault · 从 Bitwarden 导入"), &message) {
             Answer::Value(true) => {}
             Answer::Value(false) | Answer::Cancelled => return Err(Fault::Denied("user denied the Bitwarden import".into())),
             Answer::NoUi => return Err(Fault::NeedsUi("confirm")),
