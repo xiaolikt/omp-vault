@@ -179,10 +179,11 @@ mod win {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    // WinForms from PowerShell: no extra dependency, and PasswordChar can hide
-    // the input. Exit 0 = OK (value on stdout), 1 = cancel, 2 = no window.
+    // WinForms from PowerShell: no extra dependency, and the windows can be
+    // laid out to match the display. Exit 0 = OK (value on stdout), 1 = cancel,
+    // 2 = no window.
     //
-    // Two things matter on a real Windows desktop:
+    // Three things matter on a real Windows desktop:
     //   * `[Console]::Out.Write` encodes with the console's code page (936 on a
     //     Chinese Windows), so a password typed in Chinese arrived as mojibake
     //     and keyed a store no other machine could open. The value leaves as
@@ -191,27 +192,169 @@ mod win {
     //     load) used to make PowerShell exit 1, which reads as "the user
     //     cancelled": the host was told not to retry. The scripts trap into
     //     exit 2, and an exit 1 that printed an error counts the same.
-    const PREAMBLE: &str = r#"
+    //   * Windows turns the IME off in a password edit control (so that a
+    //     candidate window cannot show what is typed), and a Chinese password
+    //     could not be entered at all. The field is an ordinary text box whose
+    //     text is hidden by colour; a bullet per character shows underneath.
+    const PRELUDE: &str = r#"
 $ErrorActionPreference = 'Stop'
 try {
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-    $f = New-Object System.Windows.Forms.Form
-    $f.Text = $env:AI_VAULT_DLG_TITLE
-    $f.Width = 480; $f.Height = 200; $f.StartPosition = 'CenterScreen'
-    $f.TopMost = $true; $f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false
-    $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = $env:AI_VAULT_DLG_TEXT; $lbl.Left = 12; $lbl.Top = 12; $lbl.Width = 440; $lbl.Height = 60
-    $f.Controls.Add($lbl)
-    $box = New-Object System.Windows.Forms.TextBox
-    $box.Left = 12; $box.Top = 80; $box.Width = 440
-    if ($env:AI_VAULT_DLG_SECRET -eq '1') { $box.UseSystemPasswordChar = $true }
-    $f.Controls.Add($box)
-    $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = 'OK'; $ok.DialogResult = 'OK'; $ok.Left = 280; $ok.Top = 115; $f.AcceptButton = $ok
-    $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = $env:AI_VAULT_DLG_CANCEL; $cancel.DialogResult = 'Cancel'; $cancel.Left = 370; $cancel.Top = 115; $f.CancelButton = $cancel
-    $f.Controls.Add($ok); $f.Controls.Add($cancel)
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    # Crisp text on a scaled display: a process that is not DPI-aware is
+    # stretched as a bitmap by the system. Once this one is, a point laid out
+    # for 96 DPI is AppliedDPI / 96 pixels here, which is what Px() scales.
+    $scale = 1.0
+    try {
+        $dpi = [int](Get-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name AppliedDPI -ErrorAction Stop).AppliedDPI
+        if ($dpi -gt 96) {
+            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class AiVaultDpi { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }'
+            if ([AiVaultDpi]::SetProcessDPIAware()) { $scale = $dpi / 96.0 }
+        }
+    } catch { }
+    function Px([double]$v) { [int][Math]::Round($v * $scale) }
+
+    # One typeface for Latin and Chinese where there is one; the system's otherwise.
+    $families = [System.Drawing.FontFamily]::Families | ForEach-Object { $_.Name }
+    $ui = 'Segoe UI'
+    foreach ($name in 'Microsoft YaHei UI', 'Microsoft YaHei') {
+        if ($families -contains $name) { $ui = $name; break }
+    }
+    function New-Font([double]$size, [System.Drawing.FontStyle]$style = [System.Drawing.FontStyle]::Regular) {
+        [System.Drawing.Font]::new($ui, [single]$size, $style, [System.Drawing.GraphicsUnit]::Point)
+    }
+
+    $ink = [System.Drawing.Color]::FromArgb(26, 26, 26)
+    $muted = [System.Drawing.Color]::FromArgb(96, 96, 96)
+    $accent = [System.Drawing.Color]::FromArgb(0, 99, 192)
+    $accentHover = [System.Drawing.Color]::FromArgb(23, 118, 210)
+    $paper = [System.Drawing.Color]::FromArgb(249, 249, 249)
+    $line = [System.Drawing.Color]::FromArgb(209, 209, 209)
+    $white = [System.Drawing.Color]::White
+
+    function New-Window([string]$title) {
+        $w = [System.Windows.Forms.Form]::new()
+        $w.Text = $title
+        $w.FormBorderStyle = 'FixedDialog'; $w.MaximizeBox = $false; $w.MinimizeBox = $false
+        $w.AutoScaleMode = 'None'
+        $w.StartPosition = 'CenterScreen'; $w.TopMost = $true
+        $w.BackColor = $paper
+        $w.Icon = [System.Drawing.Icon]::new([System.Drawing.SystemIcons]::Shield, (Px 16), (Px 16))
+        $w.ClientSize = [System.Drawing.Size]::new((Px 480), 0)
+        return $w
+    }
+
+    # The shield, the title in bold, and the line under it when there is one.
+    function Add-Heading($w, [string]$text) {
+        $icon = [System.Windows.Forms.PictureBox]::new()
+        $icon.Image = [System.Drawing.Icon]::new([System.Drawing.SystemIcons]::Shield, (Px 32), (Px 32)).ToBitmap()
+        $icon.SizeMode = 'CenterImage'
+        $icon.Bounds = [System.Drawing.Rectangle]::new((Px 20), (Px 18), (Px 32), (Px 32))
+        $head = [System.Windows.Forms.Label]::new()
+        $head.Text = $w.Text; $head.Font = New-Font 12 ([System.Drawing.FontStyle]::Bold); $head.ForeColor = $ink
+        $head.Bounds = [System.Drawing.Rectangle]::new((Px 62), (Px 18), (Px 398), (Px 28))
+        $w.Controls.Add($icon); $w.Controls.Add($head)
+        if ($text) {
+            $lbl = [System.Windows.Forms.Label]::new()
+            $lbl.Text = $text; $lbl.Font = New-Font 10; $lbl.ForeColor = $muted
+            $lbl.Bounds = [System.Drawing.Rectangle]::new((Px 62), (Px 50), (Px 398), (Px 40))
+            $w.Controls.Add($lbl)
+        }
+    }
+
+    function New-Button($w, [string]$text, [string]$result, [bool]$primary) {
+        $b = [System.Windows.Forms.Button]::new()
+        $b.Text = $text; $b.DialogResult = $result; $b.FlatStyle = 'Flat'
+        $b.Size = [System.Drawing.Size]::new((Px 100), (Px 34))
+        if ($primary) {
+            $b.FlatAppearance.BorderColor = $accent; $b.BackColor = $accent; $b.ForeColor = $white
+            $b.Font = New-Font 10 ([System.Drawing.FontStyle]::Bold)
+        } else {
+            $b.FlatAppearance.BorderColor = $line; $b.BackColor = $white; $b.ForeColor = $ink
+            $b.Font = New-Font 10
+        }
+        $w.Controls.Add($b)
+        return $b
+    }
+
+    # A row at the bottom, flush right; the last button is the rightmost one.
+    function Add-Buttons($w, $buttons) {
+        $x = $w.ClientSize.Width - (Px 20)
+        foreach ($b in $buttons) {
+            $b.Left = $x - $b.Width
+            $b.Top = $w.ClientSize.Height - (Px 20) - $b.Height
+            $x = $b.Left - (Px 8)
+        }
+    }
+"#;
+
+    const PREAMBLE: &str = r#"
+    $f = New-Window $env:AI_VAULT_DLG_TITLE
+    Add-Heading $f $env:AI_VAULT_DLG_TEXT
+    $secret = $env:AI_VAULT_DLG_SECRET -eq '1'
+
+    # The field: the panel draws a border that scales with the display and
+    # turns blue while the field has the focus; the text box fills it.
+    $box = [System.Windows.Forms.TextBox]::new()
+    $box.Font = New-Font 11
+    $box.BorderStyle = 'None'; $box.AutoSize = $false; $box.Dock = 'Fill'
+    if ($secret) { $box.ForeColor = $box.BackColor }
+    $field = [System.Windows.Forms.Panel]::new()
+    $field.BackColor = $line
+    $field.Padding = [System.Windows.Forms.Padding]::new((Px 1))
+    $field.Left = Px 62; $field.Top = Px 94; $field.Width = Px 398
+    $field.Height = $box.PreferredHeight + 2 * (Px 1)
+    $field.Controls.Add($box)
+    $f.Controls.Add($field)
+
+    # Over the box, a label with one bullet per typed character and a caret of
+    # its own: the box keeps its text (and the IME), and shows none of it.
+    $mask = [System.Windows.Forms.Label]::new()
+    $mask.BackColor = $white; $mask.Font = New-Font 11; $mask.ForeColor = $muted
+    $mask.Dock = 'Fill'; $mask.TextAlign = 'MiddleLeft'
+    $mask.Padding = [System.Windows.Forms.Padding]::new((Px 10), 0, 0, 0)
+    $mask.Visible = $secret
+    $caret = [System.Windows.Forms.Label]::new()
+    $caret.BackColor = $ink; $caret.Width = [Math]::Max(1, (Px 1)); $caret.Height = Px 18
+    $caret.Visible = $false
+    if ($secret) { $field.Controls.Add($mask); $field.Controls.Add($caret) }
+
+    $show = [System.Windows.Forms.CheckBox]::new()
+    $show.Text = $env:AI_VAULT_DLG_SHOW
+    $show.Font = New-Font 9; $show.ForeColor = $muted
+    $show.Left = Px 366; $show.Top = $field.Bottom + (Px 8); $show.Width = Px 94
+    $show.Visible = $secret
+    $f.Controls.Add($show)
+    $f.ClientSize = [System.Drawing.Size]::new((Px 480), $field.Bottom + (Px 92))
+
+    function Update-Mask {
+        $mask.Text = ('● ' * $box.TextLength).TrimEnd()
+        $typed = if ($mask.Text) { $mask.Text + ' ' } else { '' }
+        $width = [System.Windows.Forms.TextRenderer]::MeasureText($typed, $mask.Font).Width
+        $caret.Left = [Math]::Min($mask.Padding.Left + $width, $mask.Width - $caret.Width)
+        $caret.Top = [int](($mask.Height - $caret.Height) / 2)
+    }
+    $box.Add_TextChanged({ Update-Mask })
+    $box.Add_GotFocus({ $caret.Visible = $secret; $field.BackColor = $accent })
+    $box.Add_LostFocus({ $caret.Visible = $false; $field.BackColor = $line })
+    $mask.Add_Click({ $box.Focus() })
+    $show.Add_CheckedChanged({
+        if ($show.Checked) { $box.ForeColor = $ink; $mask.Visible = $false }
+        else { $box.ForeColor = $box.BackColor; $mask.Visible = $true; $caret.Visible = $box.Focused }
+    })
+    $blink = [System.Windows.Forms.Timer]::new(); $blink.Interval = 530
+    $blink.Add_Tick({ if ($box.Focused -and $secret -and -not $show.Checked) { $caret.Visible = -not $caret.Visible } })
+    $blink.Start()
+    Update-Mask
     $f.Add_Shown({ $box.Focus() })
+
+    $cancel = New-Button $f $env:AI_VAULT_DLG_CANCEL 'Cancel' $false
+    $ok = New-Button $f $env:AI_VAULT_DLG_OK 'OK' $true
+    Add-Buttons $f @($cancel, $ok)
+    $f.AcceptButton = $ok; $f.CancelButton = $cancel
+    $ok.Add_MouseEnter({ $ok.BackColor = $accentHover }); $ok.Add_MouseLeave({ $ok.BackColor = $accent })
+
     if ($f.ShowDialog() -eq 'OK') {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($box.Text)
         $stdout = [Console]::OpenStandardOutput()
@@ -225,20 +368,33 @@ try {
 }
 "#;
 
-    // A MessageBox has no top-most flag of its own, so it is owned by an
-    // invisible one that has: an approval hiding behind other windows reads as
-    // a hang. The default button stays "No".
+    // A window of its own rather than a MessageBox: the buttons then say
+    // Allow and Deny in the user's language, and it matches the other one.
+    // Enter is the safe answer from wherever the focus is: Deny is both the
+    // accept and the cancel button. Allow takes a click, or Tab and Enter.
     const CONFIRM: &str = r#"
-$ErrorActionPreference = 'Stop'
-try {
-    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-    $owner = New-Object System.Windows.Forms.Form
-    $owner.TopMost = $true; $owner.Opacity = 0; $owner.ShowInTaskbar = $false
-    $owner.StartPosition = 'CenterScreen'; $owner.Width = 1; $owner.Height = 1
-    $owner.Show()
-    $r = [System.Windows.Forms.MessageBox]::Show($owner, $env:AI_VAULT_DLG_TEXT, $env:AI_VAULT_DLG_TITLE, 'YesNo', 'Warning', 'Button2')
-    $owner.Close()
-    if ($r -eq 'Yes') { exit 0 }
+    $f = New-Window $env:AI_VAULT_DLG_TITLE
+    Add-Heading $f ''
+
+    $msg = [System.Windows.Forms.Label]::new()
+    $msg.Text = $env:AI_VAULT_DLG_TEXT
+    $msg.Font = New-Font 10; $msg.ForeColor = $ink
+    $msg.Left = Px 62; $msg.Top = Px 54; $msg.Width = Px 398
+    $g = $f.CreateGraphics()
+    $msg.Height = [int]($g.MeasureString($msg.Text, $msg.Font, $msg.Width).Height) + (Px 4)
+    $g.Dispose()
+    $f.Controls.Add($msg)
+    $f.ClientSize = [System.Drawing.Size]::new((Px 480), $msg.Bottom + (Px 66))
+
+    $deny = New-Button $f $env:AI_VAULT_DLG_DENY 'Cancel' $false
+    $allow = New-Button $f $env:AI_VAULT_DLG_ALLOW 'OK' $true
+    Add-Buttons $f @($deny, $allow)
+    $f.AcceptButton = $deny
+    $f.CancelButton = $deny
+    $f.Add_Shown({ $deny.Focus() })
+    $allow.Add_MouseEnter({ $allow.BackColor = $accentHover }); $allow.Add_MouseLeave({ $allow.BackColor = $accent })
+
+    if ($f.ShowDialog() -eq 'OK') { exit 0 }
     exit 1
 } catch {
     [Console]::Error.Write($_)
@@ -275,13 +431,18 @@ try {
         })
     }
 
-    fn powershell(script: &str, title: &str, text: &str, secret: bool) -> Out {
+    fn powershell(body: &str, title: &str, text: &str, secret: bool) -> Out {
+        let script = format!("{PRELUDE}{body}");
         let mut cmd = Command::new(powershell_exe());
-        cmd.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script])
+        cmd.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script])
             .env("AI_VAULT_DLG_TITLE", title)
             .env("AI_VAULT_DLG_TEXT", text)
             .env("AI_VAULT_DLG_SECRET", if secret { "1" } else { "0" })
+            .env("AI_VAULT_DLG_OK", crate::i18n::tr("OK", "确定"))
             .env("AI_VAULT_DLG_CANCEL", crate::i18n::tr("Cancel", "取消"))
+            .env("AI_VAULT_DLG_SHOW", crate::i18n::tr("Show", "显示"))
+            .env("AI_VAULT_DLG_ALLOW", crate::i18n::tr("Allow", "允许"))
+            .env("AI_VAULT_DLG_DENY", crate::i18n::tr("Deny", "拒绝"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

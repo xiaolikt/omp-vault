@@ -370,14 +370,23 @@ function showWindow(script) {
 
 const SHOWN = "    if ($f.ShowDialog() -eq 'OK') {";
 const passwordWindow = (action) => {
-	const script = dialogScript("PREAMBLE");
+	const script = dialogScript("PRELUDE") + dialogScript("PREAMBLE");
 	assert.ok(script.includes(SHOWN), "the password window still calls ShowDialog()");
 	return script.replace(SHOWN, `${autoAnswer(action)}\n${SHOWN}`);
 };
 
 test("Windows: the password window answers in UTF-8, whatever the console's code page", onDesktop, () => {
 	const value = "密码测试-Pässw0rd";
-	const r = showWindow(passwordWindow(`$box.Text = '${value}'; $f.DialogResult = 'OK'`));
+	// The field must not be a password edit control (Windows turns the IME off
+	// there): the text is hidden by colour, and bullets are drawn over the field.
+	const kept = [
+		"if ($box.UseSystemPasswordChar) { throw 'the field is a password edit control: no IME there' }",
+		"if ($box.ForeColor -ne $box.BackColor) { throw 'the typed text is visible' }",
+		`$box.Text = '${value}'`,
+		"if ($mask.Text -notmatch '●') { throw 'no bullets are drawn over the field' }",
+		"$f.DialogResult = 'OK'",
+	].join("; ");
+	const r = showWindow(passwordWindow(kept));
 	assert.equal(r.status, 0, r.stderr.toString());
 	assert.equal(new TextDecoder().decode(r.stdout), value);
 });
@@ -393,7 +402,7 @@ test("Windows: cancel and an empty field end the prompt cleanly (exit 1 / empty,
 });
 
 test("Windows: a window that cannot open exits 2; a script that will not parse exits 1 with the error on stderr", onDesktop, () => {
-	const script = dialogScript("PREAMBLE");
+	const script = dialogScript("PRELUDE") + dialogScript("PREAMBLE");
 	// A policy that forbids Add-Type, simulated by shadowing the cmdlet.
 	const forbidden = showWindow("function Add-Type { throw 'Add-Type is blocked by policy (simulated)' }\n" + script);
 	assert.equal(forbidden.status, 2, "reported as no window, which is needs-ui to the host");
@@ -407,10 +416,14 @@ test("Windows: a window that cannot open exits 2; a script that will not parse e
 	assert.notEqual(unparsable.stderr.toString().trim(), "");
 });
 
-test("Windows: the confirm window is owned by a top-most form, and losing that owner is not a Yes", onDesktop, () => {
-	const script = dialogScript("CONFIRM");
-	const shown = "    $r = [System.Windows.Forms.MessageBox]::Show(";
-	assert.ok(script.includes(shown), "the confirm window still asks through a MessageBox owned by $owner");
-	const closed = showWindow(script.replace(shown, `${autoAnswer("$owner.Close()")}\n${shown}`));
-	assert.notEqual(closed.status, 0, "a closed window must never read as approval");
+test("Windows: the confirm window is one of its own: Enter is Deny, a click on Allow is the only way to exit 0", onDesktop, () => {
+	const script = dialogScript("PRELUDE") + dialogScript("CONFIRM");
+	assert.match(script, /\$f\.AcceptButton = \$deny/, "Enter is the safe answer");
+	assert.match(script, /\$f\.CancelButton = \$deny/, "Esc is the safe answer");
+	const shown = "    if ($f.ShowDialog() -eq 'OK') { exit 0 }";
+	assert.ok(script.includes(shown), "the confirm window still ends in ShowDialog()");
+	const answer = (click) => showWindow(script.replace(shown, `${autoAnswer(click)}\n${shown}`)).status;
+	assert.notEqual(answer("$f.Close()"), 0, "a closed window must never read as approval");
+	assert.equal(answer("$deny.PerformClick()"), 1, "Deny");
+	assert.equal(answer("$allow.PerformClick()"), 0, "Allow");
 });

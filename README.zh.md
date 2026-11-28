@@ -100,6 +100,8 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 - **插件直接启动 `ai-vault.exe`。** Node 不带 shell 跑不了 npm 的 `.cmd`/`.ps1` 包装器，所以插件直接解析 `@xiaolikt/ai-vault-win32-x64` 里的二进制；只有包装器时，读出它指向的目标，用自己的 Node 启动。
 - **弹窗需要交互式会话。** 服务、"用户未登录也运行"的计划任务、sshd 会话里没有可见桌面，CLI 会返回退出码 3（`needs-ui`），改用宿主输入框。没人应答的窗口和 Linux 一样在 600 秒后关闭，按取消处理。
 - **弹窗里输入的内容一律是 UTF-8**，不管控制台代码页是什么（中文 Windows 是 936）。打不开的窗口报成 `needs-ui`，不会被当成取消。
+- **任何文字都能输入。** Windows 会在密码编辑控件里关掉输入法（免得候选窗露出输入内容），中文主密码此前根本打不进去。现在输入框是普通文本框，只用颜色把文字藏起来：上面画着每个字符一个圆点和光标，另有一个「显示」勾选框可以看明文。
+- **窗口跟随屏幕缩放。** 按显示比例排版（缩放高于 100% 时启用 DPI 感知），字体用 Microsoft YaHei UI 或 Segoe UI，图标是系统的盾牌。确认框是同风格的独立窗口，「允许 / 拒绝」两个按钮，回车是「拒绝」。
 - **npm 装的 `bw` 可用**（`bw.cmd` 同样被拆开启动）。`bw_run` 需要 Git for Windows：在 PATH 上 `git.exe` 的旁边找 `bash.exe`。剪贴板走 Windows PowerShell，值以 UTF-8 走 stdin/stdout。
 - 库在 `%USERPROFILE%\.ai-vault`，靠用户目录的 ACL 保护。
 
