@@ -7,7 +7,7 @@
 //! token back on every later call.
 
 mod audit;
-mod bwsession;
+mod sealed;
 mod cli;
 mod config;
 mod crypto;

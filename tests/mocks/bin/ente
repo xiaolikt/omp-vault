@@ -9,7 +9,14 @@
 # the list path never asked for a code.
 DIR="${ENTE_MOCK_DIR:-/tmp/ente-mock}"
 mkdir -p "$DIR"
+# Record whether a vault key reached us and which, so tests can tell a
+# keychain-backed run (nothing) from a sealed-key run (a value).
 printf '%s\n' "$*" >>"$DIR/ente.log"
+if [[ -n "${ENTE_CLI_VAULT_KEY:-}" ]]; then
+	printf 'key=%s\n' "$ENTE_CLI_VAULT_KEY" >>"$DIR/ente.env"
+else
+	printf 'key=\n' >>"$DIR/ente.env"
+fi
 if [[ -f "$DIR/unauthenticated" ]]; then
 	echo "no account logged in; run ente account login --app auth" >&2
 	exit 3

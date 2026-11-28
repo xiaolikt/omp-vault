@@ -90,15 +90,28 @@ impl Default for UnlockPolicy {
     }
 }
 
+/// How a third-party CLI's credential is kept on disk.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct BitwardenPolicy {
-    /// `never` keeps the `bw` session key in the store directory, so no
-    /// Bitwarden master password is asked; `time` does the same with a
-    /// deadline; `session` (default) keeps it in the agent's memory only.
+pub struct StorePolicy {
+    /// `never` keeps the credential in the store directory (sealed), so the
+    /// CLI needs no keychain or password; `time` does the same with a
+    /// deadline; `session` (default) leaves it in the CLI's own keychain.
     #[serde(default = "default_bw_mode")]
     pub unlock: UnlockMode,
     #[serde(default = "default_hours")]
     pub hours: i64,
+}
+
+impl Default for StorePolicy {
+    fn default() -> Self {
+        StorePolicy { unlock: default_bw_mode(), hours: default_hours() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BitwardenPolicy {
+    #[serde(flatten)]
+    pub store: StorePolicy,
     #[serde(default = "default_import")]
     pub import: ImportPolicy,
 }
@@ -113,7 +126,7 @@ fn default_import() -> ImportPolicy {
 
 impl Default for BitwardenPolicy {
     fn default() -> Self {
-        BitwardenPolicy { unlock: default_bw_mode(), hours: default_hours(), import: default_import() }
+        BitwardenPolicy { store: StorePolicy::default(), import: default_import() }
     }
 }
 
@@ -123,6 +136,10 @@ pub struct Config {
     pub unlock: UnlockPolicy,
     #[serde(default)]
     pub bitwarden: BitwardenPolicy,
+    /// Ente's `ENTE_CLI_VAULT_KEY`: `session` leaves it to the OS keychain,
+    /// `never`/`time` keep it sealed next to the store.
+    #[serde(default)]
+    pub ente: StorePolicy,
 }
 
 /// A missing or unreadable config means the defaults. A broken file must not
@@ -156,7 +173,8 @@ mod tests {
     fn defaults_are_the_cautious_ones() {
         let config = Config::default();
         assert_eq!(config.unlock.mode, UnlockMode::Session);
-        assert_eq!(config.bitwarden.unlock, UnlockMode::Session);
+        assert_eq!(config.bitwarden.store.unlock, UnlockMode::Session);
+        assert_eq!(config.ente.unlock, UnlockMode::Session);
         assert_eq!(config.bitwarden.import, ImportPolicy::Ask);
     }
 
@@ -166,6 +184,6 @@ mod tests {
         let parsed: Config = serde_json::from_str(r#"{"unlock":{"mode":"time","hours":4}}"#).unwrap();
         assert_eq!(parsed.unlock.mode, UnlockMode::Time);
         assert_eq!(parsed.bitwarden.import, ImportPolicy::Ask);
-        assert_eq!(parsed.bitwarden.hours, 8);
+        assert_eq!(parsed.bitwarden.store.hours, 8);
     }
 }

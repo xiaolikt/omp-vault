@@ -2,7 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { answers, bind, cleanUpOnExit, dialogTrace, makeCtx, textOf, useMocks } from "./helpers.mjs";
+
+const { forgetSettings } = await import("../packages/pi-ai-vault/src/settings.ts");
 
 const dir = useMocks();
 const { default: aiVault } = await import("../packages/pi-ai-vault/src/index.ts");
@@ -83,4 +86,52 @@ test("a failed sync falls back to the offline cache", async () => {
 	const result = await b.tool("ente_list", {}, makeCtx().ctx);
 	assert.equal(result.isError, undefined, textOf(result));
 	assert.equal(JSON.parse(textOf(result)).length, 3);
+});
+
+const enteEnv = () => {
+	try {
+		return readFileSync(join(dir, "ente.env"), "utf8").trim();
+	} catch {
+		return "";
+	}
+};
+
+test("session mode passes no vault key: the OS keychain stays in charge", async () => {
+	const bin = process.env.AI_VAULT_BIN;
+	spawnSync(bin, ["settings", "ente.unlock", "session"], { env: process.env });
+	forgetSettings();
+	const b = bind(aiVault, true);
+	await b.tool("ente_list", {}, makeCtx().ctx);
+	assert.match(enteEnv(), /^key=$/m);
+});
+
+test("ente.unlock=never feeds the sealed key to the ente child", async () => {
+	const bin = process.env.AI_VAULT_BIN;
+	const set = spawnSync(bin, ["settings", "ente.unlock", "never"], { env: process.env, encoding: "utf8" });
+	assert.equal(set.status, 0, set.stderr);
+	const put = spawnSync(bin, ["ente-session", "put"], { input: "MY_SECRET_VAULT_KEY", env: process.env, encoding: "utf8" });
+	assert.equal(put.status, 0, put.stderr);
+	forgetSettings();
+
+	const b = bind(aiVault, true);
+	const result = await b.tool("ente_list", {}, makeCtx().ctx);
+	assert.equal(result.isError, undefined, textOf(result));
+	assert.match(enteEnv(), /^key=MY_SECRET_VAULT_KEY$/m);
+});
+
+test("an inherited ENTE_CLI_VAULT_KEY is not trusted in session mode", async () => {
+	const bin = process.env.AI_VAULT_BIN;
+	spawnSync(bin, ["settings", "ente.unlock", "session"], { env: process.env });
+	spawnSync(bin, ["ente-session", "clear"], { env: process.env });
+	forgetSettings();
+	const previous = process.env.ENTE_CLI_VAULT_KEY;
+	process.env.ENTE_CLI_VAULT_KEY = "LEAKED_FROM_SHELL";
+	try {
+		const b = bind(aiVault, true);
+		await b.tool("ente_list", {}, makeCtx().ctx);
+		assert.match(enteEnv(), /^key=$/m, "the shell-exported key must not reach ente");
+	} finally {
+		if (previous === undefined) delete process.env.ENTE_CLI_VAULT_KEY;
+		else process.env.ENTE_CLI_VAULT_KEY = previous;
+	}
 });

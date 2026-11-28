@@ -155,6 +155,17 @@ check "without the wrap key the session does not open" 1 "$BIN" bw-session get
 mv "$TMP/wrap.bak" "$AI_VAULT_DIR/.wrap"
 "$BIN" settings bitwarden.unlock session --json >/dev/null
 
+echo "== ente sealed key (M4 pattern) =="
+check "ente.unlock is readable" 0 "$BIN" settings ente.unlock --json
+check "ente-session put refused in session mode" 1 bash -c "printf 'K' | '$BIN' ente-session put"
+check "switch ente.unlock to never" 0 "$BIN" settings ente.unlock never --json
+check "store the Ente vault key" 0 bash -c "printf 'ENTE_KEY_PLAINTEXT' | '$BIN' ente-session put --json"
+grep -q 'ENTE_KEY_PLAINTEXT' "$AI_VAULT_DIR/ente.session.json" && bad "the ente key is plaintext on disk" || ok "the ente key is sealed at rest"
+[[ "$(stat -c %a "$AI_VAULT_DIR/ente.session.json")" == "600" ]] && ok "ente.session.json is 0600" || bad "ente.session.json is not 0600"
+"$BIN" ente-session get --json | grep -q 'ENTE_KEY_PLAINTEXT' && ok "ente-session get unseals it" || bad "ente-session get cannot unseal"
+"$BIN" settings ente.unlock session --json >/dev/null
+check "switching back to session clears the ente key" 5 "$BIN" ente-session get
+
 echo "== rekey (L2) =="
 OLD_N=$(python3 -c "import json;print(json.load(open('$AI_VAULT_DIR/store.json'))['kdf']['N'])")
 check "rekey with the password" 0 bash -c "printf 'correct horse' | '$BIN' rekey --password-stdin --json"
@@ -170,7 +181,7 @@ python3 - "$TMP/audit" <<'PY' && ok "the audit log records events without values
 import json,sys
 entries = json.load(open(sys.argv[1]))["entries"]
 events = {e["event"] for e in entries}
-for want in ("init", "unlock", "unlock_failed", "add", "grant", "read_deny", "read_allow", "remove", "import", "lock", "rekey", "bw_session"):
+for want in ("init", "unlock", "unlock_failed", "add", "grant", "read_deny", "read_allow", "remove", "import", "lock", "rekey", "sealed"):
     assert want in events, (want, events)
 assert not any("p1ssw0rd" in json.dumps(e) or "exp-pass" in json.dumps(e) for e in entries)
 PY

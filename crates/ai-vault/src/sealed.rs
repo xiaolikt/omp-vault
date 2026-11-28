@@ -1,4 +1,5 @@
-//! The `bw` session key, persisted for `bitwarden.unlock = never | time`.
+//! Secrets kept on disk for `*.unlock = never | time`: the `bw` session key
+//! and Ente's `ENTE_CLI_VAULT_KEY`.
 //!
 //! `bw unlock` hands back a bearer key for the *whole* Bitwarden vault, so the
 //! file is sealed: ChaCha20-Poly1305 under a random 256-bit key in
@@ -16,6 +17,30 @@ use crate::config::{self, UnlockMode};
 use crate::crypto;
 use crate::paths::Paths;
 use crate::session::now_ms;
+
+/// Which secret this file holds. They are sealed the same way but carry
+/// different names and different policies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Bitwarden,
+    Ente,
+}
+
+impl Kind {
+    fn file(self) -> &'static str {
+        match self {
+            Kind::Bitwarden => "bitwarden.session.json",
+            Kind::Ente => "ente.session.json",
+        }
+    }
+
+    fn policy(self, config: &config::Config) -> config::StorePolicy {
+        match self {
+            Kind::Bitwarden => config.bitwarden.store,
+            Kind::Ente => config.ente,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stored {
@@ -100,11 +125,18 @@ impl Stored {
 
 /// Store a key, honouring the current `bitwarden.unlock` policy. `session`
 /// means "do not persist": the caller keeps it in memory instead.
-pub fn save(paths: &Paths, key: &str) -> Result<Option<i64>, String> {
-    let policy = config::load(paths).bitwarden;
-    if policy.mode_is_session() {
-        clear(paths);
-        return Err("bitwarden.unlock is \"session\": the key is kept in the agent, not on disk".into());
+pub fn save(paths: &Paths, kind: Kind, secret: &str) -> Result<Option<i64>, String> {
+    let config = config::load(paths);
+    let policy = kind.policy(&config);
+    if policy.unlock == UnlockMode::Session {
+        clear(paths, kind);
+        return Err(format!(
+            "{}.unlock is \"session\": nothing is kept on disk",
+            match kind {
+                Kind::Bitwarden => "bitwarden",
+                Kind::Ente => "ente",
+            }
+        ));
     }
     let now = now_ms();
     let expires_at = match policy.unlock {
@@ -113,15 +145,16 @@ pub fn save(paths: &Paths, key: &str) -> Result<Option<i64>, String> {
         UnlockMode::Session => None,
     };
     let wrap = wrap_key(paths)?;
-    let stored = Stored { saved_at: now, expires_at, sealed: seal(&wrap, key)? };
+    let stored = Stored { saved_at: now, expires_at, sealed: seal(&wrap, secret)? };
     let bytes = serde_json::to_vec(&stored).map_err(|e| format!("cannot serialize session: {e}"))?;
-    crypto::write_atomic(&paths.bw_session(), &bytes)?;
-    let _ = fs::set_permissions(paths.bw_session(), fs::Permissions::from_mode(0o600));
+    let path = paths.dir.join(kind.file());
+    crypto::write_atomic(&path, &bytes)?;
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     Ok(expires_at)
 }
 
-pub fn load(paths: &Paths) -> Result<Option<Stored>, String> {
-    let path = paths.bw_session();
+pub fn load(paths: &Paths, kind: Kind) -> Result<Option<Stored>, String> {
+    let path = paths.dir.join(kind.file());
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -142,8 +175,8 @@ pub fn load(paths: &Paths) -> Result<Option<Stored>, String> {
 }
 
 /// The session key itself, or an error naming why it cannot be opened.
-pub fn key(paths: &Paths) -> Result<Option<String>, String> {
-    match load(paths)? {
+pub fn key(paths: &Paths, kind: Kind) -> Result<Option<String>, String> {
+    match load(paths, kind)? {
         None => Ok(None),
         Some(stored) => {
             let wrap = wrap_key(paths)?;
@@ -152,12 +185,6 @@ pub fn key(paths: &Paths) -> Result<Option<String>, String> {
     }
 }
 
-pub fn clear(paths: &Paths) -> bool {
-    fs::remove_file(paths.bw_session()).is_ok()
-}
-
-impl config::BitwardenPolicy {
-    pub fn mode_is_session(&self) -> bool {
-        self.unlock == UnlockMode::Session
-    }
+pub fn clear(paths: &Paths, kind: Kind) -> bool {
+    fs::remove_file(paths.dir.join(kind.file())).is_ok()
 }

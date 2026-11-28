@@ -93,8 +93,9 @@ ai-vault [--dir DIR] [--json] <命令>
 | `init [--password-stdin]` | 建库（弹窗两次设密码），成功后直接给一个令牌 |
 | `unlock [--password-stdin] [--requester ID]` | 按当前模式解锁，stdout 一个令牌 |
 | `mode [get]` / `mode set never\|time\|session [--hours N]` | 查看/切换解锁模式（切换要主密码） |
-| `settings [键] [值]` | 全部设置：`vault.unlock` `vault.hours` `bitwarden.unlock` `bitwarden.hours` `bitwarden.import` |
+| `settings [键] [值]` | 全部设置：`vault.*` `bitwarden.*` `ente.unlock` `ente.hours` |
 | `bw-session get\|put\|clear` | Bitwarden 会话密钥的落盘副本（`bitwarden.unlock != session` 时用，加密封存） |
+| `ente-session get\|put\|clear` | Ente 的 `ENTE_CLI_VAULT_KEY`（`ente.unlock != session` 时用，同样加密封存） |
 | `rekey` | 把旧库的 scrypt 参数升到当前默认（要主密码） |
 | `status --token T` | 条目数、过期时间、还活着的读授权 |
 | `lock --token T \| --all` | 丢掉令牌（`--all` 清空本机所有会话） |
@@ -148,6 +149,8 @@ ai-vault get <条目> --token <T> --answer-stdin --approval <hex> <<< 'y'
 | `bw_reveal` | 明文返回（默认关闭，每次确认） | exec | 是，用户当场允许 |
 | `ente_list` | Ente Auth 条目元数据（名称/签发方/账号/类型） | read | 否 |
 | `ente_code` | 读一条当前 TOTP/Steam 验证码，每次弹窗确认 | write | 是，用户当场允许 |
+
+Ente 的会话由 `ente` 自己管（登录一次）；`ente.unlock` 只决定那把 `ENTE_CLI_VAULT_KEY` 要不要由 ai-vault 加密封存。
 
 字段选择：`password`（默认）· `totp`（种子）· `code`（动态验证码）· `notes` · `field:<自定义字段名>`。
 
@@ -263,6 +266,15 @@ export ENTE_CLI_VAULT_KEY=<那个 key> # 之后连钥匙串都不用
 ```
 
 所以在 `session` 这种日常形态下，**每次查看不会再要你的密码**，最多要一次系统钥匙串解锁。
+
+想连钥匙串都不要（无人值守）：
+
+```bash
+ente vault key generate                  # 打印一个 key，拿一次就固定
+/vault ente-key                          # 在弹窗里粘进去，ai-vault 把它加密封存
+/vault settings ente.unlock never        # 之后 ente 子进程自动带上它
+```
+`ente.unlock` 和 `bitwarden.unlock` 是同一套三档（`never`/`time`/`session`），`ente-session get|put|clear` 是它的 CLI 入口；密钥用库目录的 wrap key 封存（0600），单独拷走 `ente.session.json` 解不开。插件永远不会把你 shell 里导出的 `ENTE_CLI_VAULT_KEY` 传给子进程——只有它自己封存的那把会。
 
 pi-ai-vault 只是这套 CLI 的客户端，本身不保存 Ente 的任何密钥：
 

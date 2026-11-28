@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use crate::bwsession;
+use crate::sealed::{self, Kind};
 use crate::config::{self, ImportPolicy, UnlockMode, UnlockPolicy};
 use crate::crypto::{self, Kdf};
 use crate::dialog::{self, Answer};
@@ -81,6 +81,11 @@ enum Cmd {
     },
     /// The persisted `bw` session key (bitwarden.unlock = never | time)
     BwSession {
+        /// get | put | clear
+        action: String,
+    },
+    /// Ente's `ENTE_CLI_VAULT_KEY` (ente.unlock = never | time)
+    EnteSession {
         /// get | put | clear
         action: String,
     },
@@ -321,7 +326,8 @@ fn dispatch(cmd: Cmd, paths: &Paths, json: bool) -> Outcome {
         Cmd::Settings { key, value, password_stdin } => {
             settings(paths, &out, key.as_deref(), value.as_deref(), None, password_stdin)
         }
-        Cmd::BwSession { action } => bw_session(paths, &out, &action),
+        Cmd::BwSession { action } => sealed_session(paths, &out, Kind::Bitwarden, &action),
+        Cmd::EnteSession { action } => sealed_session(paths, &out, Kind::Ente, &action),
         Cmd::Mode { action, value, hours, password_stdin } => {
             mode(paths, &out, &action, value.as_deref(), hours, password_stdin)
         }
@@ -488,7 +494,7 @@ fn signing_key(paths: &Paths) -> Result<Option<String>, String> {
     if let Some(secret) = host_secret() {
         return Ok(Some(secret));
     }
-    bwsession::wrap_key_hex(paths).map(Some)
+    sealed::wrap_key_hex(paths).map(Some)
 }
 
 /// The host integration (the extension) is recognised by the secret it
@@ -496,6 +502,13 @@ fn signing_key(paths: &Paths) -> Result<Option<String>, String> {
 /// and is treated like a human caller until it has a secret to sign with.
 /// This keeps a half-configured host from getting a session it can neither
 /// verify nor relay for.
+fn kind_label(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Bitwarden => "bitwarden",
+        Kind::Ente => "ente",
+    }
+}
+
 fn is_host() -> bool {
     std::env::var_os("AI_VAULT_HOST").is_some_and(|v| v == "1") && host_secret().is_some()
 }
@@ -749,12 +762,15 @@ fn setting_key(raw: &str) -> Option<&'static str> {
         "bitwarden.unlock" | "bitwarden.mode" | "bw.unlock" | "bw.mode" => Some("bitwarden.unlock"),
         "bitwarden.hours" | "bw.hours" => Some("bitwarden.hours"),
         "bitwarden.import" | "bw.import" | "import" => Some("bitwarden.import"),
+        "ente.unlock" | "ente.mode" => Some("ente.unlock"),
+        "ente.hours" => Some("ente.hours"),
         _ => None,
     }
 }
 
 fn settings_value(config: &config::Config, paths: &Paths) -> serde_json::Value {
-    let bw_saved = bwsession::load(paths).ok().flatten();
+    let bw_saved = sealed::load(paths, Kind::Bitwarden).ok().flatten();
+    let ente_saved = sealed::load(paths, Kind::Ente).ok().flatten();
     json!({
         "ok": true,
         "vault": {
@@ -763,11 +779,17 @@ fn settings_value(config: &config::Config, paths: &Paths) -> serde_json::Value {
             "auto": paths.auto_session().exists(),
         },
         "bitwarden": {
-            "unlock": config.bitwarden.unlock.as_str(),
-            "hours": config.bitwarden.hours,
+            "unlock": config.bitwarden.store.unlock.as_str(),
+            "hours": config.bitwarden.store.hours,
             "import": config.bitwarden.import.as_str(),
             "persisted": bw_saved.is_some(),
             "expiresAt": bw_saved.as_ref().and_then(|s| s.expires_at),
+        },
+        "ente": {
+            "unlock": config.ente.unlock.as_str(),
+            "hours": config.ente.hours,
+            "persisted": ente_saved.is_some(),
+            "expiresAt": ente_saved.as_ref().and_then(|s| s.expires_at),
         },
     })
 }
@@ -780,12 +802,15 @@ fn settings_human(config: &config::Config, paths: &Paths) -> String {
             "vault 机器级会话: {}",
             if paths.auto_session().exists() { "有（免密）" } else { "无" }
         ),
-        format!("bitwarden.unlock: {}   (never | time | session)", config.bitwarden.unlock.as_str()),
-        format!("bitwarden.hours: {}", config.bitwarden.hours),
+        format!("bitwarden.unlock: {}   (never | time | session)", config.bitwarden.store.unlock.as_str()),
+        format!("bitwarden.hours: {}", config.bitwarden.store.hours),
         format!("bitwarden.import: {}   (ask | always | never)", config.bitwarden.import.as_str()),
+        format!("ente.unlock: {}   (never | time | session)", config.ente.unlock.as_str()),
+        format!("ente.hours: {}", config.ente.hours),
+        format!("ente 已落盘的密钥: {}", if sealed::load(paths, Kind::Ente).ok().flatten().is_some() { "有" } else { "无" }),
         format!(
             "bitwarden 已落盘的会话: {}",
-            match bwsession::load(paths).ok().flatten() {
+            match sealed::load(paths, Kind::Bitwarden).ok().flatten() {
                 Some(saved) => match saved.expires_at {
                     Some(at) => format!("有（{} 后过期）", ((at - session::now_ms()) / 60_000).max(0)),
                     None => "有（不过期）".to_string(),
@@ -822,8 +847,10 @@ fn settings(
         let shown = match key {
             "vault.unlock" => config.unlock.mode.as_str().to_string(),
             "vault.hours" => config.unlock.hours.to_string(),
-            "bitwarden.unlock" => config.bitwarden.unlock.as_str().to_string(),
-            "bitwarden.hours" => config.bitwarden.hours.to_string(),
+            "bitwarden.unlock" => config.bitwarden.store.unlock.as_str().to_string(),
+            "bitwarden.hours" => config.bitwarden.store.hours.to_string(),
+            "ente.unlock" => config.ente.unlock.as_str().to_string(),
+            "ente.hours" => config.ente.hours.to_string(),
             _ => config.bitwarden.import.as_str().to_string(),
         };
         out.value(json!({ "ok": true, "key": key, "value": shown }), || format!("{key}: {shown}"));
@@ -866,21 +893,40 @@ fn settings(
         "bitwarden.unlock" => {
             let mode = UnlockMode::parse(raw_value)
                 .ok_or_else(|| Fault::Usage(format!("unknown mode \"{raw_value}\" — never, time or session")))?;
-            config.bitwarden.unlock = mode;
+            config.bitwarden.store.unlock = mode;
             if let Some(hours) = hours {
-                config.bitwarden.hours = hours.clamp(1, 24 * 90);
+                config.bitwarden.store.hours = hours.clamp(1, 24 * 90);
             }
             config::save(paths, &config)?;
             // Going back to per-session must not leave a key on disk.
             if mode == UnlockMode::Session {
-                bwsession::clear(paths);
+                sealed::clear(paths, Kind::Bitwarden);
             }
         }
         "bitwarden.hours" => {
             let hours: i64 = raw_value
                 .parse()
                 .map_err(|_| Fault::Usage(format!("\"{raw_value}\" is not a number of hours")))?;
-            config.bitwarden.hours = hours.clamp(1, 24 * 90);
+            config.bitwarden.store.hours = hours.clamp(1, 24 * 90);
+            config::save(paths, &config)?;
+        }
+        "ente.unlock" => {
+            let mode = UnlockMode::parse(raw_value)
+                .ok_or_else(|| Fault::Usage(format!("unknown mode \"{raw_value}\" — never, time or session")))?;
+            config.ente.unlock = mode;
+            if let Some(hours) = hours {
+                config.ente.hours = hours.clamp(1, 24 * 90);
+            }
+            config::save(paths, &config)?;
+            if mode == UnlockMode::Session {
+                sealed::clear(paths, Kind::Ente);
+            }
+        }
+        "ente.hours" => {
+            let hours: i64 = raw_value
+                .parse()
+                .map_err(|_| Fault::Usage(format!("\"{raw_value}\" is not a number of hours")))?;
+            config.ente.hours = hours.clamp(1, 24 * 90);
             config::save(paths, &config)?;
         }
         _ => {
@@ -913,12 +959,13 @@ fn mode(
     }
 }
 
-fn bw_session(paths: &Paths, out: &Out, action: &str) -> Outcome {
+fn sealed_session(paths: &Paths, out: &Out, kind: Kind, action: &str) -> Outcome {
     match action.trim() {
         "" | "get" => {
-            let stored = bwsession::load(paths)?
-                .ok_or_else(|| Fault::Auth("no persisted Bitwarden session — unlock Bitwarden first".into()))?;
-            let key = bwsession::key(paths)?.ok_or_else(|| Fault::Auth("no persisted Bitwarden session".into()))?;
+            let stored = sealed::load(paths, kind)?
+                .ok_or_else(|| Fault::Auth(format!("no persisted {} secret — save one first", kind_label(kind))))?;
+            let key = sealed::key(paths, kind)?
+                .ok_or_else(|| Fault::Auth(format!("no persisted {} secret", kind_label(kind))))?;
             out.value(
                 json!({ "ok": true, "key": key, "savedAt": stored.saved_at, "expiresAt": stored.expires_at }),
                 || key,
@@ -930,8 +977,8 @@ fn bw_session(paths: &Paths, out: &Out, action: &str) -> Outcome {
             if key.is_empty() {
                 return Err(Fault::Usage("bw-session put expects the session key on stdin".into()));
             }
-            let expires_at = bwsession::save(paths, &key)?;
-            audit::append(&paths.audit(), "cli", "bw_session", None, Some("put"));
+            let expires_at = sealed::save(paths, kind, &key)?;
+            audit::append(&paths.audit(), "cli", "sealed", None, Some(kind_label(kind)));
             out.value(json!({ "ok": true, "expiresAt": expires_at }), || {
                 match expires_at {
                     Some(at) => format!("saved (expires in {} min)", ((at - session::now_ms()) / 60_000).max(0)),
@@ -941,14 +988,14 @@ fn bw_session(paths: &Paths, out: &Out, action: &str) -> Outcome {
             Ok(())
         }
         "clear" | "delete" => {
-            let removed = bwsession::clear(paths);
-            audit::append(&paths.audit(), "cli", "bw_session", None, Some("clear"));
+            let removed = sealed::clear(paths, kind);
+            audit::append(&paths.audit(), "cli", "sealed", None, Some(kind_label(kind)));
             out.value(json!({ "ok": true, "removed": removed }), || {
                 if removed { "cleared".to_string() } else { "nothing stored".to_string() }
             });
             Ok(())
         }
-        other => Err(Fault::Usage(format!("unknown bw-session action \"{other}\""))),
+        other => Err(Fault::Usage(format!("unknown session action \"{other}\" (get, put, clear)"))),
     }
 }
 

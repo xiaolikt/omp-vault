@@ -40,6 +40,9 @@ export function useMocks() {
 	process.env.ENTE_MOCK_DIR = dir;
 	process.env.AI_VAULT_DIR = join(dir, "vault");
 	process.env.AI_VAULT_BIN = cliBinary();
+	// The extension resolves the CLI from PATH; the tests pass one explicitly.
+	// Put the same build first so both halves run the same version.
+	process.env.PATH = `${dirname(process.env.AI_VAULT_BIN)}:${process.env.PATH}`;
 	return dir;
 }
 

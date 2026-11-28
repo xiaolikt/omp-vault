@@ -25,6 +25,7 @@ import { Type } from "typebox";
 import { auditEvent } from "./bitwarden.js";
 import { confirmWindow, forDialog } from "./prompt.js";
 import { withTier } from "./host.js";
+import { getSettingsSafe, settingsCli } from "./settings.js";
 
 export interface EnteCodeMeta {
 	id: string;
@@ -74,12 +75,37 @@ interface Run {
 	stderr: string;
 }
 
+/**
+ * The environment for one `ente` run.
+ *
+ * `ente.unlock = never | time`: the key is kept sealed by ai-vault (the same
+ * wrapping as the Bitwarden session), so Ente needs neither the OS keychain
+ * nor a login window. `session` (default) leaves the keychain in charge and
+ * passes nothing.
+ */
+async function enteEnv(signal?: AbortSignal): Promise<Record<string, string | undefined>> {
+	const env: Record<string, string | undefined> = { ...process.env };
+	// Never let a key the user exported in their shell decide this.
+	delete env.ENTE_CLI_VAULT_KEY;
+	const settings = await getSettingsSafe(signal);
+	if (settings.ente.unlock === "session") return env;
+	try {
+		const sealed = await settingsCli().json<{ key: string }>(["ente-session", "get"], { signal });
+		if (sealed?.key) env.ENTE_CLI_VAULT_KEY = sealed.key;
+	} catch {
+		// No key saved yet, or it expired: ente will fall back to the keychain,
+		// which is exactly what a `session` policy would have done.
+	}
+	return env;
+}
+
 async function runEnte(args: string[], signal?: AbortSignal): Promise<Run> {
 	const bin = resolveEnte();
 	if (!bin) throw new EnteError(ENTE_MISSING, 127);
 	if (signal?.aborted) throw new EnteError("Cancelled.", 4);
+	const env = await enteEnv(signal);
 	return new Promise<Run>((resolve, reject) => {
-		const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"], env });
 		let stdout = "";
 		let stderr = "";
 		const onAbort = () => child.kill("SIGKILL");

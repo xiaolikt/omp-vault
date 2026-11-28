@@ -65,7 +65,9 @@ omp plugin install npm:pi-ai-vault  # omp，同一个包
 
 ## Ente
 
-`ente` CLI 自己登录一次（`ente account login --app auth`），插件只是它的客户端：`ente_list` 只给元数据，`ente_code` 每次弹窗确认。详见仓库 README。
+`ente` CLI 自己登录一次（`ente account login --app auth`），插件只是它的客户端：`ente_list` 只给元数据，`ente_code` 每次弹窗确认。
+
+想完全免钥匙串：`ente vault key generate` → `/vault ente-key` 粘进去 → `/vault settings ente.unlock never`。密钥由 ai-vault 加密封存。详见仓库 README。
 
 ## 安全边界（一句话版）
 

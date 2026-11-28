@@ -19,11 +19,14 @@ export interface Settings {
 		persisted: boolean;
 		expiresAt: number | null;
 	};
+	/** Ente's ENTE_CLI_VAULT_KEY: session leaves it to the OS keychain. */
+	ente: { unlock: UnlockModeName; hours: number; persisted: boolean; expiresAt: number | null };
 }
 
 export const DEFAULT_SETTINGS: Settings = {
 	vault: { unlock: "session", hours: 8, auto: false },
 	bitwarden: { unlock: "session", hours: 8, import: "ask", persisted: false, expiresAt: null },
+	ente: { unlock: "session", hours: 8, persisted: false, expiresAt: null },
 };
 
 const cli = new VaultCli();
