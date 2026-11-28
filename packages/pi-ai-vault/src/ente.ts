@@ -57,8 +57,11 @@ export function resolveEnte(): string | undefined {
 	if (explicit) return existsSync(explicit) ? explicit : undefined;
 	for (const dir of (process.env.PATH ?? "").split(delimiter)) {
 		if (!dir) continue;
-		const candidate = join(dir, "ente");
-		if (existsSync(candidate)) return candidate;
+		// Windows: the program is ente.exe; the bare name matches no file there.
+		for (const name of process.platform === "win32" ? ["ente.exe", "ente"] : ["ente"]) {
+			const candidate = join(dir, name);
+			if (existsSync(candidate)) return candidate;
+		}
 	}
 	for (const candidate of [
 		join(homedir(), ".local", "opt", "ente-cli", "bin", "ente"),

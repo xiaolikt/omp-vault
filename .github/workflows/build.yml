@@ -43,12 +43,23 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: build
+        # The linker for the cross target has to be set where cargo runs.
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }} --locked
+
+      # The one platform the author does not develop on: the Rust unit tests
+      # and the suite that starts the real exe, PowerShell, bash and (when
+      # installed) bw there. `publish` needs this job, so a red test blocks a release.
+      - name: test (Windows)
+        if: matrix.pkg == 'win32-x64'
+        run: |
+          cargo test --release --locked
+          npm install --no-audit --no-fund
+          node --import tsx --test tests/windows.test.mjs
 
       - name: stage the npm platform package
         shell: bash
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           ext=""
           [[ "${{ matrix.pkg }}" == win32-* ]] && ext=".exe"

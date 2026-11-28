@@ -3,7 +3,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const MOCKS = join(dirname(fileURLToPath(import.meta.url)), "mocks", "bin");
@@ -13,13 +13,14 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export function cliBinary() {
 	const explicit = process.env.AI_VAULT_BIN;
 	if (explicit) return explicit;
+	const file = process.platform === "win32" ? "ai-vault.exe" : "ai-vault";
 	for (const profile of ["release", "debug"]) {
-		const candidate = join(ROOT, "target", profile, "ai-vault");
+		const candidate = join(ROOT, "target", profile, file);
 		if (existsSync(candidate)) return candidate;
 	}
 	const built = spawnSync("cargo", ["build", "--release"], { cwd: ROOT, stdio: "inherit" });
 	if (built.status !== 0) throw new Error("cannot build the ai-vault CLI; run `cargo build --release`");
-	return join(ROOT, "target", "release", "ai-vault");
+	return join(ROOT, "target", "release", file);
 }
 
 /**
@@ -33,7 +34,7 @@ export function useMocks() {
 	process.env.HOME = join(dir, "home");
 	process.env.DISPLAY = ":99";
 	delete process.env.WAYLAND_DISPLAY;
-	process.env.PATH = `${MOCKS}:${process.env.PATH}`;
+	process.env.PATH = `${MOCKS}${delimiter}${process.env.PATH}`;
 	process.env.OMP_VAULT_BW_MOCK_DIR = dir;
 	process.env.OMP_VAULT_MOCK = dir;
 	// The ente mock keeps its own state directory, like the bw one.
@@ -42,7 +43,7 @@ export function useMocks() {
 	process.env.AI_VAULT_BIN = cliBinary();
 	// The extension resolves the CLI from PATH; the tests pass one explicitly.
 	// Put the same build first so both halves run the same version.
-	process.env.PATH = `${dirname(process.env.AI_VAULT_BIN)}:${process.env.PATH}`;
+	process.env.PATH = `${dirname(process.env.AI_VAULT_BIN)}${delimiter}${process.env.PATH}`;
 	return dir;
 }
 

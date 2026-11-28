@@ -9,6 +9,7 @@
 ~/.ai-vault/audit.log       谁在什么时候读了什么，从不记值
 ~/.ai-vault/store.lock      多进程读改写时的文件锁
 $XDG_RUNTIME_DIR/ai-vault/sessions/<token>.json   解锁令牌（0600，tmpfs）
+%TEMP%\ai-vault\sessions\<token>.json             Windows：同样的内容，用户目录下的普通文件
 ```
 
 因为位置是固定的、由 CLI 独占的，所以同一台机器上 pi、omp、脚本、别的 agent 拿到的都是同一批已导入的密码，不会再出现「这个 agent 导过、那个没导过」。
@@ -64,21 +65,21 @@ printf '//registry.npmjs.org/:_authToken=%s\n' "<token>" > ~/.npmrc && chmod 600
 
 这类令牌 npm 会在 2027 年 1 月起逐步作废，届时改用 trusted publishing 或 TOTP 2FA。
 
-别的平台要有自己的二进制包：`./scripts/stage-npm.sh darwin-arm64 --from <交叉编译产物>`，发布后把对应名字加进 `optionalDependencies`。没有匹配的平台包时，shim 会明确报错并提示 `cargo install --path crates/ai-vault`。
+别的平台要有自己的二进制包：`./scripts/stage-npm.sh darwin-arm64 --from <交叉编译产物>`。darwin 的两个包已经列在 `optionalDependencies` 里，还没发布时 npm 会跳过 optional 依赖，所以列表可以先于包存在。没有匹配的平台包时，shim 会明确报错并提示 `cargo install --path crates/ai-vault`。`--from` 会拒绝早于上一次改版本号的二进制；能在本机运行的二进制，还必须自报正在发布的版本。
 
 ### 平台
 
 | 平台 | 状态 |
 |---|---|
 | Linux x64 / arm64 | ✅ 已发布（`@xiaolikt/ai-vault-linux-x64` / `-linux-arm64`） |
-| Windows x64 | ✅ 已发布（`@xiaolikt/ai-vault-win32-x64`），对话框走 PowerShell/WinForms |
+| Windows x64 | ✅ 已发布（`@xiaolikt/ai-vault-win32-x64`），对话框走系统自带的 Windows PowerShell + WinForms |
 | macOS arm64 / x64 | 🔧 代码已可编译（`cargo check --target aarch64-apple-darwin` 通过），二进制需要 Apple SDK —— 由 `.github/workflows/build.yml` 的 macOS runner 产出 |
 
 跨平台的部分：
 - **加密/存储**：纯 Rust（chacha20poly1305、scrypt、hmac、sha2、base64、zeroize）
 - **文件锁**：`fs4`（Linux/macOS 用 flock，Windows 用 LockFileEx）
 - **权限**：Unix 设 0600/0700；Windows 没有位权限，靠 `%USERPROFILE%\.ai-vault` 的 ACL
-- **会话目录**：Linux `$XDG_RUNTIME_DIR`、macOS `$TMPDIR`、Windows `%TEMP%`（都是每人一份、可被系统清理）
+- **会话目录**：Linux `$XDG_RUNTIME_DIR`、macOS `$TMPDIR`、Windows `%TEMP%`，都是每人一份；Linux 上是 tmpfs，Windows 上是普通目录，过期的令牌由下一次 `ai-vault` 运行清掉
 - **弹窗**：Linux zenity / macOS osascript / Windows PowerShell+WinForms，同一套 `Answer` 契约（`NoUi` 才回退到宿主输入框）
 
 自己交叉编译（不需要 Mac/Windows 机器）：
@@ -93,6 +94,14 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 ```
 
 `stage-npm.sh` 两种写法都收：npm 平台名（`darwin-arm64`）或 Rust triple（`aarch64-apple-darwin`）。macOS 的二进制只能用 Apple SDK 链，所以留给 CI（tag push 时自动构建 + 发布）。
+
+### Windows
+
+- **插件直接启动 `ai-vault.exe`。** Node 不带 shell 跑不了 npm 的 `.cmd`/`.ps1` 包装器，所以插件直接解析 `@xiaolikt/ai-vault-win32-x64` 里的二进制；只有包装器时，读出它指向的目标，用自己的 Node 启动。
+- **弹窗需要交互式会话。** 服务、"用户未登录也运行"的计划任务、sshd 会话里没有可见桌面，CLI 会返回退出码 3（`needs-ui`），改用宿主输入框。没人应答的窗口和 Linux 一样在 600 秒后关闭，按取消处理。
+- **弹窗里输入的内容一律是 UTF-8**，不管控制台代码页是什么（中文 Windows 是 936）。打不开的窗口报成 `needs-ui`，不会被当成取消。
+- **npm 装的 `bw` 可用**（`bw.cmd` 同样被拆开启动）。`bw_run` 需要 Git for Windows：在 PATH 上 `git.exe` 的旁边找 `bash.exe`。剪贴板走 Windows PowerShell，值以 UTF-8 走 stdin/stdout。
+- 库在 `%USERPROFILE%\.ai-vault`，靠用户目录的 ACL 保护。
 
 ### 从源码 / git
 
@@ -376,7 +385,7 @@ pi-ai-vault 只是这套 CLI 的客户端，本身不保存 Ente 的任何密钥
 - **Bitwarden 会话密钥加密封存。** `bitwarden.unlock = never|time` 时，`bw` 的会话密钥用 ChaCha20-Poly1305 封在 `~/.ai-vault/bitwarden.session.json` 下，密钥是 `~/.ai-vault/.wrap`（0600）。单独拷走那个文件什么都打不开。`bw unlock --raw` 的会话密钥等价于**整个** Bitwarden 保险库的读权限，所以这个文件的敏感度 ≥ 库本身。
 - **确认窗里的字不是模型写的。** 条目名、原因、用户名、URI 进窗口前都压成一行、去掉控制字符、截到 80–120 字符，模型没法在名字里塞换行伪造第二条「已授权」。
 - **KDF。** 新库 scrypt `N=2^17`（128 MiB）；文件头记着参数，旧库（`N=2^15`）照常打开，`ai-vault rekey` 升级。低于 `2^15` 的参数一律拒收（防降级）。
-- **主密码**只经过弹窗或宿主输入框；`unlock` 派生的 key 只写进令牌文件（0600，优先 tmpfs）。`BW_*` 在所有子进程环境里剔除。
+- **主密码**只经过弹窗或宿主输入框；`unlock` 派生的 key 只写进令牌文件（0600，优先 tmpfs；Windows 上是 `%TEMP%` 下的普通文件，靠用户目录的 ACL 保护，重启后仍在，过期后由下一次 `ai-vault` 运行删除）。`BW_*` 在所有子进程环境里剔除。
 - **审计**：`~/.ai-vault/audit.log` 记录会话、条目、允许/拒绝/原因、以及 `unsigned-relay`、`bad-approval`、`modified-outside` 这类尝试，从不记值；1 MiB 轮转。
 - **原子写 + flock**：临时文件（0600）→ fsync → rename → 目录 fsync；多进程读改写有文件锁。失效/被改/旧库的令牌文件每次调用都会被清掉。
 - `bw_reveal` 默认关闭；擦洗只在值长度 ≥ 6 时生效，防不住网络外传和单向哈希——`bw_run` / `bw_inject` 的价值是值不进对话，不是防住被注入的 agent。
