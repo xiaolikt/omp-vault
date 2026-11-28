@@ -435,7 +435,7 @@ may *use* passwords but cannot *get around you* to take them.
 |---|---|---|
 | **You** (typing `ai-vault` in a terminal) | everything | — |
 | **The host** (the pi/omp extension process; `AI_VAULT_HOST=1` + a secret in memory) | relay your confirmations (signed), change settings | learn the master password unless you type it |
-| **The agent** (the model's `bash`, same user, can read `~/.ai-vault`) | read a token file (but a session the extension opened is useless without the secret — first use voids it) | **forge a read confirmation, mint a grant on a token, change the requester shown in a window, `list` an extension session, get the Bitwarden master password** |
+| **The agent** (the model's `bash`, same user, can read `~/.ai-vault`) | read a token file (but a session the extension opened is useless without the secret — first use is refused) | **forge a read confirmation, mint a grant on a token, change the requester shown in a window, `list` an extension session, get the Bitwarden master password, change any setting by editing a file** |
 | **Another user / someone with the files offline** | read ciphertext | decrypt (scrypt + ChaCha20-Poly1305) |
 
 ### How
